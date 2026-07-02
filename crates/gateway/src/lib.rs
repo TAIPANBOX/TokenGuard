@@ -5,6 +5,7 @@
 pub mod estimate;
 pub mod provider;
 pub mod proxy;
+pub mod settle;
 pub mod state;
 
 use axum::routing::{get, post};
