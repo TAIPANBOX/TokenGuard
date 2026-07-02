@@ -2,6 +2,7 @@
 //! `Router`. The binary (`main.rs`) wires real config around `app()`; tests
 //! drive `app()` directly.
 
+pub mod backtestcli;
 pub mod estimate;
 pub mod obs;
 pub mod provider;
