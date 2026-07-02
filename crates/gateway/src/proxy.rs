@@ -1,17 +1,22 @@
 //! The request path: parse → estimate → enforce → forward → settle.
 //!
-//! This is the heart of the gateway. The enforcement contract (ADR-4) is that we
-//! decide *before* forwarding — a blocked call never reaches the provider — and
-//! we settle the real cost *after*. A blocked call returns HTTP 402 with a
-//! stable JSON error body so agent frameworks can catch it and stop cleanly.
+//! Enforcement happens *before* forwarding (ADR-4): a blocked call returns HTTP
+//! 402 with a stable JSON error and never reaches the provider. Cost is settled
+//! *after* the response:
+//! - streaming requests (`"stream": true`) are passed through chunk-by-chunk and
+//!   settled at end-of-stream (usage is parsed out of the bytes as they flow);
+//! - non-streaming requests are buffered, so we can also return `x-fuse-cost-*`
+//!   headers with the exact settled figures.
 
 use crate::estimate::estimate_cost;
+use crate::provider::{ProviderError, ProviderResponse};
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode};
+use futures::StreamExt;
+use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode, Reservation};
 
 /// Default per-run budget when neither the request nor the policy sets one.
 const DEFAULT_RUN_BUDGET: Microusd = Microusd(5_000_000); // $5.00
@@ -23,12 +28,14 @@ pub async fn healthz() -> &'static str {
 /// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
 /// as-is once the budget check passes.
 pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let (model, max_tokens) = parse_request(&body);
+    let parsed = parse_request(&body);
 
-    // No run id → unmanaged pass-through. Keeps the gateway drop-in safe: an
-    // un-tagged caller is forwarded untouched rather than rejected.
+    // No run id → unmanaged pass-through (drop-in safe).
     let Some(run_id) = header_str(&headers, "x-fuse-run-id") else {
-        return forward(&st, &model, &body, None, "unmanaged", None).await;
+        return match st.provider.send(headers, body).await {
+            Ok(resp) => passthrough(resp, "unmanaged"),
+            Err(e) => upstream_error(e),
+        };
     };
 
     let budget = header_f64(&headers, "x-fuse-budget-usd")
@@ -37,26 +44,25 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
         .unwrap_or(DEFAULT_RUN_BUDGET);
     st.ledger.open_run(&run_id, budget);
 
-    let estimate =
-        estimate_cost(&st.prices, &model, body.len(), max_tokens).unwrap_or(Microusd::ZERO);
+    let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
+        .unwrap_or(Microusd::ZERO);
 
     let snapshot = st.ledger.snapshot(&run_id).expect("run just opened");
     let eval = evaluate(&st.policy, &snapshot, estimate);
 
     // Policy (step/max-steps) block, enforced only in enforce mode.
     if st.policy.mode == Mode::Enforce && eval.decision.is_blocking() {
-        let reason = eval.violated.clone().unwrap_or_default();
         return budget_error(
             "policy_violation",
             &run_id,
             budget,
             snapshot.spent,
             &st.policy_id,
-            &reason,
+            &eval.violated.unwrap_or_default(),
         );
     }
 
-    // Budget gate. Enforce uses the atomic checked reserve; shadow/warn record
+    // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
     let reservation = match st.policy.mode {
         Mode::Enforce => match st.ledger.reserve(&run_id, estimate) {
@@ -76,71 +82,157 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
         Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate),
     };
 
-    forward(
-        &st,
-        &model,
-        &body,
-        Some(reservation),
-        "managed",
-        eval.violated,
-    )
-    .await
-}
-
-/// Forward to the provider and settle. `reservation` is `None` for unmanaged
-/// pass-through (no accounting). `would_block` carries a shadow/warn reason.
-async fn forward(
-    st: &AppState,
-    model: &str,
-    body: &[u8],
-    reservation: Option<tokenfuse_core::Reservation>,
-    managed: &str,
-    would_block: Option<String>,
-) -> Response {
-    let outcome = match st.provider.complete(model, body).await {
-        Ok(o) => o,
+    let resp = match st.provider.send(headers, body).await {
+        Ok(r) => r,
         Err(e) => {
-            if let Some(r) = &reservation {
-                // Release the reservation; a failed call cost us nothing.
-                st.ledger.settle(r, Microusd::ZERO);
-            }
-            return simple_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string());
+            // Failed call cost us nothing — release the reservation.
+            st.ledger.settle(&reservation, Microusd::ZERO);
+            return upstream_error(e);
         }
     };
 
-    let mut builder = Response::builder()
-        .status(StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::OK))
-        .header("content-type", "application/json")
-        .header("x-fuse", managed);
-
-    if let Some(r) = reservation {
-        let actual = st.prices.cost(model, &outcome.usage).unwrap_or(r.amount);
-        st.ledger.settle(&r, actual);
-        let after = st.ledger.snapshot(&r.run_id);
-        let spent = after.map(|s| s.spent).unwrap_or(actual);
-
-        builder = builder
-            .header("x-fuse-run-id", r.run_id)
-            .header("x-fuse-step", r.step.to_string())
-            .header("x-fuse-mode", mode_str(st.policy.mode))
-            .header("x-fuse-cost-usd", format!("{:.6}", actual.as_usd()))
-            .header("x-fuse-spent-usd", format!("{:.6}", spent.as_usd()))
-            .header(
-                "x-fuse-price",
-                if st.prices.is_known(model) {
-                    "known"
-                } else {
-                    "fallback"
-                },
-            );
-        if let Some(reason) = would_block {
-            builder = builder.header("x-fuse-would-block", reason);
-        }
+    if parsed.stream {
+        stream_managed(resp, reservation, eval.violated, &parsed.model, &st)
+    } else {
+        buffered_managed(resp, reservation, eval.violated, &parsed.model, &st).await
     }
+}
 
+/// Streaming managed response: pass chunks through and settle at end-of-stream.
+/// Cost headers are omitted because headers are sent before the body — the
+/// settled figures go to the ledger (and, later, the event sink).
+fn stream_managed(
+    resp: ProviderResponse,
+    reservation: Reservation,
+    would_block: Option<String>,
+    model: &str,
+    st: &AppState,
+) -> Response {
+    let ledger = st.ledger.clone();
+    let prices = st.prices.clone();
+    let usage_slot = resp.usage.clone();
+    let inner = resp.body;
+    let fallback = reservation.amount;
+    let model = model.to_string();
+    // Capture the header values before `reservation` is moved into the stream.
+    let run_id = reservation.run_id.clone();
+    let step = reservation.step;
+
+    // TODO: if the client disconnects mid-stream this wrapper is dropped before
+    // settling, leaking the reservation. A Drop guard should settle on cancel.
+    let wrapped = async_stream::try_stream! {
+        futures::pin_mut!(inner);
+        while let Some(chunk) = inner.next().await {
+            let chunk = chunk?;
+            yield chunk;
+        }
+        let usage = usage_slot.lock().unwrap().take();
+        let actual = usage.and_then(|u| prices.cost(&model, &u)).unwrap_or(fallback);
+        ledger.settle(&reservation, actual);
+    };
+    // Pin with an explicit error type so `Body::from_stream` can pick up the
+    // `Into<BoxError>` bound.
+    let wrapped: futures::stream::BoxStream<'static, Result<Bytes, ProviderError>> =
+        Box::pin(wrapped);
+
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK))
+        .header(
+            "content-type",
+            resp.content_type.as_deref().unwrap_or("text/event-stream"),
+        )
+        .header("x-fuse", "managed")
+        .header("x-fuse-stream", "passthrough")
+        .header("x-fuse-run-id", run_id)
+        .header("x-fuse-step", step.to_string())
+        .header("x-fuse-mode", mode_str(st.policy.mode));
+    if let Some(reason) = would_block {
+        builder = builder.header("x-fuse-would-block", reason);
+    }
     builder
-        .body(Body::from(outcome.body.to_vec()))
+        .body(Body::from_stream(wrapped))
         .expect("valid response")
+}
+
+/// Non-streaming managed response: buffer the body, settle with the exact cost,
+/// and return full `x-fuse-*` accounting headers.
+async fn buffered_managed(
+    resp: ProviderResponse,
+    reservation: Reservation,
+    would_block: Option<String>,
+    model: &str,
+    st: &AppState,
+) -> Response {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
+    let content_type = resp
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/json".to_string());
+
+    let bytes = match collect(resp.body).await {
+        Ok(b) => b,
+        Err(e) => {
+            st.ledger.settle(&reservation, Microusd::ZERO);
+            return upstream_error(e);
+        }
+    };
+
+    let usage = resp.usage.lock().unwrap().take();
+    let actual = usage
+        .and_then(|u| st.prices.cost(model, &u))
+        .unwrap_or(reservation.amount);
+    st.ledger.settle(&reservation, actual);
+    let spent = st
+        .ledger
+        .snapshot(&reservation.run_id)
+        .map(|s| s.spent)
+        .unwrap_or(actual);
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .header("x-fuse", "managed")
+        .header("x-fuse-run-id", reservation.run_id.clone())
+        .header("x-fuse-step", reservation.step.to_string())
+        .header("x-fuse-mode", mode_str(st.policy.mode))
+        .header("x-fuse-cost-usd", format!("{:.6}", actual.as_usd()))
+        .header("x-fuse-spent-usd", format!("{:.6}", spent.as_usd()))
+        .header(
+            "x-fuse-price",
+            if st.prices.is_known(model) {
+                "known"
+            } else {
+                "fallback"
+            },
+        );
+    if let Some(reason) = would_block {
+        builder = builder.header("x-fuse-would-block", reason);
+    }
+    builder.body(Body::from(bytes)).expect("valid response")
+}
+
+/// Unmanaged pass-through (no run id): stream the upstream body straight back
+/// with no accounting.
+fn passthrough(resp: ProviderResponse, managed: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK))
+        .header(
+            "content-type",
+            resp.content_type.as_deref().unwrap_or("application/json"),
+        )
+        .header("x-fuse", managed)
+        .body(Body::from_stream(resp.body))
+        .expect("valid response")
+}
+
+async fn collect(
+    mut body: futures::stream::BoxStream<'static, Result<Bytes, ProviderError>>,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut acc = Vec::new();
+    while let Some(chunk) = body.next().await {
+        acc.extend_from_slice(&chunk?);
+    }
+    Ok(acc)
 }
 
 /// Build the stable 402 budget/policy error contract.
@@ -172,24 +264,36 @@ fn budget_error(
         .expect("valid response")
 }
 
-fn simple_error(status: StatusCode, kind: &str, detail: &str) -> Response {
-    let body = serde_json::json!({ "error": { "type": kind, "detail": detail } });
+fn upstream_error(e: ProviderError) -> Response {
+    let body =
+        serde_json::json!({ "error": { "type": "upstream_error", "detail": e.to_string() } });
     Response::builder()
-        .status(status)
+        .status(StatusCode::BAD_GATEWAY)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }
 
-fn parse_request(body: &[u8]) -> (String, Option<u64>) {
+struct ParsedRequest {
+    model: String,
+    max_tokens: Option<u64>,
+    stream: bool,
+}
+
+fn parse_request(body: &[u8]) -> ParsedRequest {
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
-    let model = value
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let max_tokens = value.get("max_tokens").and_then(|m| m.as_u64());
-    (model, max_tokens)
+    ParsedRequest {
+        model: value
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        max_tokens: value.get("max_tokens").and_then(|m| m.as_u64()),
+        stream: value
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -215,7 +319,6 @@ fn mode_str(mode: Mode) -> &'static str {
 mod tests {
     use super::*;
     use crate::provider::StubProvider;
-    use crate::state::AppState;
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::sync::Arc;
@@ -241,6 +344,10 @@ mod tests {
 
     fn body(max_tokens: u64) -> String {
         format!(r#"{{"model":"test-model","max_tokens":{max_tokens}}}"#)
+    }
+
+    fn body_stream(max_tokens: u64) -> String {
+        format!(r#"{{"model":"test-model","max_tokens":{max_tokens},"stream":true}}"#)
     }
 
     async fn call(st: AppState, req: Request<Body>) -> Response {
@@ -269,7 +376,6 @@ mod tests {
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
         assert!(resp.headers().contains_key("x-fuse-cost-usd"));
 
-        // The run was actually charged.
         let snap = ledger.snapshot("run-1").unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.steps, 1);
@@ -277,12 +383,12 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_over_budget_returns_402_contract() {
-        // Tiny budget + a big output => estimate exceeds budget before forwarding.
         let st = state(
             Mode::Enforce,
             StubProvider {
                 input_tokens: 1_000,
                 output_tokens: 100_000,
+                sse: false,
             },
         );
         let req = Request::post("/v1/messages")
@@ -303,12 +409,10 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_over_budget_allows_but_flags_would_block() {
-        // In shadow mode a step/steps violation must not block. Force a
-        // max-steps violation via policy, but mode = shadow.
         let mut st = state(Mode::Shadow, StubProvider::default());
         st.policy = Arc::new(Policy {
             mode: Mode::Shadow,
-            max_steps: Some(0), // any call violates
+            max_steps: Some(0),
             ..Default::default()
         });
         let req = Request::post("/v1/messages")
@@ -329,5 +433,37 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn streaming_request_passes_through_and_settles_at_end() {
+        let st = state(
+            Mode::Enforce,
+            StubProvider {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                sse: true,
+            },
+        );
+        let ledger = Arc::clone(&st.ledger);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-stream")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-stream").unwrap(), "passthrough");
+
+        // Draining the body is what triggers settle at end-of-stream.
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("message_start"));
+        assert!(text.contains("[DONE]"));
+
+        let snap = ledger.snapshot("run-stream").unwrap();
+        assert!(snap.spent > Microusd::ZERO);
+        assert_eq!(snap.reserved, Microusd::ZERO); // reservation released on settle
     }
 }

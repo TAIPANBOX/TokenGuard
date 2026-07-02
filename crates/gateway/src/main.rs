@@ -1,11 +1,15 @@
-//! Tokenfuse gateway binary. Starts the proxy with sane defaults: in-process
-//! ledger, an illustrative price book, shadow-mode policy (safe to drop in),
-//! and — for now — the stub provider until real forwarding lands.
+//! Tokenfuse gateway binary. Defaults are safe for a drop-in trial: in-process
+//! ledger, an illustrative price book, and shadow-mode policy.
+//!
+//! Provider selection:
+//! - `TOKENFUSE_UPSTREAM=<url>` forwards to a real endpoint (e.g.
+//!   `https://api.anthropic.com/v1/messages`) with SSE passthrough;
+//! - unset → the deterministic stub, so `cargo run` works offline.
 
 use std::sync::Arc;
 use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
 use tokenfuse_gateway::app;
-use tokenfuse_gateway::provider::StubProvider;
+use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
 use tracing_subscriber::EnvFilter;
 
@@ -30,11 +34,22 @@ async fn main() {
         .with("gpt", ModelPrice::per_mtok_usd(2.5, 10.0, 0.25, 3.125))
         .with_fallback(ModelPrice::per_mtok_usd(15.0, 75.0, 1.5, 18.75));
 
+    let provider: Arc<dyn Provider> = match std::env::var("TOKENFUSE_UPSTREAM") {
+        Ok(url) if !url.is_empty() => {
+            tracing::info!(%url, "forwarding to real upstream");
+            Arc::new(HttpProvider::new(url))
+        }
+        _ => {
+            tracing::info!("no TOKENFUSE_UPSTREAM set — using stub provider");
+            Arc::new(StubProvider::default())
+        }
+    };
+
     let state = AppState::new(
         Arc::new(Ledger::new()),
         Arc::new(prices),
         Arc::new(Policy::default()), // shadow by default
-        Arc::new(StubProvider::default()),
+        provider,
         "default",
     );
 
@@ -42,7 +57,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");
-    tracing::info!(%addr, "tokenfuse gateway listening (stub provider, shadow mode)");
+    tracing::info!(%addr, "tokenfuse gateway listening");
 
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
