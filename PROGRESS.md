@@ -28,10 +28,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | Python SDK | ✅ done | `sdk/python` — dependency-free helpers: `run_headers`, `gateway_url`, and typed exceptions (`BudgetExceeded`/`LoopDetected`/`PolicyViolation`/`Killed`) via `raise_for_fuse`/`check_response`. Own CI job (pytest, 9 tests) |
 | Parquet trace sink (`tokenfuse sql`) | ✅ done | `sink.rs`: settled calls → rotating Parquet segments (opt-in via `TOKENFUSE_DATA_DIR`; `NullSink` default). `sqlq.rs` + `tokenfuse sql "…"` query the trace with DataFusion. Verified live end-to-end. |
 | Semantic cache (Ring 1.1) | ✅ done | `crates/core/cache.rs`: hard-partition + cosine similarity, entity-guard, length-ratio guard, TTL, FIFO eviction; pluggable `Embedder` (default `HashEmbedder`, ONNX later). Wired for non-streaming tool-free calls; `TOKENFUSE_CACHE=off\|shadow\|on`. On-hit serves `$0` with `x-fuse-saved-usd`. Verified live. |
+| Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
 
 ## Test status
 
-`cargo test --all` — 60 passing (core: 34, gateway: 26); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: Parquet trace + `tokenfuse sql`, and a semantic cache hit serving a repeat request for $0 (saved $0.0105, similarity 1.000).
+`cargo test --all` — 66 passing (core: 39, gateway: 27); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: semantic cache hit for $0, and `tokenfuse backtest` reporting a candidate policy would have saved 50% on a demo trace.
 
 ## How to run
 

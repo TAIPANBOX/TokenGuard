@@ -38,6 +38,16 @@ async fn main() {
                 eprintln!("sql error: {e}");
             }
         }
+        // `tokenfuse backtest --budget … --max-steps …` replays a candidate
+        // policy over the Parquet trace.
+        Some("backtest") => {
+            let rest: Vec<String> = args.collect();
+            let dir = std::env::var("TOKENFUSE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+            let policy = tokenfuse_gateway::backtestcli::parse_policy(&rest);
+            if let Err(e) = tokenfuse_gateway::backtestcli::run(&dir, policy).await {
+                eprintln!("backtest error: {e}");
+            }
+        }
         // Anything else starts the gateway.
         _ => serve().await,
     }
