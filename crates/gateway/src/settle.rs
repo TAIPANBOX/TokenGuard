@@ -1,0 +1,129 @@
+//! A guard that guarantees a streaming reservation is always settled — even if
+//! the client disconnects mid-stream and the response future is dropped before
+//! the normal end-of-stream settle runs.
+//!
+//! On normal completion the caller invokes [`SettleGuard::complete`], which
+//! settles with the usage parsed from the stream. If the guard is dropped first
+//! (client cancel, or an upstream error propagated via `?`), its `Drop` settles
+//! with whatever usage was parsed so far, falling back to the reserved estimate
+//! so the budget is never left over-reserved (a leaked reservation would wrongly
+//! block later calls in the same run).
+
+use crate::provider::UsageSlot;
+use std::sync::Arc;
+use tokenfuse_core::{Ledger, Microusd, PriceBook, Reservation};
+
+pub struct SettleGuard {
+    ledger: Arc<Ledger>,
+    prices: Arc<PriceBook>,
+    model: String,
+    usage: UsageSlot,
+    fallback: Microusd,
+    reservation: Option<Reservation>,
+}
+
+impl SettleGuard {
+    pub fn new(
+        ledger: Arc<Ledger>,
+        prices: Arc<PriceBook>,
+        model: String,
+        usage: UsageSlot,
+        fallback: Microusd,
+        reservation: Reservation,
+    ) -> Self {
+        SettleGuard {
+            ledger,
+            prices,
+            model,
+            usage,
+            fallback,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn settle_now(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let parsed = self.usage.lock().unwrap().take();
+        let actual = parsed
+            .and_then(|u| self.prices.cost(&self.model, &u))
+            .unwrap_or(self.fallback);
+        self.ledger.settle(&reservation, actual);
+    }
+
+    /// Settle now with the parsed usage (normal end-of-stream). Consumes the
+    /// guard so its `Drop` becomes a no-op.
+    pub fn complete(mut self) {
+        self.settle_now();
+    }
+}
+
+impl Drop for SettleGuard {
+    fn drop(&mut self) {
+        // Only fires if `complete()` was not called (cancel / error path).
+        self.settle_now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::UsageSlot;
+    use std::sync::Mutex;
+    use tokenfuse_core::{ModelPrice, PriceBook, Usage};
+
+    fn setup() -> (Arc<Ledger>, Arc<PriceBook>, UsageSlot, Reservation) {
+        let ledger = Arc::new(Ledger::new());
+        ledger.open_run("r", Microusd::from_usd(5.0));
+        let reservation = ledger.reserve("r", Microusd::from_usd(1.0)).unwrap();
+        let prices =
+            Arc::new(PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0)));
+        let usage: UsageSlot = Arc::new(Mutex::new(None));
+        (ledger, prices, usage, reservation)
+    }
+
+    #[test]
+    fn complete_settles_with_parsed_usage() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        let guard = SettleGuard::new(
+            ledger.clone(),
+            prices,
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            reservation,
+        );
+        guard.complete();
+
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO); // released
+        assert_eq!(snap.spent, Microusd::from_usd(3.0)); // 1M input @ $3/Mtok
+    }
+
+    #[test]
+    fn drop_without_complete_settles_with_fallback() {
+        let (ledger, prices, usage, reservation) = setup();
+        // No usage parsed (cancel before any usage event).
+        let fallback = Microusd::from_usd(1.0);
+        {
+            let _guard = SettleGuard::new(
+                ledger.clone(),
+                prices,
+                "m".into(),
+                usage,
+                fallback,
+                reservation,
+            );
+            // dropped here without complete()
+        }
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO); // reservation released, not leaked
+        assert_eq!(snap.spent, fallback); // conservative fallback charge
+    }
+}

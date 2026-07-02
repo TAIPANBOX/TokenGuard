@@ -10,6 +10,7 @@
 
 use crate::estimate::estimate_cost;
 use crate::provider::{ProviderError, ProviderResponse};
+use crate::settle::SettleGuard;
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -108,27 +109,30 @@ fn stream_managed(
     model: &str,
     st: &AppState,
 ) -> Response {
-    let ledger = st.ledger.clone();
-    let prices = st.prices.clone();
-    let usage_slot = resp.usage.clone();
     let inner = resp.body;
-    let fallback = reservation.amount;
-    let model = model.to_string();
-    // Capture the header values before `reservation` is moved into the stream.
+    // Capture the header values before `reservation` is moved into the guard.
     let run_id = reservation.run_id.clone();
     let step = reservation.step;
+    let guard = SettleGuard::new(
+        st.ledger.clone(),
+        st.prices.clone(),
+        model.to_string(),
+        resp.usage.clone(),
+        reservation.amount,
+        reservation,
+    );
 
-    // TODO: if the client disconnects mid-stream this wrapper is dropped before
-    // settling, leaking the reservation. A Drop guard should settle on cancel.
+    // The guard settles at end-of-stream via `complete()`; if this future is
+    // dropped first (client cancel) or an upstream error propagates via `?`, the
+    // guard's Drop settles instead, so the reservation is never leaked.
     let wrapped = async_stream::try_stream! {
+        let guard = guard;
         futures::pin_mut!(inner);
         while let Some(chunk) = inner.next().await {
             let chunk = chunk?;
             yield chunk;
         }
-        let usage = usage_slot.lock().unwrap().take();
-        let actual = usage.and_then(|u| prices.cost(&model, &u)).unwrap_or(fallback);
-        ledger.settle(&reservation, actual);
+        guard.complete();
     };
     // Pin with an explicit error type so `Body::from_stream` can pick up the
     // `Into<BoxError>` bound.
@@ -433,6 +437,42 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn client_cancel_midstream_still_settles() {
+        use futures::StreamExt;
+        // A managed streaming reservation whose body is only partially consumed
+        // (client disconnects) must still be settled — reservation released.
+        let st = state(
+            Mode::Enforce,
+            StubProvider {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                sse: true,
+            },
+        );
+        st.ledger.open_run("run-cancel", Microusd::from_usd(5.0));
+        let reservation = st
+            .ledger
+            .reserve("run-cancel", Microusd::from_usd(0.5))
+            .unwrap();
+        let resp = st
+            .provider
+            .send(HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+
+        let response = stream_managed(resp, reservation, None, "test-model", &st);
+        {
+            // Consume a single chunk, then drop the stream (simulated cancel).
+            let mut data = response.into_body().into_data_stream();
+            let _first = data.next().await;
+        }
+
+        let snap = st.ledger.snapshot("run-cancel").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO); // released, not leaked
+        assert!(snap.spent > Microusd::ZERO); // conservative fallback charge
     }
 
     #[tokio::test]

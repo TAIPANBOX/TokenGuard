@@ -25,7 +25,7 @@ Phase 2 (loop detection) and the `tokenfuse top` TUI.
 | `crates/gateway` — HTTP skeleton | ✅ done | axum server, `/healthz` + `/v1/messages`, estimate → enforce → forward → settle, 402 budget contract, shadow/warn/enforce, unmanaged pass-through, `x-fuse-*` response headers |
 | Gateway — real forwarding + SSE passthrough | ✅ done | `HttpProvider` (reqwest/rustls) streams chunks through; `UsageParser` extracts usage from Anthropic + OpenAI SSE and non-stream JSON; settle at end-of-stream. `TOKENFUSE_UPSTREAM` selects real vs stub. Verified live. |
 | Latency benchmark (p99 < 3 ms) | ✅ done | `examples/bench.rs`; decision path **p99 0.38 µs**, full in-process request **p99 4.67 µs** — ~3 orders under target. See BENCHMARKS.md |
-| Client-cancel settle guard | ⬜ todo | Drop guard so a mid-stream disconnect still settles (noted TODO in code) |
+| Client-cancel settle guard | ✅ done | `SettleGuard` settles on Drop — client cancel or upstream error mid-stream never leaks a reservation |
 | Loop detection | ⬜ todo | Phase 2 |
 | `tokenfuse top` TUI | ⬜ todo | Phase 1 (W2) |
 | Python SDK | ⬜ todo | Phase 1 |
@@ -33,7 +33,7 @@ Phase 2 (loop detection) and the `tokenfuse top` TUI.
 
 ## Test status
 
-`cargo test --all` — 32 passing (core: 19, gateway: 13, incl. SSE usage-parser + streaming passthrough tests). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: streaming request forwarded through the gateway to a real HTTP SSE upstream, all frames passed through, run settled.
+`cargo test --all` — 35 passing (core: 19, gateway: 16). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: streaming request forwarded through the gateway to a real HTTP SSE upstream, all frames passed through, run settled.
 
 ## How to run
 
