@@ -7,11 +7,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 
 ## Current stage
 
-**Phase 0 spike #1 landed: real forwarding + SSE passthrough.** The gateway now
-forwards to a real upstream over HTTP (`reqwest`, rustls), streams the response
-back chunk-by-chunk, parses token usage out of the stream (Anthropic + OpenAI
-shapes), and settles the real cost at end-of-stream. Verified live against a mock
-SSE upstream. Next: a latency benchmark (target p99 < 3 ms).
+**Phase 0 complete.** Real forwarding + SSE passthrough, and the latency
+benchmark that closes the spike: the enforcement decision path adds **~0.4 µs at
+p99** and a full in-process request is **~4.7 µs at p99** — ~3 orders of
+magnitude under the 3 ms target. Next: the client-cancel settle guard, then
+Phase 2 (loop detection) and the `tokenfuse top` TUI.
 
 ## Status by component
 
@@ -24,7 +24,7 @@ SSE upstream. Next: a latency benchmark (target p99 < 3 ms).
 | `crates/core` — policy | ✅ done | shadow/warn/enforce modes; per-step + max-steps rules; records "would block" in shadow |
 | `crates/gateway` — HTTP skeleton | ✅ done | axum server, `/healthz` + `/v1/messages`, estimate → enforce → forward → settle, 402 budget contract, shadow/warn/enforce, unmanaged pass-through, `x-fuse-*` response headers |
 | Gateway — real forwarding + SSE passthrough | ✅ done | `HttpProvider` (reqwest/rustls) streams chunks through; `UsageParser` extracts usage from Anthropic + OpenAI SSE and non-stream JSON; settle at end-of-stream. `TOKENFUSE_UPSTREAM` selects real vs stub. Verified live. |
-| Latency benchmark (p99 < 3 ms) | ⬜ next | Phase 0 spike #1 finale — the first public number |
+| Latency benchmark (p99 < 3 ms) | ✅ done | `examples/bench.rs`; decision path **p99 0.38 µs**, full in-process request **p99 4.67 µs** — ~3 orders under target. See BENCHMARKS.md |
 | Client-cancel settle guard | ⬜ todo | Drop guard so a mid-stream disconnect still settles (noted TODO in code) |
 | Loop detection | ⬜ todo | Phase 2 |
 | `tokenfuse top` TUI | ⬜ todo | Phase 1 (W2) |

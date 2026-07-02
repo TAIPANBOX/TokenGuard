@@ -107,6 +107,10 @@ Three ideas make this safe to put in production:
 2. **Fail-open by default.** If Tokenfuse itself has a problem, your traffic keeps flowing — it never becomes a single point of failure.
 3. **Metadata-only.** It measures cost and behavior; it does **not** store your prompt contents by default.
 
+### How fast is "in the path"?
+
+The enforcement decision (estimate → policy → reserve → settle) adds **~0.4 µs at p99**; a full request handled in-process is **~4.7 µs at p99** — three orders of magnitude under the 3 ms budget. Method and full table: [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `cargo run -p tokenfuse-gateway --release --example bench`.
+
 ---
 
 ## 🎯 What makes it different
