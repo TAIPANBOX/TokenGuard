@@ -1,0 +1,11 @@
+[package]
+name = "tokenfuse-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain for Tokenfuse: money, pricing, ledger, policy."
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
