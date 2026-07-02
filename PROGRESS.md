@@ -7,11 +7,7 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 
 ## Current stage
 
-**Phase 0 complete; Phase 2 underway.** Real forwarding + SSE passthrough at
-~0.4 µs p99 overhead, the settle guard, and now **loop / runaway detection**
-(identical-tool-call, ping-pong, context-growth). Next: the `tokenfuse top` TUI
-(needs a runs registry + observability endpoint), then the Python SDK and the
-Parquet trace sink.
+**Phase 1 + Phase 2 core largely in place.** Budget enforcement, real SSE forwarding (~0.4 µs p99 overhead), loop detection, an observability API, and the `tokenfuse top` TUI. Remaining headline items: the Python SDK and the Parquet trace sink (`tokenfuse sql`).
 
 ## Status by component
 
@@ -28,13 +24,13 @@ Parquet trace sink.
 | Client-cancel settle guard | ✅ done | `SettleGuard` settles on Drop — client cancel or upstream error mid-stream never leaks a reservation |
 | Loop detection | ✅ done | `crates/core/loops.rs`: identical-tool-call + ping-pong (from the request's own message history) + context-growth (per-run tracker). Wired in: enforce → `402 loop_detected`, shadow/warn → `x-fuse-would-block` header. Verified live. |
 | Observability API | ✅ done | `GET /v1/runs` (list runs, spend, %, killed) + `POST /v1/runs/{id}/kill` (hard stop, any mode). Backs the TUI + Slack kill-button |
-| `tokenfuse top` TUI | ⬜ next | Phase 1 (W2) — polls /v1/runs |
+| `tokenfuse top` TUI | ✅ done | ratatui / crossterm live view: runs table, spend/budget bars, %, steps, select + kill (`k`), refresh, quit. `tokenfuse top` subcommand; polls `/v1/runs` |
 | Python SDK | ⬜ todo | Phase 1 |
 | Parquet trace sink | ⬜ todo | Phase 2 (W8) |
 
 ## Test status
 
-`cargo test --all` — 45 passing (core: 27, gateway: 18). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
+`cargo test --all` — 49 passing (core: 27, gateway: 22). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
 
 ## How to run
 

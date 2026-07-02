@@ -8,6 +8,7 @@ pub mod provider;
 pub mod proxy;
 pub mod settle;
 pub mod state;
+pub mod tui;
 
 use axum::routing::{get, post};
 use axum::Router;

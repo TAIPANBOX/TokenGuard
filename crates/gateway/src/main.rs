@@ -15,6 +15,19 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // `tokenfuse top` launches the TUI; anything else starts the gateway.
+    if std::env::args().nth(1).as_deref() == Some("top") {
+        let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
+        let base = std::env::var("TOKENFUSE_URL").unwrap_or_else(|_| format!("http://{addr}"));
+        if let Err(e) = tokenfuse_gateway::tui::run(base).await {
+            eprintln!("tui error: {e}");
+        }
+        return;
+    }
+    serve().await;
+}
+
+async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
