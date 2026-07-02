@@ -143,19 +143,32 @@ async fn serve() {
     tracing::info!(?dlp, "secret scanning (DLP)");
     state = state.with_dlp(dlp);
 
-    // Opt in to the Parquet trace with TOKENFUSE_DATA_DIR; query it via
-    // `tokenfuse sql "..."`. Without it, telemetry is a no-op.
+    // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
+    // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.
+    use tokenfuse_gateway::sink::{EventSink, NullSink, ParquetSink, TeeSink};
+    let mut sink: Arc<dyn EventSink> = Arc::new(NullSink);
     if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {
         if !dir.is_empty() {
-            match tokenfuse_gateway::sink::ParquetSink::new(&dir, 256) {
-                Ok(sink) => {
+            match ParquetSink::new(&dir, 256) {
+                Ok(s) => {
                     tracing::info!(%dir, "recording trace to Parquet");
-                    state = state.with_sink(Arc::new(sink));
+                    sink = Arc::new(s);
                 }
                 Err(e) => tracing::warn!(%dir, "could not open trace dir: {e}"),
             }
         }
     }
+    if let Ok(endpoint) = std::env::var("TOKENFUSE_OTLP_ENDPOINT") {
+        if !endpoint.is_empty() {
+            tracing::info!(%endpoint, "exporting OTLP spans");
+            let otel = Arc::new(tokenfuse_gateway::otel::OtelSink::new(&endpoint));
+            sink = Arc::new(TeeSink {
+                first: sink,
+                second: otel,
+            });
+        }
+    }
+    state = state.with_sink(sink);
 
     let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)

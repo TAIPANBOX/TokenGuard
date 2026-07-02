@@ -7,6 +7,7 @@ pub mod embedder;
 pub mod estimate;
 pub mod firewall;
 pub mod obs;
+pub mod otel;
 pub mod provider;
 pub mod proxy;
 pub mod settle;
