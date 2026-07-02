@@ -252,6 +252,9 @@ pub struct StubProvider {
     /// When true, emit the body as a couple of SSE `data:` frames to exercise
     /// the streaming passthrough path.
     pub sse: bool,
+    /// Override the non-streaming JSON body (e.g. to inject a tool_use for
+    /// firewall tests). Ignored in SSE mode.
+    pub body_override: Option<String>,
 }
 
 impl Default for StubProvider {
@@ -260,6 +263,7 @@ impl Default for StubProvider {
             input_tokens: 1_000,
             output_tokens: 500,
             sse: false,
+            body_override: None,
         }
     }
 }
@@ -293,12 +297,15 @@ impl Provider for StubProvider {
                 ],
             )
         } else {
-            (
-                Some("application/json".to_string()),
-                vec![Bytes::from(format!(
+            let body = self.body_override.clone().unwrap_or_else(|| {
+                format!(
                     r#"{{"stub":true,"usage":{{"input_tokens":{},"output_tokens":{}}}}}"#,
                     self.input_tokens, self.output_tokens
-                ))],
+                )
+            });
+            (
+                Some("application/json".to_string()),
+                vec![Bytes::from(body)],
             )
         };
 
@@ -369,6 +376,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             sse: true,
+            body_override: None,
         };
         let resp = stub.send(HeaderMap::new(), Bytes::new()).await.unwrap();
         let collected: Vec<u8> = {

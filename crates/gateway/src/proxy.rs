@@ -19,6 +19,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
 use tokenfuse_core::cache::{CacheMode, Lookup};
+use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode, Reservation, SemanticCache};
 
 /// Where a non-streaming response should be cached after it settles.
@@ -195,6 +196,20 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
         Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate),
     };
 
+    // Agent firewall: accumulate the run's taint from this request (header +
+    // tool history) so the response's tool calls can be judged against it.
+    // Computed before `send` consumes `headers`.
+    let firewall_labels = if st.firewall.mode != FirewallMode::Off {
+        let mut labels = taint_header_labels(&headers);
+        labels.extend(taint::labels_for_tools(
+            &taint::tool_names_in(&request),
+            &st.firewall.sources,
+        ));
+        st.accumulate_taint(&run_id, labels)
+    } else {
+        Labels::new()
+    };
+
     let resp = match st.provider.send(headers, body).await {
         Ok(r) => r,
         Err(e) => {
@@ -215,6 +230,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
             &st,
             cache_ctx,
             cache_note,
+            firewall_labels,
         )
         .await
     }
@@ -291,6 +307,7 @@ async fn buffered_managed(
     st: &AppState,
     cache_ctx: Option<CacheCtx>,
     cache_note: Option<String>,
+    firewall_labels: Labels,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -330,6 +347,27 @@ async fn buffered_managed(
         step: reservation.step,
     });
 
+    // Agent firewall: judge the model's requested tool calls against the run's
+    // accumulated taint. Enforce → 403; shadow/warn → header note.
+    let mut firewall_note: Option<String> = None;
+    if st.firewall.mode != FirewallMode::Off {
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let resp_tools = taint::tool_names_in(&resp_json);
+        let requested = taint::capabilities_for_tools(&resp_tools, &st.firewall.capabilities);
+        if let Some(reason) = taint::evaluate(&firewall_labels, &requested, &st.firewall.rules) {
+            if st.firewall.mode == FirewallMode::Enforce {
+                return firewall_block(&reservation.run_id, &reason);
+            }
+            firewall_note = Some(reason);
+        }
+        // Executing these tools will taint future turns — record their labels now.
+        st.accumulate_taint(
+            &reservation.run_id,
+            taint::labels_for_tools(&resp_tools, &st.firewall.sources),
+        );
+    }
+
     // Store a successful response for future cache hits.
     if status == StatusCode::OK {
         if let Some(ctx) = cache_ctx {
@@ -367,7 +405,42 @@ async fn buffered_managed(
     if let Some(note) = cache_note {
         builder = builder.header("x-fuse-cache", note);
     }
+    if let Some(note) = firewall_note {
+        builder = builder.header("x-fuse-taint", format!("would-block: {note}"));
+    }
     builder.body(Body::from(bytes)).expect("valid response")
+}
+
+/// Firewall block: the model asked for a capability denied under the run's taint.
+fn firewall_block(run_id: &str, reason: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "taint_blocked",
+            "run_id": run_id,
+            "reason": reason,
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-taint", format!("blocked: {reason}"))
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// Parse the `X-Fuse-Taint` header (comma-separated labels the caller declares).
+fn taint_header_labels(headers: &HeaderMap) -> Labels {
+    header_str(headers, "x-fuse-taint")
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build a response served straight from the semantic cache.
@@ -622,6 +695,7 @@ mod tests {
                 input_tokens: 1_000,
                 output_tokens: 100_000,
                 sse: false,
+                body_override: None,
             },
         );
         let req = Request::post("/v1/messages")
@@ -666,6 +740,57 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn firewall_blocks_exec_after_web_taint() {
+        use crate::firewall::FirewallConfig;
+        let mut st = state(
+            Mode::Shadow,
+            StubProvider {
+                body_override: Some(
+                    r#"{"content":[{"type":"tool_use","name":"run_shell","input":{}}]}"#.into(),
+                ),
+                ..StubProvider::default()
+            },
+        );
+        st.firewall = Arc::new(FirewallConfig::defaults(FirewallMode::Enforce));
+
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "fw")
+            .header("x-fuse-taint", "web") // context touched the web
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        // Model wants run_shell (exec) but the context is web-tainted → 403.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "taint_blocked");
+    }
+
+    #[tokio::test]
+    async fn firewall_allows_exec_without_taint() {
+        use crate::firewall::FirewallConfig;
+        let mut st = state(
+            Mode::Shadow,
+            StubProvider {
+                body_override: Some(
+                    r#"{"content":[{"type":"tool_use","name":"run_shell","input":{}}]}"#.into(),
+                ),
+                ..StubProvider::default()
+            },
+        );
+        st.firewall = Arc::new(FirewallConfig::defaults(FirewallMode::Enforce));
+        // No taint header, no untrusted tools in history → exec is allowed.
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "fw2")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -807,6 +932,7 @@ mod tests {
                 input_tokens: 1_000,
                 output_tokens: 500,
                 sse: true,
+                body_override: None,
             },
         );
         st.ledger
@@ -841,6 +967,7 @@ mod tests {
                 input_tokens: 1_000,
                 output_tokens: 500,
                 sse: true,
+                body_override: None,
             },
         );
         let ledger = Arc::clone(&st.ledger);

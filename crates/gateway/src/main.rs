@@ -128,6 +128,11 @@ async fn serve() {
     )));
     tracing::info!(?cache_mode, "semantic cache");
 
+    // Agent firewall: TOKENFUSE_FIREWALL = off | shadow | enforce (default off).
+    let firewall = tokenfuse_gateway::firewall::from_env();
+    tracing::info!(mode = ?firewall.mode, "agent firewall");
+    state = state.with_firewall(Arc::new(firewall));
+
     // Opt in to the Parquet trace with TOKENFUSE_DATA_DIR; query it via
     // `tokenfuse sql "..."`. Without it, telemetry is a no-op.
     if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {

@@ -38,6 +38,7 @@ __all__ = [
     "LoopDetected",
     "PolicyViolation",
     "Killed",
+    "TaintBlocked",
 ]
 
 DEFAULT_GATEWAY = "http://127.0.0.1:4100"
@@ -115,12 +116,22 @@ class Killed(FuseError):
     """The run was killed by an operator (error type ``killed``)."""
 
 
+class TaintBlocked(FuseError):
+    """The agent firewall blocked a tool call under a tainted context
+    (error type ``taint_blocked``, HTTP 403)."""
+
+
 _ERROR_TYPES: dict[str, type[FuseError]] = {
     "budget_exceeded": BudgetExceeded,
     "loop_detected": LoopDetected,
     "policy_violation": PolicyViolation,
     "killed": Killed,
+    "taint_blocked": TaintBlocked,
 }
+
+# Statuses that carry a TokenFuse error contract: 402 (budget/policy) and
+# 403 (agent firewall / taint).
+_FUSE_STATUSES = (402, 403)
 
 
 def _coerce_body(body: Any) -> dict[str, Any]:
@@ -140,7 +151,7 @@ def raise_for_fuse(status_code: int, body: Any) -> None:
 
     ``body`` may be a dict, a JSON string, or raw bytes.
     """
-    if status_code != 402:
+    if status_code not in _FUSE_STATUSES:
         return
     data = _coerce_body(body)
     err = data.get("error")
@@ -161,14 +172,14 @@ def raise_for_fuse(status_code: int, body: Any) -> None:
 def check_response(response: Any) -> None:
     """Convenience for ``requests``/``httpx`` responses: inspect a duck-typed
     object with ``.status_code`` and ``.json()``/``.text`` and raise on a
-    TokenFuse 402.
+    TokenFuse 402/403.
     """
     status = getattr(response, "status_code", None)
-    if status != 402:
+    if status not in _FUSE_STATUSES:
         return
     body: Any
     try:
         body = response.json()
     except Exception:  # noqa: BLE001 — fall back to text
         body = getattr(response, "text", "")
-    raise_for_fuse(402, body)
+    raise_for_fuse(status, body)
