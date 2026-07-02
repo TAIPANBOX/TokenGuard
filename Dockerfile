@@ -33,6 +33,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 tokenfuse
 COPY --from=build /src/target/release/tokenfuse /usr/local/bin/tokenfuse
+# A writable data dir owned by the non-root user. When you mount a fresh named
+# volume at /data, Docker copies this ownership onto it, so durable raft storage
+# (TOKENFUSE_CLUSTER_DATA_DIR=/data) works without running as root.
+RUN mkdir -p /data && chown tokenfuse:tokenfuse /data
+VOLUME /data
 USER tokenfuse
 # Bind on all interfaces inside the container; map the port when you run it.
 ENV TOKENFUSE_ADDR=0.0.0.0:4100

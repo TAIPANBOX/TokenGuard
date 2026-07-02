@@ -311,8 +311,12 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
     {
         Ok(rl) => Some(rl),
         Err(e) => {
+            // Cluster mode was explicitly requested (TOKENFUSE_CLUSTER_ID set).
+            // Fail fast rather than silently degrade to a non-HA local ledger —
+            // silently losing durability/HA is worse than a clear startup error.
             tracing::error!("failed to start cluster ledger: {e}");
-            None
+            eprintln!("fatal: TOKENFUSE_CLUSTER_* set but the cluster ledger failed to start: {e}");
+            std::process::exit(1);
         }
     }
 }
