@@ -70,9 +70,52 @@ async fn main() {
                 ),
             }
         }
+        // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
+        Some("mcp-broker") => mcp_broker().await,
         // Anything else starts the gateway.
         _ => serve().await,
     }
+}
+
+/// Run the MCP credential-broker: an agent points its MCP client here; the broker
+/// injects secret handles and scans tool listings before forwarding upstream.
+async fn mcp_broker() {
+    use std::sync::Arc;
+    use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let upstream = std::env::var("TOKENFUSE_MCP_UPSTREAM").unwrap_or_default();
+    if upstream.is_empty() {
+        eprintln!("set TOKENFUSE_MCP_UPSTREAM=<real MCP server url>");
+        return;
+    }
+    let vault = tokenfuse_core::SecretVault::from_pairs(
+        &std::env::var("TOKENFUSE_MCP_SECRETS").unwrap_or_default(),
+    );
+    let scan = match std::env::var("TOKENFUSE_MCP_SCAN").as_deref() {
+        Ok("off") => ScanMode::Off,
+        Ok("block") => ScanMode::Block,
+        _ => ScanMode::Warn,
+    };
+    let state = Arc::new(BrokerState {
+        upstream: upstream.clone(),
+        vault,
+        scan,
+        client: reqwest::Client::new(),
+    });
+    let addr = std::env::var("TOKENFUSE_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:4200".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind");
+    tracing::info!(%addr, %upstream, "mcp credential-broker listening");
+    axum::serve(listener, app(state))
+        .await
+        .expect("server error");
 }
 
 async fn serve() {

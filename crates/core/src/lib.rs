@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod money;
 pub mod policy;
 pub mod pricing;
+pub mod secretbroker;
 pub mod taint;
 
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};
@@ -21,4 +22,5 @@ pub use loops::{AnomalyConfig, Growth, Window};
 pub use money::Microusd;
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
 pub use pricing::{ModelPrice, PriceBook, Usage};
+pub use secretbroker::{inject_secrets, Injection, SecretVault};
 pub use taint::{FirewallMode, Labels, TaintRule};
