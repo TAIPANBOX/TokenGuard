@@ -6,7 +6,8 @@
 
 **Observability shows you the fire. TokenFuse is the automatic fire extinguisher.**
 
-![status](https://img.shields.io/badge/status-planning-yellow)
+![release](https://img.shields.io/badge/release-v0.1.0-brightgreen)
+![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
 ![control%20plane](https://img.shields.io/badge/control%20plane-Go-00ADD8)

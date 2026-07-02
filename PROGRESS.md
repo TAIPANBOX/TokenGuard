@@ -3,11 +3,24 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-02 (HA cluster: transport + gateway integration + hierarchical budgets)
+**Last updated:** 2026-07-02 (HA membership + durable redb + cloud kill-switch)
 
 ## Current stage
 
-**Phase 1 complete; Phase 2 core in place.** Budget enforcement, real SSE forwarding (~0.4 µs p99 overhead), loop detection, observability API, `tokenfuse top` TUI, Python SDK, and the Parquet trace sink with `tokenfuse sql`. The entire "90 seconds to wow" demo now runs on real code. Next (later phases): WASM policies, backtesting, hierarchical sub-agent budgets, the semantic cache, then Phase 4 (eBPF Radar, raft cluster, taint/agent-firewall, MCP gateway).
+**Phases 1–4 implemented; v0.1.0 released.** The full request path (budget
+enforcement with `TOKENFUSE_MODE=shadow|warn|enforce`, real SSE forwarding at
+~0.4 µs p99 in-process / ~1–2 ms on the wire, loop detection, hierarchical
+sub-agent budgets), the intelligence/ops layer (semantic cache, WASM policies,
+backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the
+security packs (agent firewall/taint, DLP, MCP scanner), eBPF Radar, the
+**HA raft cluster** (in-process + HTTP transport, hierarchical + durable redb
+storage, runtime membership changes), and the **hosted Cloud** (Go control plane
++ dashboard, gateway telemetry, fleet-wide kill-switch).
+
+Shipped as container images on GHCR: `tokenfuse`, `tokenfuse:cluster`,
+`tokenfuse-control-plane` — runs anywhere, no dedicated server. Remaining:
+central budgets from the Cloud, a richer (Next.js) dashboard, linearizable
+follower reads, HTTPS/auth on cluster endpoints, a live MCP credential-broker.
 
 ## Status by component
 
@@ -70,6 +83,10 @@ TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages cargo run -p tokenfuse-
 
 ## Next steps
 
-1. Latency benchmark (target p99 < 3 ms) — the first public number.
-2. Drop guard so a client cancel mid-stream still settles the reservation.
-3. Loop detection (Phase 2), then `tokenfuse top` TUI and the Python SDK.
+1. **Central budgets from the Cloud** — define per-run/org limits in the control
+   plane and push them to gateways (complements the fleet-wide kill-switch).
+2. **Richer dashboard** — the roadmap's Next.js app (charts, alerts, org/RBAC);
+   today's embedded page is the dependency-free v1.
+3. **Linearizable follower reads** (`ensure_linearizable` + leader forward) and
+   **HTTPS/auth** on the raft + admin endpoints for cross-machine deploys.
+4. **Live MCP credential-broker** (needs an MCP transport).
