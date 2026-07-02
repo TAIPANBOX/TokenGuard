@@ -102,6 +102,22 @@ async fn serve() {
         "default",
     );
 
+    // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
+    // records would-hits without serving them — safe to drop in).
+    let cache_mode = match std::env::var("TOKENFUSE_CACHE").as_deref() {
+        Ok("on") => tokenfuse_core::cache::CacheMode::On,
+        Ok("off") => tokenfuse_core::cache::CacheMode::Off,
+        _ => tokenfuse_core::cache::CacheMode::Shadow,
+    };
+    state = state.with_cache(Arc::new(tokenfuse_core::SemanticCache::new(
+        Box::new(tokenfuse_core::cache::HashEmbedder::default()),
+        tokenfuse_core::cache::CacheConfig {
+            mode: cache_mode,
+            ..Default::default()
+        },
+    )));
+    tracing::info!(?cache_mode, "semantic cache");
+
     // Opt in to the Parquet trace with TOKENFUSE_DATA_DIR; query it via
     // `tokenfuse sql "..."`. Without it, telemetry is a no-op.
     if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {

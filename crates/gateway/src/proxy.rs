@@ -11,13 +11,21 @@
 use crate::estimate::estimate_cost;
 use crate::provider::{ProviderError, ProviderResponse};
 use crate::settle::SettleGuard;
+use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
-use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode, Reservation};
+use tokenfuse_core::cache::{CacheMode, Lookup};
+use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode, Reservation, SemanticCache};
+
+/// Where a non-streaming response should be cached after it settles.
+struct CacheCtx {
+    partition: u64,
+    core: String,
+}
 
 /// Default per-run budget when neither the request nor the policy sets one.
 const DEFAULT_RUN_BUDGET: Microusd = Microusd(5_000_000); // $5.00
@@ -62,6 +70,53 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
             &st.policy_id,
             "run killed by operator",
         );
+    }
+
+    // Semantic cache (non-streaming, tool-free requests only). A hit in `on`
+    // mode short-circuits before we spend anything; in shadow it just annotates.
+    let mut cache_ctx: Option<CacheCtx> = None;
+    let mut cache_note: Option<String> = None;
+    if !parsed.stream && st.cache.mode() != CacheMode::Off && cache_eligible(&request) {
+        let task_type = header_str(&headers, "x-fuse-task-type").unwrap_or_default();
+        let core = semantic_core(&request);
+        let partition = SemanticCache::partition_key(
+            &parsed.model,
+            &system_text(&request),
+            &tools_text(&request),
+            &task_type,
+            "default",
+        );
+        if let Some(hit) = st.cache.get(partition, &core, now_millis()) {
+            match st.cache.mode() {
+                CacheMode::On => {
+                    let step = st
+                        .ledger
+                        .snapshot(&run_id)
+                        .map(|s| s.steps + 1)
+                        .unwrap_or(1);
+                    st.sink.record(CallRecord {
+                        ts_millis: now_millis(),
+                        run_id: run_id.clone(),
+                        model: parsed.model.clone(),
+                        decision: "cache_hit".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microusd: 0,
+                        step,
+                    });
+                    return cached_response(&run_id, &hit, st.policy.mode);
+                }
+                CacheMode::Shadow => {
+                    cache_note = Some(format!(
+                        "would-hit; similarity={:.3}; saved=${:.6}",
+                        hit.similarity,
+                        hit.saved_microusd as f64 / 1e6
+                    ));
+                }
+                CacheMode::Off => {}
+            }
+        }
+        cache_ctx = Some(CacheCtx { partition, core });
     }
 
     let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
@@ -140,7 +195,16 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     if parsed.stream {
         stream_managed(resp, reservation, would_block, &parsed.model, &st)
     } else {
-        buffered_managed(resp, reservation, would_block, &parsed.model, &st).await
+        buffered_managed(
+            resp,
+            reservation,
+            would_block,
+            &parsed.model,
+            &st,
+            cache_ctx,
+            cache_note,
+        )
+        .await
     }
 }
 
@@ -206,12 +270,15 @@ fn stream_managed(
 
 /// Non-streaming managed response: buffer the body, settle with the exact cost,
 /// and return full `x-fuse-*` accounting headers.
+#[allow(clippy::too_many_arguments)]
 async fn buffered_managed(
     resp: ProviderResponse,
     reservation: Reservation,
     would_block: Option<String>,
     model: &str,
     st: &AppState,
+    cache_ctx: Option<CacheCtx>,
+    cache_note: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -240,8 +307,8 @@ async fn buffered_managed(
         .unwrap_or(actual);
 
     let u = usage.unwrap_or_default();
-    st.sink.record(crate::sink::CallRecord {
-        ts_millis: crate::sink::now_millis(),
+    st.sink.record(CallRecord {
+        ts_millis: now_millis(),
         run_id: reservation.run_id.clone(),
         model: model.to_string(),
         decision: "allow".into(),
@@ -250,6 +317,20 @@ async fn buffered_managed(
         cost_microusd: actual.0,
         step: reservation.step,
     });
+
+    // Store a successful response for future cache hits.
+    if status == StatusCode::OK {
+        if let Some(ctx) = cache_ctx {
+            st.cache.put(
+                ctx.partition,
+                &ctx.core,
+                bytes.clone(),
+                content_type.clone(),
+                actual.0,
+                now_millis(),
+            );
+        }
+    }
 
     let mut builder = Response::builder()
         .status(status)
@@ -271,7 +352,29 @@ async fn buffered_managed(
     if let Some(reason) = would_block {
         builder = builder.header("x-fuse-would-block", reason);
     }
+    if let Some(note) = cache_note {
+        builder = builder.header("x-fuse-cache", note);
+    }
     builder.body(Body::from(bytes)).expect("valid response")
+}
+
+/// Build a response served straight from the semantic cache.
+fn cached_response(run_id: &str, hit: &Lookup, mode: Mode) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", hit.content_type.clone())
+        .header("x-fuse", "cached")
+        .header("x-fuse-cache", "hit")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-mode", mode_str(mode))
+        .header("x-fuse-similarity", format!("{:.3}", hit.similarity))
+        .header("x-fuse-cost-usd", "0.000000")
+        .header(
+            "x-fuse-saved-usd",
+            format!("{:.6}", hit.saved_microusd as f64 / 1e6),
+        )
+        .body(Body::from(hit.response.clone()))
+        .expect("valid response")
 }
 
 /// Unmanaged pass-through (no run id): stream the upstream body straight back
@@ -356,6 +459,62 @@ fn parse_request(value: &serde_json::Value) -> ParsedRequest {
             .and_then(|s| s.as_bool())
             .unwrap_or(false),
     }
+}
+
+/// A request is cache-eligible only if it defines no tools (tool calls can have
+/// side effects and must not be replayed from cache).
+fn cache_eligible(request: &serde_json::Value) -> bool {
+    match request.get("tools") {
+        None => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// The system prompt text (Anthropic `system` field), for the partition key.
+fn system_text(request: &serde_json::Value) -> String {
+    request
+        .get("system")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A stable string for the tools schema, for the partition key.
+fn tools_text(request: &serde_json::Value) -> String {
+    request
+        .get("tools")
+        .map(|t| t.to_string())
+        .unwrap_or_default()
+}
+
+/// The "semantic core" of a request: the last user message's text, truncated.
+/// Handles Anthropic (string or content-block array) and OpenAI (string).
+fn semantic_core(request: &serde_json::Value) -> String {
+    let mut text = String::new();
+    if let Some(messages) = request.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages.iter().rev() {
+            if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+                continue;
+            }
+            match msg.get("content") {
+                Some(serde_json::Value::String(s)) => text = s.clone(),
+                Some(serde_json::Value::Array(blocks)) => {
+                    let mut buf = String::new();
+                    for b in blocks {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            buf.push_str(t);
+                            buf.push(' ');
+                        }
+                    }
+                    text = buf.trim().to_string();
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
+    text.chars().take(512).collect()
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -495,6 +654,38 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn cache_on_serves_second_identical_request() {
+        use tokenfuse_core::cache::{CacheConfig, CacheMode, HashEmbedder};
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.cache = Arc::new(SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::On,
+                threshold: 0.9,
+                ..Default::default()
+            },
+        ));
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"how do refunds work?"}]}"#;
+        let mk = || {
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "run-c")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(payload))
+                .unwrap()
+        };
+
+        // First call: forwarded and stored.
+        let r1 = call(st.clone(), mk()).await;
+        assert_eq!(r1.headers().get("x-fuse").unwrap(), "managed");
+
+        // Second identical call: served from cache, $0.
+        let r2 = call(st.clone(), mk()).await;
+        assert_eq!(r2.headers().get("x-fuse").unwrap(), "cached");
+        assert_eq!(r2.headers().get("x-fuse-cache").unwrap(), "hit");
+        assert_eq!(r2.headers().get("x-fuse-cost-usd").unwrap(), "0.000000");
     }
 
     #[tokio::test]

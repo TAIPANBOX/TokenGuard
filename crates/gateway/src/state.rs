@@ -4,7 +4,8 @@ use crate::provider::Provider;
 use crate::sink::{EventSink, NullSink};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokenfuse_core::{Ledger, Policy, PriceBook};
+use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
+use tokenfuse_core::{Ledger, Policy, PriceBook, SemanticCache};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
 /// detector. Bounded so a long-lived run cannot grow it without limit.
@@ -24,6 +25,8 @@ pub struct AppState {
     pub policy_id: Arc<str>,
     /// Where settled calls are recorded (Parquet, or a no-op by default).
     pub sink: Arc<dyn EventSink>,
+    /// Semantic response cache (Off by default).
+    pub cache: Arc<SemanticCache>,
     history: History,
     killed: Killed,
 }
@@ -43,6 +46,10 @@ impl AppState {
             provider,
             policy_id: policy_id.into(),
             sink: Arc::new(NullSink),
+            cache: Arc::new(SemanticCache::new(
+                Box::new(HashEmbedder::default()),
+                CacheConfig::default(), // Off
+            )),
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -51,6 +58,12 @@ impl AppState {
     /// Attach an event sink (e.g. the Parquet trace). Chainable.
     pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.sink = sink;
+        self
+    }
+
+    /// Attach a semantic cache. Chainable.
+    pub fn with_cache(mut self, cache: Arc<SemanticCache>) -> Self {
+        self.cache = cache;
         self
     }
 

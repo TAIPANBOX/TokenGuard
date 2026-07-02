@@ -27,10 +27,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | `tokenfuse top` TUI | ✅ done | ratatui / crossterm live view: runs table, spend/budget bars, %, steps, select + kill (`k`), refresh, quit. `tokenfuse top` subcommand; polls `/v1/runs` |
 | Python SDK | ✅ done | `sdk/python` — dependency-free helpers: `run_headers`, `gateway_url`, and typed exceptions (`BudgetExceeded`/`LoopDetected`/`PolicyViolation`/`Killed`) via `raise_for_fuse`/`check_response`. Own CI job (pytest, 9 tests) |
 | Parquet trace sink (`tokenfuse sql`) | ✅ done | `sink.rs`: settled calls → rotating Parquet segments (opt-in via `TOKENFUSE_DATA_DIR`; `NullSink` default). `sqlq.rs` + `tokenfuse sql "…"` query the trace with DataFusion. Verified live end-to-end. |
+| Semantic cache (Ring 1.1) | ✅ done | `crates/core/cache.rs`: hard-partition + cosine similarity, entity-guard, length-ratio guard, TTL, FIFO eviction; pluggable `Embedder` (default `HashEmbedder`, ONNX later). Wired for non-streaming tool-free calls; `TOKENFUSE_CACHE=off\|shadow\|on`. On-hit serves `$0` with `x-fuse-saved-usd`. Verified live. |
 
 ## Test status
 
-`cargo test --all` — 52 passing (core: 27, gateway: 25); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live end-to-end: recorded a trace, then `tokenfuse sql "select run_id, sum(cost_microusd)… group by run_id"` returned per-run spend.
+`cargo test --all` — 60 passing (core: 34, gateway: 26); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: Parquet trace + `tokenfuse sql`, and a semantic cache hit serving a repeat request for $0 (saved $0.0105, similarity 1.000).
 
 ## How to run
 
