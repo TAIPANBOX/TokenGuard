@@ -2,11 +2,11 @@
 
 # 🧯 TokenFuse
 
-### Runtime control for AI agents — budgets, runaway detection, and a kill-switch.
+### The runtime firewall for AI agents — enforce budgets, stop runaways, keep secrets out of the model.
 
 **Observability shows you the fire. TokenFuse is the automatic fire extinguisher.**
 
-![release](https://img.shields.io/badge/release-v0.1.0-brightgreen)
+![release](https://img.shields.io/badge/release-v0.2.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -17,13 +17,48 @@
 
 ---
 
-## 🧠 In plain words (30-second version)
+TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers. It watches every call, adds up the real cost as it happens, and — the instant an agent goes rogue (burns through its budget, spins in a loop, or tries to leak a secret) — it **cuts the circuit in real time**, before the damage lands. You point your agent at it with a one-line base-URL change; no SDK, no rewrite.
 
-Modern AI **agents** don't make one call to an AI model — they make *hundreds* in a loop, thinking, retrying, calling tools. When an agent gets stuck in a loop, it keeps calling the model… and every call costs money. People have woken up to **thousand-dollar bills from a single bug**.
+> **⚡ Try it in one command** — no signup, no config:
+> ```bash
+> docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+> ```
+> Full walkthrough: [**🚀 Get started**](#-get-started).
 
-The scary part: your normal monitoring **can't see it**. A looping agent still looks "healthy" — it returns `200 OK`. The bill is the only symptom, and by then it's too late.
+---
 
-> **TokenFuse sits between your agent and the AI provider like a fuse in an electrical circuit.** It watches every call, adds up the real cost live, and the moment an agent goes rogue — burns through its budget or spins in a loop — it *cuts the circuit* before the damage is done. Then it pings you on Slack with a **[Kill]** button.
+## 📑 Table of contents
+
+- [The problem TokenFuse solves](#-the-problem-tokenfuse-solves)
+- [**🚀 Get started**](#-get-started) ← install & first run
+- [How it works](#-how-it-works)
+- [How TokenFuse compares](#-how-tokenfuse-compares) ← vs. observability, gateways, guardrails
+- [What's inside](#-whats-inside)
+- [Architecture](#-architecture)
+- [Project status](#-project-status)
+- [The bigger picture](#-the-bigger-picture-a-runtime-firewall)
+- [Who is this for?](#-who-is-this-for)
+- [Glossary](#-glossary-for-newcomers) · [FAQ](#-faq) · [Docs](#-documentation)
+
+---
+
+## 🔥 The problem TokenFuse solves
+
+A chatbot makes **one** call to an LLM. An **agent** makes *hundreds* — it thinks, calls a tool, reads the result, thinks again, retries, and loops. That loop is what makes agents powerful, and it's also what makes them dangerous in three specific ways:
+
+### 1. Cost runs away silently
+
+Agents burn tokens **10–100× faster** than a chatbot, and a single bad loop compounds fast — one documented code-review agent ballooned from **2,000 to 120,000 tokens** on a *single task* after a self-improvement loop. The failure mode that hurts most is that **nothing looks wrong**: a looping agent still returns `200 OK`, so your APM stays green while the meter spins. The bill is the first and only symptom — and by then the money is spent.
+
+### 2. "Per-key" limits don't understand agents
+
+The unit that matters for an agent is the **run** — one whole task, start to finish, spanning many calls and often several sub-agents. Traditional controls cap a *user* or an *API key*. Neither can say "this one task has a $2 ceiling," neither notices that call #34 is identical to call #31 (a loop), and neither can stop a task mid-flight.
+
+### 3. Agents are a new, live attack surface
+
+Autonomous agents read untrusted web pages, call external **MCP** tools, and hold credentials. **65%** of organizations reported an AI-agent security incident in the last year, and **82%** discovered a *shadow* agent they didn't know was running. Prompt injection, secret exfiltration, and tool "rug-pulls" are runtime problems — they can't be fixed by a code review before deploy.
+
+**TokenFuse addresses all three, in the request path, in real time** — enforcing per-run budgets, detecting loops, and acting as a security boundary for what agents can spend and leak.
 
 <div align="center">
 
@@ -41,57 +76,78 @@ flowchart LR
 
 ---
 
-> **⚡ Try it in one command** — no signup, no config:
-> ```bash
-> docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
-> ```
-> Full walkthrough below: [**🚀 Get started**](#-get-started).
+## 🚀 Get started
 
----
+TokenFuse is a **proxy**: start it, then point your agent at it instead of the provider. Three steps, ~2 minutes.
 
-## 📑 Table of contents
+### Step 1 — Start TokenFuse
 
-- [**🚀 Get started**](#-get-started) ← install & first run
-- [The problem](#-the-problem-in-numbers)
-- [How it works](#-how-it-works)
-- [What makes it different](#-what-makes-it-different)
-- [Feature overview](#-feature-overview)
-- [Architecture](#-architecture)
-- [Roadmap](#-roadmap)
-- [The bigger picture: capability packs](#-the-bigger-picture-capability-packs)
-- [90 seconds to "wow"](#-90-seconds-to-wow)
-- [Who is this for?](#-who-is-this-for)
-- [Glossary for newcomers](#-glossary-for-newcomers)
-- [FAQ](#-faq)
-- [Project status & docs](#-project-status--documentation)
+Published to GitHub Container Registry, so it runs anywhere with Docker — nothing to compile:
 
----
+```bash
+docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+```
 
-## 🔥 The problem, in numbers
+A working gateway on **http://localhost:4100**, using a built-in fake provider so you can try it offline.
 
-These figures come from mid-2026 industry reports (DORA, Stack Overflow, GitGuardian, CSA, OWASP). Full sources in [docs/01-research.md](docs/01-research.md).
+<details><summary>Prefer to build from source? (needs Rust)</summary>
 
-| What's happening | The number |
-|---|---|
-| How much faster agents burn tokens vs. a chatbot | **10–100×** |
-| A real code-review agent that ballooned after a self-improvement loop | **2,000 → 120,000** tokens on one task |
-| Organizations that hit an AI-agent security incident in the past year | **65%** |
-| Organizations that discovered a *shadow* (unknown) AI agent | **82%** |
-| Teams running RAG (AI + your own data) in production | **72%** |
+```bash
+git clone https://github.com/TAIPANBOX/tokenfuse.git
+cd tokenfuse
+cargo run -p tokenfuse-gateway      # gateway on http://localhost:4100
+```
+</details>
 
-**Why existing tools don't solve it:**
+### Step 2 — Point it at your real LLM provider
 
-- 🪞 **Observability tools** (Langfuse, Helicone) are a *rearview mirror* — they tell you what you already spent.
-- 🚦 **Gateways** (LiteLLM, Portkey) can cap a key or a user, but have **no idea what a "run" is** and can't detect a loop.
-- 🔕 **Your APM** (Datadog etc.) sees `200 OK` and stays silent while the agent spins.
+Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your agent's traffic to `localhost:4100`. Your provider API key is passed straight through — TokenFuse never needs it.
 
-TokenFuse is the missing piece: it **stops the bleeding in real time**, not after the invoice.
+```bash
+docker run -p 4100:4100 \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse
+```
+
+Then change **one line** in your app — the base URL:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4100   # Anthropic SDK
+export OPENAI_BASE_URL=http://localhost:4100       # OpenAI-style SDKs
+```
+
+Your agent runs exactly as before — TokenFuse just watches every call.
+
+### Step 3 — Give a run a budget
+
+Add two headers: a **run id** (a name for the whole task) and a **budget**. TokenFuse tallies the real cost live and returns **HTTP 402** the moment the task would blow past its cap.
+
+```bash
+curl http://localhost:4100/v1/messages \
+  -H "content-type: application/json" \
+  -H "x-fuse-run-id: my-agent-task-1" \
+  -H "x-fuse-budget-usd: 0.50" \
+  -d '{"model":"claude-sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+- **No `x-fuse-run-id`?** The call is passed through untouched — safe to drop in.
+- **Live view:** `docker exec <container> tokenfuse top` shows every run and its $/min.
+
+**Observe first, then enforce.** By default TokenFuse runs in **shadow** mode — it records what it *would* block but changes nothing, so you can drop it in risk-free. Flip to **enforce** when you trust it:
+
+```bash
+docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse
+```
+
+`TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
 
 ---
 
 ## ⚙️ How it works
 
-Every request flows through TokenFuse. It estimates the cost *before* the call, reserves it against a budget, and only forwards the call if it's safe. After the response, it reconciles the real cost.
+Every request flows through TokenFuse. It estimates the cost *before* the call, reserves it against the run's budget, forwards it only if it's safe, then reconciles the real cost from the streamed response.
 
 ```mermaid
 sequenceDiagram
@@ -111,131 +167,82 @@ sequenceDiagram
     end
 ```
 
-Three ideas make this safe to put in production:
+Three properties make this safe in production:
 
-1. **Shadow → Warn → Enforce.** Start in *shadow* mode: TokenFuse watches and reports what it *would* have blocked, changing nothing. Flip to *enforce* only when you trust it.
-2. **Fail-open by default.** If TokenFuse itself has a problem, your traffic keeps flowing — it never becomes a single point of failure.
-3. **Metadata-only.** It measures cost and behavior; it does **not** store your prompt contents by default.
+1. **Shadow → Warn → Enforce.** Start in shadow mode (observe only); flip to enforce when you trust it.
+2. **Fail-open by default.** If TokenFuse itself has trouble, your traffic keeps flowing — it never becomes a single point of failure. (And for the reverse — never *losing* a budget — it can run as a raft-replicated [HA cluster](docs/10-ha-cluster.md).)
+3. **Metadata-only.** It measures cost and behavior; it does **not** store prompt contents by default.
 
-### How fast is "in the path"?
-
-The enforcement decision (estimate → policy → reserve → settle) adds **~0.4 µs at p99**; a full request handled in-process is **~4.7 µs at p99** — three orders of magnitude under the 3 ms budget. Method and full table: [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `cargo run -p tokenfuse-gateway --release --example bench`, or the on-the-wire benchmark with [`bench/run.sh`](bench/run.sh).
+**Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~1 ms p50 / ~2 ms p99** over a direct provider call — negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
-## 🚀 Get started
+## 🎯 How TokenFuse compares
 
-TokenFuse is a **proxy**: you start it, then point your agent at it instead of the provider. Three steps, ~2 minutes. No SDK, no code changes.
+There are excellent tools *around* this problem. None of them sit in the request path and **act on a per-run basis** the way TokenFuse does. The categories:
 
-### Step 1 — Start TokenFuse
+| Category | Examples | What they do | The gap |
+|---|---|---|---|
+| **Observability / tracing** | Langfuse, Helicone, LangSmith | Record calls, dashboards, evals, cost reports | A rearview mirror — they tell you what you *already spent* |
+| **AI gateways / proxies** | LiteLLM, Portkey, Cloudflare AI Gateway | Routing, caching, fallbacks, **per-key / per-user** rate + spend limits | Key-scoped, not **run**-scoped; no loop detection; can't stop a task mid-flight |
+| **FinOps / cost tools** | Vantage, CloudZero | Attribute cloud spend after the fact | Not in the request path; can't prevent anything |
+| **Agent guardrails** | Guardrails AI, Lakera, NeMo | Content safety, prompt-injection filtering | Focused on *content*, usually SDK-level; no cost / loop / runtime enforcement |
 
-The image is published to GitHub Container Registry, so it runs anywhere with Docker — nothing to compile:
+### Capability matrix
 
-```bash
-docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
-```
+| Capability | 🧯 TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
+|---|:---:|:---:|:---:|:---:|
+| Show how much you spent | ✅ | ✅ | ✅ | — |
+| Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ |
+| **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial | ❌ |
+| **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
+| **Enforce — stop before the damage** | ✅ | ❌ | ⚠️ key caps only | ⚠️ content only |
+| Live kill-switch (from Slack / dashboard) | ✅ | ❌ | ❌ | ❌ |
+| **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ |
+| Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial |
+| Shadow-agent discovery (eBPF) | ✅ | ❌ | ❌ | ❌ |
 
-That's a working gateway on **http://localhost:4100** using a built-in fake provider, so you can try it offline.
+### What has no equivalent we're aware of
 
-<details><summary>Prefer to build from source? (needs Rust)</summary>
+TokenFuse's core bet is **enforcement, not observation** — and a few of its capabilities have, to our knowledge, no direct equivalent in another tool:
 
-```bash
-git clone https://github.com/TAIPANBOX/tokenfuse.git
-cd tokenfuse
-cargo run -p tokenfuse-gateway      # gateway on http://localhost:4100
-```
-</details>
+- **Loop-aware enforcement at the proxy.** Gateways cap a key; none *detect a runaway loop* and cut it off mid-task.
+- **Per-run budgets linearized across an HA cluster.** Reserve/settle runs through a raft state machine, so several gateways serving the same run can't *both* slip past one ceiling — a distributed no-double-spend guarantee for budgets.
+- **MCP credential brokering.** The agent holds only a *handle* (`{{secret:token}}`); the real secret is injected at the boundary, so it never enters the prompt, trace, or the model's memory.
+- **eBPF shadow-agent discovery.** Find agents by the LLM traffic they emit, with zero application changes.
 
-### Step 2 — Point it at your real LLM provider
-
-Tell TokenFuse where the real provider is with `TOKENFUSE_UPSTREAM`, then send your agent's traffic to `localhost:4100`. Your provider API key is passed straight through — TokenFuse never needs it.
-
-```bash
-docker run -p 4100:4100 \
-  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse
-```
-
-Then in your app, change **one line** — the base URL:
-
-```bash
-# Anthropic SDK
-export ANTHROPIC_BASE_URL=http://localhost:4100
-# OpenAI-style SDKs
-export OPENAI_BASE_URL=http://localhost:4100
-```
-
-Your agent runs exactly as before — TokenFuse just watches every call.
-
-### Step 3 — Give a run a budget
-
-Add two headers to your requests: a **run id** (a name for the whole agent task) and a **budget**. TokenFuse adds up the real cost live and returns **HTTP 402** the moment the task would blow past its cap.
-
-```bash
-curl http://localhost:4100/v1/messages \
-  -H "content-type: application/json" \
-  -H "x-fuse-run-id: my-agent-task-1" \
-  -H "x-fuse-budget-usd: 0.50" \
-  -d '{"model":"claude-sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
-```
-
-- **No `x-fuse-run-id`?** The call is passed through untouched — safe to drop in.
-- **Want the live view?** `docker exec <container> tokenfuse top` (or `cargo run -p tokenfuse-gateway top`) shows every run and its $/min.
-
-**Observe first, then enforce.** By default TokenFuse runs in **shadow** mode — it *records* what it would block but changes nothing, so you can drop it in risk-free. When you're ready to actually cut the circuit (return `402` on a breach), start it in **enforce** mode:
-
-```bash
-docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
-  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse
-```
-
-`TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
-
-> Everything the project needs lives on GitHub — source, CI, and the container image (GHCR). **No dedicated server required.**
+TokenFuse is **complementary** to observability and gateways — many teams will run it *alongside* Langfuse or LiteLLM. It's the enforcement layer they don't have.
 
 ---
 
-## 🎯 What makes it different
+## 🧩 What's inside
 
-| Capability | 🧯 TokenFuse | 🪞 Observability<br/>(Langfuse, Helicone) | 🚦 Gateways<br/>(LiteLLM, Portkey) |
-|---|:---:|:---:|:---:|
-| Show how much you spent | ✅ | ✅ | ✅ |
-| Per-key / per-user limits | ✅ | ❌ | ✅ |
-| **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial |
-| **Loop / runaway detection** | ✅ | ❌ | ❌ |
-| **Auto-stop before the damage** (enforcement) | ✅ | ❌ | ❌ |
-| **Burn forecast** ("blowout in ~12 steps") | ✅ | ❌ | ❌ |
-| Live kill-switch (Slack button) | ✅ | ❌ | ❌ |
+Everything below is **implemented and shipped in v0.2.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
 
-The one-line summary: **everyone else reports; TokenFuse acts.**
+**Cost & control**
+- 💰 **Per-run budgets** — a hard cap for a whole task, with hierarchical roll-up so a sub-agent's spend counts against its parent.
+- 🔁 **Loop / runaway detection** — identical-call, ping-pong, and context-growth detectors.
+- 🛑 **Kill-switch** — hard-stop a run from the API, the `tokenfuse top` TUI, Slack, or the Cloud dashboard.
+- 🧩 **Policies as code (WASM)** — custom rules in any language, sandboxed; **backtest** them over past traffic.
+- ⚡ **Semantic cache** — repeated questions served for **$0**.
 
----
+**Security (agent runtime firewall)**
+- 🔒 **Agent firewall (taint)** — block risky actions after an agent touches untrusted data.
+- 🕵️ **DLP** — detect/redact secrets leaving in prompts.
+- 🔑 **MCP credential-broker** + tool-poisoning / rug-pull scanner.
+- 📡 **eBPF Radar** — discover shadow agents on a host, zero config (Linux).
 
-## ✨ Feature overview
-
-| Feature | What it gives you | Ships in |
-|---|---|---|
-| 💰 Per-run budgets | Hard cost cap for a whole agent task, not just a key | Phase 1 |
-| 🛑 Kill-switch in Slack | One-click stop on a runaway alert | Phase 1 |
-| 📟 `tokenfuse top` | A live `htop`-style terminal view of every running agent and its $/min | Phase 1 |
-| 🔁 Loop detection | Catches "same tool called 3× in a row" and ping-pong loops | Phase 2 |
-| 📈 Burn forecast | Predicts a budget blowout *before* it happens | Phase 2 |
-| 🤝 Self-aware agents (MCP) | The agent can *see* its own budget and *ask a human* for more | Phase 2 |
-| 🔑 MCP credential-broker | Secrets never touch the prompt — the agent passes a *handle*, the broker injects the real value at the boundary | Phase 4 |
-| 🗄️ Zero-DB analytics | Your data in open Parquet files; query with `tokenfuse sql "..."` | Phase 2 |
-| ⚡ Semantic cache | Repeated questions answered for **$0** — the product pays for itself | Phase 2.5 |
-| 🧩 Policies as code (WASM) | Write custom rules in any language; test them on past traffic | Phase 3 |
-| 📡 Radar (eBPF) | Finds *shadow* agents on your machines with **zero config** | Phase 4 |
-| 🔒 Agent firewall (taint) | Blocks risky actions after an agent touches untrusted data | Phase 4 |
-| 🧬 HA cluster (raft) | Budgets survive a node crash; the affordability check is **linearized** across nodes so no two agents double-spend the same ceiling | Phase 4 |
-| ☁️ Hosted Cloud | Many gateways roll up into one dashboard — a **single pane of glass** for spend across your fleet (`cloud/`, `docker compose up`) | Phase 3 |
+**Ops & platform**
+- 🧬 **HA raft cluster** — replicated budgets, durable storage, runtime membership, token auth + TLS.
+- ☁️ **Hosted Cloud** — Go control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
+- 🗄️ **Zero-DB analytics** — telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
+- 🐍 **Python SDK**, sub-µs decision path, four public container images.
 
 ---
 
 ## 🏗️ Architecture
 
-One binary. A fast **Rust** core in the request path, a **Go** control plane for the cloud, a **Next.js** dashboard. Telemetry lives in open **Parquet** files instead of a heavy database.
+One fast **Rust** binary in the request path, a **Go** control plane for the Cloud, a **Next.js** dashboard. Telemetry lives in open **Parquet** files instead of a heavy database.
 
 ```mermaid
 flowchart TB
@@ -255,60 +262,41 @@ flowchart TB
     end
     packs --> core
     core --> ST["📦 Parquet + DataFusion · OTel export"]
+    core -.-> HA["🧬 raft HA cluster"]
+    core -.-> CL["☁️ Cloud control plane + dashboard"]
 ```
 
-Design decisions and the full data model live in [docs/02-architecture.md](docs/02-architecture.md).
+Design decisions and the data model: [docs/02-architecture.md](docs/02-architecture.md).
 
 ---
 
-## 🗺️ Roadmap
+## 📋 Project status
 
-Built as a **series of public launches**, not one big release — each phase is its own "wow" moment.
+**v0.2.0 — functional and shipped, young and not yet battle-tested.**
 
-```mermaid
-timeline
-    title TokenFuse delivery plan
-    Phase 0 Spikes : sub-3ms overhead benchmark
-    Phase 1 MVP : budgets + kill-switch + live TUI
-    Phase 2 Intelligence : loop detection + forecast + MCP + Show HN
-    Phase 2.5 Cache : the product pays for itself
-    Phase 3 Platform : policies-as-code + backtesting + Cloud
-    Phase 4 Flagship : eBPF Radar + agent firewall
+The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
+
+It has **not** yet had a production hardening pass or a security audit — treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
+
+```bash
+docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse          # gateway
+cd cloud && docker compose up                                 # + Cloud dashboard (:3000)
 ```
 
-**To public launch (Show HN): ~12–13 weeks** of solo full-time work. Details, estimates, and risks in [docs/03-roadmap.md](docs/03-roadmap.md).
+Images on GHCR: `tokenfuse` · `tokenfuse:cluster` · `tokenfuse-control-plane` · `tokenfuse-dashboard`.
 
 ---
 
-## 🧭 The bigger picture: capability packs
+## 🧭 The bigger picture: a runtime firewall
 
-TokenFuse starts as a cost tool and grows into an **agent runtime firewall** — all under one brand, one install. The parts reinforce each other (that's the moat), so they ship as *packs* you switch on, not separate products.
+TokenFuse starts as a cost tool and grows into an **agent runtime firewall** — one brand, one install. The parts reinforce each other (that's the moat): a single taint domain follows data from the web → RAG → memory → tool calls, so the thing that catches a prompt injection is the same thing that enforces a budget.
 
 ```mermaid
 flowchart LR
     M["💰 Stop burning money"] --> D["🗄️ Stop leaking data"] --> FW["🔒 Control everything agents do"]
 ```
 
-The reasoning behind "one product, not three" is in [docs/09-product-strategy.md](docs/09-product-strategy.md); the expansion plan is in [docs/04-expansion-rings.md](docs/04-expansion-rings.md).
-
----
-
-## 🎬 90 seconds to "wow"
-
-The intended first-run experience (and, not coincidentally, the script for the launch demo video):
-
-```text
-00:00  docker run tokenfuse                 ← one line, zero config
-00:10  export ANTHROPIC_BASE_URL=http://localhost:4100
-       your agent runs exactly as before
-00:20  tokenfuse top                        ← live runs, $/min sparklines
-00:35  launch a "broken" agent (deliberate loop)
-00:45  the run turns red: "loop detected · blowout at step ~34"
-00:55  Slack alert with a [Kill run] button
-01:00  the agent receives a clean stop signal and shuts down
-01:10  tokenfuse sql "select task_type, sum(cost) group by 1"
-01:25  "Rust · one binary · your data in Parquet."
-```
+Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-product-strategy.md).
 
 ---
 
@@ -316,7 +304,7 @@ The intended first-run experience (and, not coincidentally, the script for the l
 
 - **AI / ML engineers** shipping agents to production who've been surprised by a bill.
 - **Platform / DevOps teams** who need guardrails and cost visibility across many agents.
-- **Security teams** worried about what autonomous agents can *do* (prompt injection, data exfiltration).
+- **Security teams** worried about what autonomous agents can *do* — prompt injection, data exfiltration, shadow agents.
 - **Solo builders** who want a safety net that installs in one command.
 
 ---
@@ -325,55 +313,45 @@ The intended first-run experience (and, not coincidentally, the script for the l
 
 | Term | Plain-English meaning |
 |---|---|
-| **LLM** | The AI model behind the scenes (e.g. Claude, GPT). You pay per word ("token") it reads and writes. |
-| **Token** | A chunk of text (~¾ of a word). Billing is per token — more tokens, more cost. |
+| **LLM** | The AI model behind the scenes (Claude, GPT…). You pay per "token" it reads and writes. |
+| **Token** | A chunk of text (~¾ of a word). Billing is per token. |
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
-| **Run** | One complete agent task from start to finish — possibly hundreds of LLM calls. |
+| **Run** | One complete agent task, start to finish — possibly hundreds of LLM calls. |
 | **Runaway** | An agent stuck looping or exploding in cost — the thing TokenFuse stops. |
-| **Proxy** | A middleman that sits in the request path. You point your agent at it instead of the provider. |
-| **RAG** | "Retrieval-Augmented Generation" — feeding the AI your own documents so it can answer about them. |
-| **MCP** | A standard way for agents to call external tools/servers. Powerful and a new security surface. |
+| **Proxy** | A middleman in the request path. You point your agent at it instead of the provider. |
+| **MCP** | A standard for agents to call external tools/servers — powerful, and a new security surface. |
 | **Prompt injection** | A hidden instruction smuggled into data the agent reads, hijacking its behavior. |
 
 ---
 
 ## ❓ FAQ
 
-**Will it slow my agent down?**
-The target is **under 3 ms** of added latency (p99). Responses stream straight through — TokenFuse doesn't buffer them.
+**Will it slow my agent down?** Negligibly — ~1 ms p50 added on the wire, and responses stream straight through (no buffering). See [BENCHMARKS.md](BENCHMARKS.md).
 
-**Do I have to change my code?**
-No. You change one environment variable (`base_url`) so calls go through TokenFuse. An optional SDK adds nicer error handling.
+**Do I have to change my code?** No — change one base-URL env var so calls go through TokenFuse. An optional Python SDK adds nicer error handling.
 
-**Does it read or store my prompts?**
-No — metadata-only by default. It measures cost and behavior, not content. Prompt inspection is a separate, explicit opt-in.
+**Does it read or store my prompts?** No — metadata-only by default. It measures cost and behavior, not content.
 
-**What if TokenFuse itself goes down?**
-It's **fail-open**: your traffic keeps flowing. It's a safety net, never a chokepoint.
+**What if TokenFuse goes down?** It's **fail-open**: traffic keeps flowing. For the opposite guarantee (never losing a budget), run the raft **HA cluster**.
 
-**Is it free?**
-The core is **open source (Apache-2.0)**. A hosted Cloud version and advanced packs will be the paid tiers.
+**Is it free?** The core is **open source (Apache-2.0)**. A hosted Cloud and advanced packs are the intended paid tiers.
 
-**Is it ready to use?**
-Not yet — this repository is currently the **design and planning phase**. Follow along; code is coming.
+**Is it production-ready?** It's a young v0.2.0 — functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
-## 📋 Project status & documentation
-
-> **Status:** early implementation. The Rust core (money, pricing, reserve/settle ledger, policy), the budget-enforcing gateway (real SSE passthrough, loop detection, 402 contract), an observability API + `tokenfuse top` TUI, and a Python SDK are built and CI-green — see [PROGRESS.md](PROGRESS.md) and [BENCHMARKS.md](BENCHMARKS.md). Not yet production-ready. The design docs below remain the source of truth for direction.
+## 📚 Documentation
 
 | Document | What's inside |
 |---|---|
+| [PROGRESS.md](PROGRESS.md) | Live component-by-component build status & tests |
+| [BENCHMARKS.md](BENCHMARKS.md) | Latency methodology + numbers |
 | [01 · Research](docs/01-research.md) | The pain points and hard numbers behind the idea |
-| [02 · Architecture](docs/02-architecture.md) | Rust core, decisions (ADRs), data model, policy language |
-| [03 · Roadmap](docs/03-roadmap.md) | Phases 0–5, the demo script, metrics, risks |
-| [04 · Expansion rings](docs/04-expansion-rings.md) | How the platform grows: cache → RAG → security → governance |
-| [05 · Open questions](docs/05-open-questions.md) | Decisions still to be made before coding |
-| [06 · Semantic cache](docs/06-semantic-cache.md) | Detailed design: partitions, thresholds, invalidation |
-| [07 · Taint model](docs/07-taint-model.md) | The "agent firewall": labels, propagation, policies |
-| [08 · Security extensions](docs/08-security-extensions.md) | MCP credential broker, RAG ingestion scanning, agent identity |
-| [09 · Product strategy](docs/09-product-strategy.md) | Why one product with capability packs, not three tools |
+| [02 · Architecture](docs/02-architecture.md) | Rust core, ADRs, data model, policy language |
+| [03 · Roadmap](docs/03-roadmap.md) | Phases, demo script, metrics, risks |
+| [06 · Semantic cache](docs/06-semantic-cache.md) · [07 · Taint model](docs/07-taint-model.md) | Detailed subsystem designs |
+| [08 · Security extensions](docs/08-security-extensions.md) | MCP broker, RAG scanning, agent identity |
+| [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 
 ---
 
@@ -382,5 +360,5 @@ Not yet — this repository is currently the **design and planning phase**. Foll
 [Apache License 2.0](LICENSE).
 
 <div align="center">
-<sub>Built in the open. Diagrams above render natively on GitHub (Mermaid).</sub>
+<sub>Built in the open. Diagrams render natively on GitHub (Mermaid).</sub>
 </div>
