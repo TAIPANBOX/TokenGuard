@@ -29,10 +29,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | Parquet trace sink (`tokenfuse sql`) | ✅ done | `sink.rs`: settled calls → rotating Parquet segments (opt-in via `TOKENFUSE_DATA_DIR`; `NullSink` default). `sqlq.rs` + `tokenfuse sql "…"` query the trace with DataFusion. Verified live end-to-end. |
 | Semantic cache (Ring 1.1) | ✅ done | `crates/core/cache.rs`: hard-partition + cosine similarity, entity-guard, length-ratio guard, TTL, FIFO eviction; pluggable `Embedder` (default `HashEmbedder`, ONNX later). Wired for non-streaming tool-free calls; `TOKENFUSE_CACHE=off\|shadow\|on`. On-hit serves `$0` with `x-fuse-saved-usd`. Verified live. |
 | Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
+| Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
 
 ## Test status
 
-`cargo test --all` — 66 passing (core: 39, gateway: 27); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: semantic cache hit for $0, and `tokenfuse backtest` reporting a candidate policy would have saved 50% on a demo trace.
+`cargo test --all` — 69 passing (core: 41, gateway: 28); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: semantic cache hit for $0, `tokenfuse backtest` (50% saved on a demo trace), and sub-agent spend rolling up into a parent budget.
 
 ## How to run
 

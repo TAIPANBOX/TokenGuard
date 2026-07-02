@@ -53,7 +53,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
         .map(Microusd::from_usd)
         .or(st.policy.budget_per_run)
         .unwrap_or(DEFAULT_RUN_BUDGET);
-    st.ledger.open_run(&run_id, budget);
+    // A sub-agent's run rolls up into its parent's budget (hierarchical budgets).
+    let parent = header_str(&headers, "x-fuse-parent-run-id");
+    st.ledger.open_run(&run_id, budget, parent.as_deref());
 
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
@@ -168,14 +170,24 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     let reservation = match st.policy.mode {
         Mode::Enforce => match st.ledger.reserve(&run_id, estimate) {
             Ok(r) => r,
-            Err(BudgetError::Exceeded { budget, spent, .. }) => {
+            Err(BudgetError::Exceeded {
+                run_id: hit_run,
+                budget,
+                spent,
+                ..
+            }) => {
+                let reason = if hit_run == run_id {
+                    "per-run budget exceeded".to_string()
+                } else {
+                    format!("parent run '{hit_run}' budget exceeded")
+                };
                 return budget_error(
                     "budget_exceeded",
                     &run_id,
                     budget,
                     spent,
                     &st.policy_id,
-                    "per-run budget exceeded",
+                    &reason,
                 );
             }
             Err(BudgetError::UnknownRun { .. }) => st.ledger.reserve_unchecked(&run_id, estimate),
@@ -657,6 +669,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_blocked_by_parent_budget() {
+        // Parent has a tiny budget; a sub-agent call rolls up and is blocked.
+        let st = state(Mode::Enforce, StubProvider::default());
+        // Parent budget is tiny — smaller than a single child call's estimate.
+        st.ledger
+            .open_run("parent", Microusd::from_usd(0.001), None);
+
+        let child = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "child")
+            .header("x-fuse-parent-run-id", "parent")
+            .header("x-fuse-budget-usd", "100.0") // child's own budget is huge
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, child).await;
+        // Child fits its own budget but the parent's $0.001 can't take the
+        // ~$0.0087 estimate → 402.
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "budget_exceeded");
+        assert!(json["error"]["reason"].as_str().unwrap().contains("parent"));
+    }
+
+    #[tokio::test]
     async fn cache_on_serves_second_identical_request() {
         use tokenfuse_core::cache::{CacheConfig, CacheMode, HashEmbedder};
         let mut st = state(Mode::Shadow, StubProvider::default());
@@ -773,7 +809,8 @@ mod tests {
                 sse: true,
             },
         );
-        st.ledger.open_run("run-cancel", Microusd::from_usd(5.0));
+        st.ledger
+            .open_run("run-cancel", Microusd::from_usd(5.0), None);
         let reservation = st
             .ledger
             .reserve("run-cancel", Microusd::from_usd(0.5))

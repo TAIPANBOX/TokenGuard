@@ -65,7 +65,7 @@ fn bench_decision_path(iters: usize) {
     let prices = prices();
     let ledger = Ledger::new();
     // A budget large enough never to trip during the run.
-    ledger.open_run("bench", Microusd(i64::MAX / 2));
+    ledger.open_run("bench", Microusd(i64::MAX / 2), None);
     let policy = Policy::default();
     let usage = Usage {
         input_tokens: 1_000,
