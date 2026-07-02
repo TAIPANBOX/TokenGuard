@@ -27,6 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 datafusion = { version = "44", default-features = false, features = ["parquet"] }
+wasmtime = { version = "27", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 fastembed = { version = "4", optional = true }
 
 [dev-dependencies]
@@ -35,3 +36,4 @@ http-body-util = "0.1"
 
 [features]
 onnx = ["dep:fastembed"]
+wasm = ["dep:wasmtime"]

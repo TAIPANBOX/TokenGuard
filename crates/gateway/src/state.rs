@@ -3,6 +3,7 @@
 use crate::firewall::FirewallConfig;
 use crate::provider::Provider;
 use crate::sink::{EventSink, NullSink};
+use crate::wasmpolicy::WasmEval;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
@@ -33,6 +34,8 @@ pub struct AppState {
     pub firewall: Arc<FirewallConfig>,
     /// Secret-scanning (DLP) mode (Off by default).
     pub dlp: DlpMode,
+    /// Optional custom WASM policy.
+    pub wasm: Option<Arc<dyn WasmEval>>,
     history: History,
     killed: Killed,
     /// Per-run accumulated taint labels.
@@ -60,6 +63,7 @@ impl AppState {
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
             dlp: DlpMode::Off,
+            wasm: None,
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
@@ -69,6 +73,12 @@ impl AppState {
     /// Set the DLP (secret-scanning) mode. Chainable.
     pub fn with_dlp(mut self, dlp: DlpMode) -> Self {
         self.dlp = dlp;
+        self
+    }
+
+    /// Attach a custom WASM policy. Chainable.
+    pub fn with_wasm(mut self, wasm: Arc<dyn WasmEval>) -> Self {
+        self.wasm = Some(wasm);
         self
     }
 

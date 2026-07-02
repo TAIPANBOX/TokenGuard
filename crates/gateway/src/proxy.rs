@@ -184,6 +184,35 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         }
     }
 
+    // Custom WASM policy (opt-in): a loaded policy can block on its own logic.
+    if let Some(wasm) = &st.wasm {
+        let taint_bits = if st.firewall.mode != FirewallMode::Off {
+            taint::labels_for_tools(&taint::tool_names_in(&request), &st.firewall.sources)
+                .iter()
+                .map(|l| crate::wasmpolicy::label_bit(l))
+                .fold(0u32, |a, b| a | b)
+        } else {
+            0
+        };
+        let decision = wasm.evaluate(
+            estimate.0,
+            snapshot.spent.0,
+            budget.0,
+            snapshot.steps,
+            taint_bits,
+        );
+        if decision == 2 {
+            return budget_error(
+                "wasm_policy",
+                &run_id,
+                budget,
+                snapshot.spent,
+                &st.policy_id,
+                "blocked by custom wasm policy",
+            );
+        }
+    }
+
     // For shadow/warn, surface whichever signal tripped in the response header.
     let would_block = eval.violated.clone().or(loop_reason);
 

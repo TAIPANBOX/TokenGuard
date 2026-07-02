@@ -15,6 +15,7 @@ pub mod sink;
 pub mod sqlq;
 pub mod state;
 pub mod tui;
+pub mod wasmpolicy;
 
 use axum::routing::{get, post};
 use axum::Router;

@@ -143,6 +143,20 @@ async fn serve() {
     tracing::info!(?dlp, "secret scanning (DLP)");
     state = state.with_dlp(dlp);
 
+    // Custom WASM policy (built with --features wasm): TOKENFUSE_WASM_POLICY=<path>.
+    #[cfg(feature = "wasm")]
+    if let Ok(path) = std::env::var("TOKENFUSE_WASM_POLICY") {
+        if !path.is_empty() {
+            match tokenfuse_gateway::wasmpolicy::WasmPolicy::from_file(&path) {
+                Ok(p) => {
+                    tracing::info!(%path, "loaded custom WASM policy");
+                    state = state.with_wasm(Arc::new(p));
+                }
+                Err(e) => tracing::warn!(%path, "failed to load WASM policy: {e}"),
+            }
+        }
+    }
+
     // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
     // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.
     use tokenfuse_gateway::sink::{EventSink, NullSink, ParquetSink, TeeSink};
