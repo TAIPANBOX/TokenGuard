@@ -1,0 +1,24 @@
+[package]
+name = "tokenfuse-gateway"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tokenfuse gateway: budget-enforcing proxy between agents and LLM providers."
+
+[[bin]]
+name = "tokenfuse"
+path = "src/main.rs"
+
+[dependencies]
+tokenfuse-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
