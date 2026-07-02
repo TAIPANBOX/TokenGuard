@@ -6,18 +6,20 @@
 //!    handles in the params with real secrets from the vault *just before*
 //!    forwarding. The agent (and the LLM prompt, trace, and memory) only ever
 //!    holds handles; the secret appears only on the wire to the MCP server.
-//! 2. **Live poisoning scan** — on `tools/list`, run the tool-description
-//!    scanner (`tokenfuse_core::mcp`); `warn` logs, `block` refuses the list.
+//! 2. **Live poisoning + rug-pull scan** — on `tools/list`, run the
+//!    tool-description scanner and diff against a pinned lockfile.
+//! 3. **DLP** — block raw secrets in outgoing args and **redact** secrets in tool
+//!    responses so a result can't leak a credential into the model's context.
 //!
-//! Config: `TOKENFUSE_MCP_UPSTREAM` (real server), `TOKENFUSE_MCP_SECRETS`
-//! (`name=val,…`), `TOKENFUSE_MCP_SCAN` (`off|warn|block`, default `warn`),
-//! `TOKENFUSE_MCP_ADDR` (listen; default `127.0.0.1:4200`). Run:
-//! `tokenfuse mcp-broker`.
+//! Two transports share [`process`]: HTTP (`app`, default `127.0.0.1:4200`) and
+//! **stdio** (`run_stdio`, for MCP clients that launch a server as a subprocess).
+//! Config: `TOKENFUSE_MCP_UPSTREAM`, `_SECRETS` (`name=val,…`), `_SCAN`
+//! (`off|warn|block`), `_DLP` (`off|warn|block`), `_LOCK` (rug-pull baseline),
+//! `_ADDR`, `_STDIO`. Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
 
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -53,18 +55,22 @@ pub fn app(state: Arc<BrokerState>) -> Router {
 }
 
 /// JSON-RPC error response with the same id as the request.
-fn rpc_error(id: &Value, code: i64, message: &str) -> Json<Value> {
-    Json(json!({
+fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": { "code": code, "message": message },
-    }))
+    })
 }
 
-async fn handle(
-    State(st): State<Arc<BrokerState>>,
-    Json(mut req): Json<Value>,
-) -> impl IntoResponse {
+/// HTTP handler — delegates to the transport-agnostic [`process`].
+async fn handle(State(st): State<Arc<BrokerState>>, Json(req): Json<Value>) -> Json<Value> {
+    Json(process(&st, req).await)
+}
+
+/// Broker a single JSON-RPC request and return the response — shared by the HTTP
+/// and stdio transports. Injects secrets, scans, forwards, and redacts.
+pub async fn process(st: &BrokerState, mut req: Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
         .get("method")
@@ -89,8 +95,7 @@ async fn handle(
                                 "blocked: raw secret in tool arguments ({})",
                                 dlp::summary(&findings)
                             ),
-                        )
-                        .into_response();
+                        );
                     }
                 }
             }
@@ -110,7 +115,7 @@ async fn handle(
     // isn't enabled in this crate).
     let payload = match serde_json::to_vec(&req) {
         Ok(p) => p,
-        Err(e) => return rpc_error(&id, -32000, &format!("encode error: {e}")).into_response(),
+        Err(e) => return rpc_error(&id, -32000, &format!("encode error: {e}")),
     };
     let upstream = match st
         .client
@@ -122,17 +127,15 @@ async fn handle(
         .and_then(|r| r.error_for_status())
     {
         Ok(r) => r,
-        Err(e) => return rpc_error(&id, -32000, &format!("upstream error: {e}")).into_response(),
+        Err(e) => return rpc_error(&id, -32000, &format!("upstream error: {e}")),
     };
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
-        Err(e) => return rpc_error(&id, -32000, &format!("upstream read: {e}")).into_response(),
+        Err(e) => return rpc_error(&id, -32000, &format!("upstream read: {e}")),
     };
     let mut out: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
-        Err(e) => {
-            return rpc_error(&id, -32000, &format!("bad upstream json: {e}")).into_response()
-        }
+        Err(e) => return rpc_error(&id, -32000, &format!("bad upstream json: {e}")),
     };
 
     // 2. Poisoning + rug-pull checks on tool listings.
@@ -158,8 +161,7 @@ async fn handle(
                             "blocked: tool definition changed (rug-pull): {}",
                             changed.join(", ")
                         ),
-                    )
-                    .into_response();
+                    );
                 }
             }
         }
@@ -172,8 +174,7 @@ async fn handle(
                     &id,
                     -32001,
                     &format!("blocked: {} poisoned tool description(s)", findings.len()),
-                )
-                .into_response();
+                );
             }
             // In warn mode, annotate the response without breaking the client.
             if let Some(obj) = out.as_object_mut() {
@@ -185,5 +186,43 @@ async fn handle(
         }
     }
 
-    Json(out).into_response()
+    // 3. Redact secrets in the response body so a tool result can't leak a
+    //    credential into the model's context.
+    if st.dlp != DlpMode::Off {
+        let text = out.to_string();
+        let findings = dlp::scan(&text);
+        if !findings.is_empty() {
+            tracing::warn!(secrets = %dlp::summary(&findings), "mcp broker: redacted secrets in tool response");
+            if let Ok(redacted) = serde_json::from_str(&dlp::redact(&text, &findings)) {
+                out = redacted;
+            }
+        }
+    }
+
+    out
+}
+
+/// Run the broker over **stdio** — newline-delimited JSON-RPC on stdin/stdout,
+/// for MCP clients that launch a server as a subprocess. Each request is brokered
+/// via [`process`] and forwarded to the configured HTTP upstream. Logs must go to
+/// stderr (stdout is the protocol channel).
+pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<Value>(line) {
+            Ok(req) => process(&state, req).await,
+            Err(e) => rpc_error(&Value::Null, -32700, &format!("parse error: {e}")),
+        };
+        let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
+        buf.push(b'\n');
+        stdout.write_all(&buf).await?;
+        stdout.flush().await?;
+    }
+    Ok(())
 }
