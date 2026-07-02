@@ -262,6 +262,20 @@ Combine with `TOKENFUSE_CLUSTER_TOKEN` for authenticated, encrypted transport.
 Test `serves_over_https_with_token` (self-signed cert, HTTPS `/healthz` + token-
 gated `/mgmt/metrics`).
 
+## Mutual TLS (implemented)
+
+Set `TOKENFUSE_CLUSTER_MTLS_CA` (a CA PEM) in addition to the server cert/key and
+the node requires **every** peer to present a client certificate signed by that
+CA — enforced during the TLS handshake by rustls' `WebPkiClientVerifier`
+(`server::serve_mtls`, or `tokenfuse-cluster serve … --mtls-ca …`). Each node
+presents its own client cert via `TOKENFUSE_CLUSTER_CLIENT_CERT` +
+`TOKENFUSE_CLUSTER_CLIENT_KEY` (loaded into the reqwest `Identity` in
+`build_client`). This gives **cryptographic peer authentication** on top of the
+bearer token: an unauthenticated TCP client can't even complete the handshake, so
+raft RPCs and admin/app calls are both mutually authenticated and encrypted. Test
+`serves_over_mutual_tls`: no client cert → handshake rejected; CA-signed client
+cert → `/healthz` succeeds and `/mgmt/metrics` still needs the token.
+
 ## Linearizable reads (implemented)
 
 Local reads (`sm.read_run`) are eventually consistent. For a **linearizable**
@@ -272,6 +286,7 @@ helper. Test `linearizable_read_from_follower`.
 
 ## Not yet (follow-ups)
 
-- **mTLS / client-cert** auth (today: server TLS + shared bearer token).
+- **Automated cert rotation / SPIFFE-style identity issuance** (today: static PEM
+  files for the server and client certs). mTLS itself is implemented above.
 
 [openraft]: https://docs.rs/openraft

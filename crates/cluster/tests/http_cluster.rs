@@ -358,6 +358,106 @@ async fn serves_over_https_with_token() {
         .is_success());
 }
 
+/// Mutual TLS: the server requires a client certificate signed by the cluster
+/// CA. A client with no cert can't complete the handshake; a client presenting a
+/// CA-signed cert can, and then still needs the bearer token for admin routes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_over_mutual_tls() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let port = 5704u16;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let url = format!("https://127.0.0.1:{port}");
+    let peers: Peers = Arc::new(BTreeMap::from([(1u64, url.clone())]));
+
+    // A cluster CA that signs both the server and the client certs.
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+
+    // Server leaf (SAN 127.0.0.1) signed by the CA.
+    let server_key = KeyPair::generate().unwrap();
+    let server_params =
+        CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    // Client leaf signed by the same CA.
+    let client_key = KeyPair::generate().unwrap();
+    let client_params = CertificateParams::new(vec!["tokenfuse-peer".to_string()]).unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let node = HttpNode::build(1, peers, Some("s3cret".into()))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = server::serve_mtls(
+            node,
+            addr,
+            server_cert.pem().into_bytes(),
+            server_key.serialize_pem().into_bytes(),
+            ca_pem.clone().into_bytes(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A client that trusts the server CA but presents NO client cert is rejected
+    // at the TLS layer.
+    let no_cert = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    assert!(
+        no_cert.get(format!("{url}/healthz")).send().await.is_err(),
+        "mTLS server must reject a client with no certificate"
+    );
+
+    // A client presenting a CA-signed identity completes the handshake.
+    let mut id_pem = client_cert.pem().into_bytes();
+    id_pem.push(b'\n');
+    id_pem.extend_from_slice(client_key.serialize_pem().as_bytes());
+    let with_cert = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap())
+        .identity(reqwest::Identity::from_pem(&id_pem).unwrap())
+        .build()
+        .unwrap();
+
+    let hz = with_cert
+        .get(format!("{url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        hz.status().is_success(),
+        "healthz over mTLS with client cert"
+    );
+
+    // Admin route still needs the bearer token on top of the client cert.
+    assert_eq!(
+        with_cert
+            .get(format!("{url}/mgmt/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert!(with_cert
+        .get(format!("{url}/mgmt/metrics"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn linearizable_read_from_follower() {
     let urls = start_http_cluster().await;

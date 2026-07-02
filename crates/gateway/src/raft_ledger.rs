@@ -52,8 +52,11 @@ impl RaftLedger {
             }
         };
 
-        // Serve peer RPCs + the admin/app API in the background — over HTTPS when
-        // TOKENFUSE_CLUSTER_TLS_CERT + _KEY point at PEM files, else plain HTTP.
+        // Serve peer RPCs + the admin/app API in the background. Transport:
+        //   * plain HTTP                                    — no TLS env set
+        //   * HTTPS (TLS_CERT + TLS_KEY)                    — server auth only
+        //   * mutual TLS (+ MTLS_CA)                        — server *and* client
+        //     certs required, giving cryptographic peer auth on top of the token.
         let serve_node = node.clone();
         let tls = match (
             std::env::var("TOKENFUSE_CLUSTER_TLS_CERT"),
@@ -64,13 +67,21 @@ impl RaftLedger {
             }
             _ => None,
         };
+        let client_ca = match std::env::var("TOKENFUSE_CLUSTER_MTLS_CA") {
+            Ok(p) if !p.is_empty() => Some(std::fs::read(p)?),
+            _ => None,
+        };
         tokio::spawn(async move {
-            let res = match tls {
-                Some((cert, key)) => {
+            let res = match (tls, client_ca) {
+                (Some((cert, key)), Some(ca)) => {
+                    tracing::info!("cluster server: mutual TLS (client certs required)");
+                    server::serve_mtls(serve_node, addr, cert, key, ca).await
+                }
+                (Some((cert, key)), None) => {
                     tracing::info!("cluster server: HTTPS (TLS)");
                     server::serve_tls(serve_node, addr, cert, key).await
                 }
-                None => server::serve(serve_node, addr).await,
+                (None, _) => server::serve(serve_node, addr).await,
             };
             if let Err(e) = res {
                 tracing::error!("cluster server exited: {e}");

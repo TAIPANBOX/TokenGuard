@@ -259,6 +259,15 @@ pub async fn serve_on(
     axum::serve(listener, router(node)).await
 }
 
+/// Install the process-level rustls crypto provider exactly once. rustls 0.23
+/// requires this when more than one backend is compiled in.
+fn install_crypto_provider() {
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// Serve this node over **HTTPS** with the given PEM cert + key. Peer/admin URLs
 /// must then use `https://`; clients trust the cert via a public CA or
 /// `TOKENFUSE_CLUSTER_CA`.
@@ -268,13 +277,55 @@ pub async fn serve_tls(
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
 ) -> std::io::Result<()> {
-    // rustls 0.23 needs a process-level crypto provider chosen explicitly when
-    // more than one backend is compiled in.
-    static PROVIDER: std::sync::Once = std::sync::Once::new();
-    PROVIDER.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
+    install_crypto_provider();
     let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+    axum_server::bind_rustls(addr, config)
+        .serve(router(node).into_make_service())
+        .await
+}
+
+/// Serve over **mutual TLS**: in addition to presenting `cert_pem`/`key_pem`, the
+/// server *requires* every peer to present a client certificate signed by
+/// `client_ca_pem`. Combined with the bearer token this gives cryptographic peer
+/// authentication for the raft mesh — an unauthenticated TCP client can't even
+/// complete the handshake. Peers must set `TOKENFUSE_CLUSTER_CLIENT_CERT/_KEY`.
+pub async fn serve_mtls(
+    node: Arc<HttpNode>,
+    addr: SocketAddr,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    client_ca_pem: Vec<u8>,
+) -> std::io::Result<()> {
+    install_crypto_provider();
+
+    let ioerr = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+
+    // Trust anchors for verifying client certs.
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut &client_ca_pem[..]) {
+        let cert = cert.map_err(|e| ioerr(format!("client CA parse: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| ioerr(format!("client CA add: {e}")))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| ioerr(format!("client verifier: {e}")))?;
+
+    // This node's own serving cert chain + key.
+    let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ioerr(format!("server cert parse: {e}")))?;
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|e| ioerr(format!("server key parse: {e}")))?
+        .ok_or_else(|| ioerr("no private key in TLS key PEM".into()))?;
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| ioerr(format!("server config: {e}")))?;
+
+    let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
     axum_server::bind_rustls(addr, config)
         .serve(router(node).into_make_service())
         .await
