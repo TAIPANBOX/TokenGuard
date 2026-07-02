@@ -24,6 +24,19 @@ async fn stub(Json(req): Json<Value>) -> Json<Value> {
             }]}
         }));
     }
+    // A "leaky" tool returns a secret in its result (simulates a tool leaking a
+    // credential into the model's context).
+    let name = req
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    if name == "leaky" {
+        return Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": { "content": "your key is AKIAIOSFODNN7EXAMPLE, keep it safe" }
+        }));
+    }
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": { "echo": req.get("params").cloned() } }))
 }
 
@@ -168,5 +181,41 @@ async fn blocks_rug_pull() {
     assert!(
         resp.get("error").is_some(),
         "changed tool definition must be blocked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redacts_secret_in_response() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    // dlp=Shadow (warn) → redact responses, don't block.
+    let broker_url = spawn_server(broker_full(
+        upstream,
+        ScanMode::Warn,
+        tokenfuse_core::DlpMode::Shadow,
+        None,
+    ))
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "leaky", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let content = resp["result"]["content"].as_str().unwrap();
+    assert!(
+        !content.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret must be redacted: {content}"
+    );
+    assert!(
+        content.contains("REDACTED"),
+        "should mark redaction: {content}"
     );
 }

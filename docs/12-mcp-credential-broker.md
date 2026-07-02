@@ -75,6 +75,16 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
 - **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
   a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
 
+## Response redaction + stdio (implemented)
+
+- **Response redaction** — with `TOKENFUSE_MCP_DLP` on, secrets in a tool's
+  *response* are redacted (`[REDACTED:kind]`) before reaching the agent, so a
+  tool result can't leak a credential into the model's context.
+- **stdio transport** — `tokenfuse mcp-broker --stdio` (or `TOKENFUSE_MCP_STDIO`)
+  speaks newline-delimited JSON-RPC on stdin/stdout for MCP clients that launch a
+  server as a subprocess; logs go to stderr. Both transports share `process()`.
+
 ## Not yet (follow-ups)
 
-- **Response redaction** and **stdio MCP transport** (today: HTTP JSON-RPC).
+- Spawning a **child stdio MCP server** (today the broker forwards to an HTTP
+  upstream from either transport).

@@ -81,13 +81,20 @@ async fn main() {
 /// injects secret handles and scans tool listings before forwarding upstream.
 async fn mcp_broker() {
     use std::sync::Arc;
-    use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
+    use tokenfuse_gateway::mcpbroker::{app, run_stdio, BrokerState, ScanMode};
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // stdio mode: `mcp-broker --stdio` or TOKENFUSE_MCP_STDIO — logs go to stderr
+    // so stdout stays the JSON-RPC protocol channel.
+    let stdio =
+        std::env::args().any(|a| a == "--stdio") || std::env::var("TOKENFUSE_MCP_STDIO").is_ok();
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    if stdio {
+        builder.with_writer(std::io::stderr).init();
+    } else {
+        builder.init();
+    }
 
     let upstream = std::env::var("TOKENFUSE_MCP_UPSTREAM").unwrap_or_default();
     if upstream.is_empty() {
@@ -121,6 +128,13 @@ async fn mcp_broker() {
         lock,
         client: reqwest::Client::new(),
     });
+    if stdio {
+        tracing::info!(%upstream, "mcp credential-broker on stdio");
+        if let Err(e) = run_stdio(state).await {
+            eprintln!("stdio error: {e}");
+        }
+        return;
+    }
     let addr = std::env::var("TOKENFUSE_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:4200".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
