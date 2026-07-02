@@ -87,10 +87,12 @@ TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages cargo run -p tokenfuse-
 
 ## Next steps
 
-1. **Central budgets from the Cloud** — define per-run/org limits in the control
-   plane and push them to gateways (complements the fleet-wide kill-switch).
-2. **Richer dashboard** — the roadmap's Next.js app (charts, alerts, org/RBAC);
-   today's embedded page is the dependency-free v1.
-3. **Linearizable follower reads** (`ensure_linearizable` + leader forward) and
-   **HTTPS/auth** on the raft + admin endpoints for cross-machine deploys.
-4. **Live MCP credential-broker** (needs an MCP transport).
+The roadmap (phases 1–4) is implemented and shipped in **v0.2.0**. What remains is
+optional hardening / scale work, sensible to defer for a young project:
+
+1. **mTLS / client-cert** auth between nodes (today: server TLS + shared token).
+2. **Durable Cloud store** — Postgres/ClickHouse behind the control plane's
+   in-memory aggregates, with retention.
+3. **Dashboard org/RBAC + alerting** (today: single org key, live view).
+4. **MCP broker**: response redaction + a stdio transport (today: HTTP JSON-RPC).
+5. A production-hardening pass and a security review before any "GA" claim.
