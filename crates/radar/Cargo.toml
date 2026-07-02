@@ -1,0 +1,23 @@
+[package]
+name = "radar"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tokenfuse-radar"
+path = "src/main.rs"
+
+[dependencies]
+aya = "0.13"
+aya-log = "0.2"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[build-dependencies]
+aya-build = "0.1"
+cargo_metadata = "0.19"
+
+[workspace]
+resolver = "2"
+members = [".", "radar-ebpf"]

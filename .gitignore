@@ -36,3 +36,7 @@ __pycache__/
 .venv/
 *.egg-info/
 .pytest_cache/
+
+# radar (Linux eBPF) build artifacts
+crates/radar/target/
+crates/radar/**/target/

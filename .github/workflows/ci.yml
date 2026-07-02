@@ -41,3 +41,25 @@ jobs:
       - name: Test
         working-directory: sdk/python
         run: python -m pytest -q
+
+  radar:
+    name: radar (eBPF build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libelf-dev
+      - name: Install Rust (stable + nightly + rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: rustup toolchain install stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/radar
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+      - name: Build radar
+        working-directory: crates/radar
+        run: cargo build

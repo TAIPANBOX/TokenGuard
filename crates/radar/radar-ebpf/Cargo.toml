@@ -1,0 +1,16 @@
+[package]
+name = "radar-ebpf"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[[bin]]
+name = "radar"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+opt-level = 3
