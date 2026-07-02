@@ -9,7 +9,15 @@ import (
 )
 
 func newTestServer() *server {
-	return &server{store: NewStore(), keys: map[string]string{"devkey": "acme"}}
+	return &server{
+		store: NewStore(),
+		keys: map[string]principal{
+			"devkey":    {org: "acme", role: "admin"},
+			"viewerkey": {org: "acme", role: "viewer"},
+			"otherorg":  {org: "beta", role: "admin"},
+		},
+		alertPct: 0.8,
+	}
 }
 
 func TestIngestThenQueryWithAuth(t *testing.T) {
@@ -122,6 +130,80 @@ func TestUnauthorizedRejected(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("wrong-key status = %d, want 401", rec.Code)
+	}
+}
+
+func TestViewerCannotMutate(t *testing.T) {
+	srv := newTestServer()
+	h := srv.routes()
+
+	// A viewer may read runs...
+	req := httptest.NewRequest("GET", "/v1/runs", nil)
+	req.Header.Set("Authorization", "Bearer viewerkey")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("viewer read status = %d, want 200", rec.Code)
+	}
+
+	// ...but cannot kill (403 forbidden, not 401).
+	req = httptest.NewRequest("POST", "/v1/runs/r1/kill", nil)
+	req.Header.Set("Authorization", "Bearer viewerkey")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("viewer kill status = %d, want 403", rec.Code)
+	}
+
+	// ...and cannot set a budget.
+	req = httptest.NewRequest("POST", "/v1/runs/r1/budget", bytes.NewReader([]byte(`{"budget_usd":1}`)))
+	req.Header.Set("Authorization", "Bearer viewerkey")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("viewer budget status = %d, want 403", rec.Code)
+	}
+}
+
+func TestParseKeysRoles(t *testing.T) {
+	keys := parseKeys("k1:acme,k2:acme:viewer,k3:beta:admin")
+	if p := keys["k1"]; p.org != "acme" || p.role != "admin" {
+		t.Errorf("k1 = %+v, want {acme admin}", p)
+	}
+	if p := keys["k2"]; p.org != "acme" || p.role != "viewer" {
+		t.Errorf("k2 = %+v, want {acme viewer}", p)
+	}
+	if p := keys["k3"]; p.org != "beta" || p.role != "admin" {
+		t.Errorf("k3 = %+v, want {beta admin}", p)
+	}
+}
+
+func TestAlerts(t *testing.T) {
+	srv := newTestServer()
+	h := srv.routes()
+
+	// Budget r-hot at $1, r-cool at $10; spend $0.90 on each.
+	srv.store.SetBudget("acme", "r-hot", 1_000_000)
+	srv.store.SetBudget("acme", "r-cool", 10_000_000)
+	srv.store.Ingest("acme", []CallRecord{
+		{RunID: "r-hot", CostMicrousd: 900_000, Step: 1},
+		{RunID: "r-cool", CostMicrousd: 900_000, Step: 1},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/alerts", nil)
+	req.Header.Set("Authorization", "Bearer viewerkey")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alerts status = %d, want 200", rec.Code)
+	}
+	var alerts []Alert
+	if err := json.Unmarshal(rec.Body.Bytes(), &alerts); err != nil {
+		t.Fatal(err)
+	}
+	// Only r-hot (90% ≥ 80%) fires; r-cool (9%) does not.
+	if len(alerts) != 1 || alerts[0].RunID != "r-hot" {
+		t.Fatalf("alerts = %+v, want just r-hot", alerts)
 	}
 }
 

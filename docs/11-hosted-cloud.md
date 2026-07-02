@@ -43,8 +43,19 @@ Storage is concurrency-safe, keyed `org → run`, and **durable**: set
 `TOKENFUSE_CLOUD_DATA=<path>` and the store loads a JSON snapshot on startup and
 autosaves every 2 s (atomic tmp+rename), so it survives a restart. A SQL/columnar
 backend (Postgres/ClickHouse) for scale + retention is a drop-in behind the same
-`Store` methods. Org API keys
-come from `TOKENFUSE_CLOUD_KEYS="key1:org1,key2:org2"` (dev default: `devkey`).
+`Store` methods.
+
+**Auth + RBAC.** Org API keys come from
+`TOKENFUSE_CLOUD_KEYS="key:org[:role],…"` (dev default: `devkey`). The optional
+role is `admin` (default) or `viewer`. Reads (`/v1/runs`, `/v1/summary`,
+`/v1/kills`, `/v1/budgets`, `/v1/alerts`, ingest) work for any valid key of the
+org; **mutations** (`POST …/kill`, `POST …/budget`) require `admin` — a viewer
+key gets `403`. A missing/unknown key gets `401`. Keys never cross orgs.
+
+- **`GET /v1/alerts`** — runs that have spent ≥ a fraction of their central
+  budget. Threshold defaults to `0.8`, overridable per-deploy with
+  `TOKENFUSE_CLOUD_ALERT_PCT` or per-request with `?pct=` (0..1). The embedded
+  dashboard surfaces the count and flags near-budget runs with a ⚠.
 
 ### Gateway side (`crates/gateway/src/cloudsink.rs`)
 
@@ -120,5 +131,5 @@ raise) a runaway run's cap centrally without touching the agent.
 
 ## Not yet (follow-ups)
 - **SQL/columnar store** (Postgres/ClickHouse) for scale + retention (today: durable JSON snapshot).
-- **Auth hardening** — per-org key rotation, TLS, rate limits; dashboard
-  org/RBAC and alerts.
+- **Auth hardening** — per-org key rotation, rate limits (RBAC and budget alerts
+  are implemented; run behind a TLS-terminating proxy in production).

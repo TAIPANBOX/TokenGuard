@@ -223,6 +223,46 @@ func (s *Store) Runs(org string) []RunAgg {
 	return out
 }
 
+// Alert is a run that has spent at or above `pct` of its central budget.
+type Alert struct {
+	RunID         string  `json:"run_id"`
+	SpentMicrousd int64   `json:"spent_microusd"`
+	BudgetMicros  int64   `json:"budget_micros"`
+	Fraction      float64 `json:"fraction"`
+	Killed        bool    `json:"killed"`
+}
+
+// Alerts returns runs whose spend has reached `pct` (0..1) of a set budget.
+// Only runs with a central budget override (>0) are considered.
+func (s *Store) Alerts(org string, pct float64) []Alert {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []Alert{}
+	budgets := s.budgets[org]
+	killed := s.killed[org]
+	runs := s.orgs[org]
+	for run, budget := range budgets {
+		if budget <= 0 {
+			continue
+		}
+		var spent int64
+		if agg := runs[run]; agg != nil {
+			spent = agg.SpentMicrousd
+		}
+		frac := float64(spent) / float64(budget)
+		if frac >= pct {
+			out = append(out, Alert{
+				RunID:         run,
+				SpentMicrousd: spent,
+				BudgetMicros:  budget,
+				Fraction:      frac,
+				Killed:        killed[run],
+			})
+		}
+	}
+	return out
+}
+
 // Summary returns org-wide totals.
 func (s *Store) Summary(org string) Summary {
 	s.mu.RLock()

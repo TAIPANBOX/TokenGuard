@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -13,38 +14,74 @@ import (
 //go:embed index.html
 var dashboardHTML []byte
 
-// server holds the store and the api-key → org mapping.
-type server struct {
-	store *Store
-	keys  map[string]string // api key → org
+// principal is who a key belongs to: an org and a role (admin｜viewer).
+type principal struct {
+	org  string
+	role string
 }
 
-// parseKeys reads "key1:org1,key2:org2" into a map. Falls back to a dev key.
-func parseKeys(spec string) map[string]string {
-	keys := map[string]string{}
+// server holds the store and the api-key → principal mapping.
+type server struct {
+	store    *Store
+	keys     map[string]principal
+	alertPct float64 // budget fraction at which a run is flagged (default 0.8)
+}
+
+// parseKeys reads "key:org[:role],…" (role defaults to admin). Falls back to a
+// dev key. A `viewer` role can read but not kill or set budgets.
+func parseKeys(spec string) map[string]principal {
+	keys := map[string]principal{}
 	for _, pair := range strings.Split(spec, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
 		}
-		if k, org, ok := strings.Cut(pair, ":"); ok {
-			keys[strings.TrimSpace(k)] = strings.TrimSpace(org)
+		parts := strings.Split(pair, ":")
+		if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" {
+			continue
 		}
+		role := "admin"
+		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
+			role = strings.TrimSpace(parts[2])
+		}
+		keys[strings.TrimSpace(parts[0])] = principal{org: strings.TrimSpace(parts[1]), role: role}
 	}
 	if len(keys) == 0 {
-		keys["devkey"] = "default"
+		keys["devkey"] = principal{org: "default", role: "admin"}
 	}
 	return keys
 }
 
-// orgFor resolves the bearer token to an org, or "" if unauthorized.
-func (s *server) orgFor(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+func (s *server) principalFor(r *http.Request) (principal, bool) {
+	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	if token == "" {
-		return ""
+		return principal{}, false
 	}
-	return s.keys[token]
+	p, ok := s.keys[token]
+	return p, ok
+}
+
+// orgFor resolves the bearer token to an org (any role), or "" if unauthorized.
+func (s *server) orgFor(r *http.Request) string {
+	if p, ok := s.principalFor(r); ok {
+		return p.org
+	}
+	return ""
+}
+
+// adminOrg authorizes a mutation: returns the org only for an admin principal,
+// writing the right status otherwise.
+func (s *server) adminOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
+	p, ok := s.principalFor(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return "", false
+	}
+	if p.role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return "", false
+	}
+	return p.org, true
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -93,9 +130,8 @@ func (s *server) summary(w http.ResponseWriter, r *http.Request) {
 
 // kill: POST /v1/runs/{run}/kill → mark a run killed (operator / dashboard)
 func (s *server) kill(w http.ResponseWriter, r *http.Request) {
-	org := s.orgFor(r)
-	if org == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+	org, ok := s.adminOrg(w, r)
+	if !ok {
 		return
 	}
 	run := r.PathValue("run")
@@ -115,9 +151,8 @@ func (s *server) kills(w http.ResponseWriter, r *http.Request) {
 
 // setBudget: POST /v1/runs/{run}/budget {"budget_usd": 1.5}
 func (s *server) setBudget(w http.ResponseWriter, r *http.Request) {
-	org := s.orgFor(r)
-	if org == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+	org, ok := s.adminOrg(w, r)
+	if !ok {
 		return
 	}
 	var body struct {
@@ -142,6 +177,23 @@ func (s *server) budgets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Budgets(org))
 }
 
+// alerts: GET /v1/alerts → runs at or above the alert threshold of their budget.
+// The threshold defaults to 0.8 and can be overridden with ?pct= (0..1).
+func (s *server) alerts(w http.ResponseWriter, r *http.Request) {
+	org := s.orgFor(r)
+	if org == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return
+	}
+	pct := s.alertPct
+	if q := r.URL.Query().Get("pct"); q != "" {
+		if v, err := strconv.ParseFloat(q, 64); err == nil && v > 0 && v <= 1 {
+			pct = v
+		}
+	}
+	writeJSON(w, http.StatusOK, s.store.Alerts(org, pct))
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -154,6 +206,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/kills", s.kills)
 	mux.HandleFunc("POST /v1/runs/{run}/budget", s.setBudget)
 	mux.HandleFunc("GET /v1/budgets", s.budgets)
+	mux.HandleFunc("GET /v1/alerts", s.alerts)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -187,8 +240,14 @@ func main() {
 		addr = "8080"
 	}
 	srv := &server{
-		store: NewStore(),
-		keys:  parseKeys(os.Getenv("TOKENFUSE_CLOUD_KEYS")),
+		store:    NewStore(),
+		keys:     parseKeys(os.Getenv("TOKENFUSE_CLOUD_KEYS")),
+		alertPct: 0.8,
+	}
+	if v := os.Getenv("TOKENFUSE_CLOUD_ALERT_PCT"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p > 0 && p <= 1 {
+			srv.alertPct = p
+		}
 	}
 	// Durable persistence: load a snapshot and autosave every 2s (TOKENFUSE_CLOUD_DATA).
 	if data := os.Getenv("TOKENFUSE_CLOUD_DATA"); data != "" {

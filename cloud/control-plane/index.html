@@ -45,6 +45,7 @@
     <div class="card"><div id="c-runs" class="n">–</div><div class="l">Runs</div></div>
     <div class="card"><div id="c-calls" class="n">–</div><div class="l">Calls</div></div>
     <div class="card"><div id="c-spent" class="n">–</div><div class="l">Spent</div></div>
+    <div class="card"><div id="c-alerts" class="n">–</div><div class="l">Budget alerts</div></div>
   </div>
   <table>
     <thead><tr>
@@ -78,17 +79,22 @@
   async function refresh() {
     if (!key) return;
     try {
-      const [runs, sum] = await Promise.all([api("/v1/runs"), api("/v1/summary")]);
+      const [runs, sum, alerts] = await Promise.all([
+        api("/v1/runs"), api("/v1/summary"), api("/v1/alerts"),
+      ]);
       $("status").textContent = "connected";
       $("c-runs").textContent = sum.runs;
       $("c-calls").textContent = sum.calls;
       $("c-spent").textContent = usd(sum.spent_microusd);
+      const alerted = new Set((alerts || []).map((a) => a.run_id));
+      $("c-alerts").textContent = alerted.size;
+      $("c-alerts").style.color = alerted.size ? "#f85149" : "";
       runs.sort((a, b) => b.spent_microusd - a.spent_microusd);
       $("empty").style.display = runs.length ? "none" : "block";
       $("empty").textContent = "No runs yet — send some traffic through a gateway.";
       $("rows").innerHTML = runs.map((r) => `
         <tr${r.killed ? ' style="opacity:.55"' : ""}>
-          <td>${r.run_id}</td>
+          <td>${r.run_id}${alerted.has(r.run_id) ? ' <span class="pill" style="color:#f85149" title="near budget">⚠</span>' : ""}</td>
           <td><span class="pill">${r.model || "—"}</span></td>
           <td class="num">${usd(r.spent_microusd)}</td>
           <td class="num">${r.calls}</td>
