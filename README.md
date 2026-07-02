@@ -25,6 +25,14 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 > ```
 > Full walkthrough: [**🚀 Get started**](#-get-started).
 
+<div align="center">
+
+<img src="docs/assets/dashboard.gif" alt="TokenFuse Cloud dashboard: live spend per run, with a runaway agent being killed" width="760">
+
+<sub>The hosted Cloud dashboard — live spend across your fleet, with a one-click kill-switch. `cd cloud && docker compose up`.</sub>
+
+</div>
+
 ---
 
 ## 📑 Table of contents
