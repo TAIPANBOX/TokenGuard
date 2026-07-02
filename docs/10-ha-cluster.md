@@ -224,10 +224,24 @@ reservation up the chain, exactly like `tokenfuse-core::Ledger`. A denial names
 the blocked run (leaf or ancestor), so the gateway still reports "parent run X
 exceeded". Per-run `steps` are tracked in the SM and returned on the reservation.
 
+## Membership changes (implemented)
+
+Nodes join and leave a running cluster — no downtime, no re-bootstrap:
+
+- `POST /mgmt/init-single` — start a one-voter cluster.
+- `POST /mgmt/add-learner` `{id, addr}` — add a node that replicates but doesn't
+  vote (blocks until it catches up). The address travels in the replicated
+  membership (`BasicNode.addr`), so peers can reach a runtime-added node.
+- `POST /mgmt/change-membership` `[ids]` — set the voter set (promote learners /
+  remove nodes).
+
+`HttpNode::{init_single, add_learner, change_membership}` and the matching
+`Client` methods wrap these. Test `membership_grow_add_learner_then_promote`:
+start a single-voter node, add a second as a learner over HTTP, promote to
+`{1,2}`, and confirm a write replicates to the newly-joined node.
+
 ## Not yet (follow-ups)
 
-- **`change_membership` join/leave** flow for rolling deploys (the API exposes
-  `initialize`; add-learner/promote endpoints are the next increment).
 - **Linearizable follower reads** via `ensure_linearizable()` + leader forward
   (reads today are eventually-consistent local reads).
 - **HTTPS / auth** on the raft + admin endpoints for cross-machine deploys.

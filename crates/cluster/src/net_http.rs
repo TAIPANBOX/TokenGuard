@@ -48,8 +48,15 @@ impl HttpNetwork {
 impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
     type Network = HttpConn;
 
-    async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
-        let base = self.peers.get(&target).cloned().unwrap_or_default();
+    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+        // Prefer the address carried in the replicated membership (so nodes added
+        // at runtime via add_learner are reachable); fall back to the static
+        // bootstrap peer map for the initial members.
+        let base = if !node.addr.is_empty() {
+            node.addr.clone()
+        } else {
+            self.peers.get(&target).cloned().unwrap_or_default()
+        };
         HttpConn {
             target,
             base,

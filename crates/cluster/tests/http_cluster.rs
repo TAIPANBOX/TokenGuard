@@ -3,7 +3,7 @@
 //! Each test binds three OS-assigned ports, forms a real cluster over HTTP,
 //! and drives budgets through the HTTP API — no in-process shortcuts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,4 +146,74 @@ async fn writes_routed_to_leader_from_any_node() {
     };
     assert!(resp.accepted);
     assert_eq!(resp.reserved_micros, 25 * 10_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_grow_add_learner_then_promote() {
+    // Two nodes; both know each other's URL (bootstrap peer map), but only node 1
+    // is initialized to start — node 2 joins at runtime.
+    let mut listeners = Vec::new();
+    let mut peers_map = BTreeMap::new();
+    for i in 0..2u64 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        peers_map.insert(i + 1, format!("http://127.0.0.1:{port}"));
+        listeners.push(l);
+    }
+    let peers: Peers = Arc::new(peers_map.clone());
+    let urls: Vec<String> = peers_map.values().cloned().collect();
+    for (i, l) in listeners.into_iter().enumerate() {
+        let node = HttpNode::build(i as u64 + 1, peers.clone()).await.unwrap();
+        tokio::spawn(async move {
+            let _ = server::serve_on(node, l).await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let n1 = Client::new(urls[0].clone());
+    let n2 = Client::new(urls[1].clone());
+
+    // Node 1 starts as the sole voter.
+    n1.init_single().await.unwrap().unwrap();
+    assert!(wait_for_leader(&n1).await.is_some());
+
+    // Grow: add node 2 as a learner, then promote the voter set to {1, 2}.
+    n1.add_learner(2, &urls[1]).await.unwrap().unwrap();
+    n1.change_membership(&BTreeSet::from([1, 2]))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A write on the leader must now replicate to the newly-joined node 2.
+    let run = "grow";
+    n1.write(&Request::Open {
+        run: run.into(),
+        budget_micros: USD,
+        parent: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    n1.write(&Request::Reserve {
+        run: run.into(),
+        micros: 30 * 10_000,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let mut seen = false;
+    for _ in 0..100 {
+        if let Ok(Some(s)) = n2.read(run).await {
+            if s.reserved_micros == 30 * 10_000 {
+                seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen,
+        "node 2 joined at runtime must receive replicated writes"
+    );
 }
