@@ -6,7 +6,7 @@
 
 **Observability shows you the fire. TokenFuse is the automatic fire extinguisher.**
 
-![release](https://img.shields.io/badge/release-v0.2.0-brightgreen)
+![release](https://img.shields.io/badge/release-v0.3.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -225,7 +225,7 @@ TokenFuse is **complementary** to observability and gateways — many teams will
 
 ## 🧩 What's inside
 
-Everything below is **implemented and shipped in v0.2.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
+Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
 
 <div align="center">
 
@@ -288,7 +288,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 ## 📋 Project status
 
-**v0.2.0 — functional and shipped, young and not yet battle-tested.**
+**v0.3.0 — functional and shipped, young and not yet battle-tested.**
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
@@ -352,7 +352,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Is it free?** The core is **open source (Apache-2.0)**. A hosted Cloud and advanced packs are the intended paid tiers.
 
-**Is it production-ready?** It's a young v0.2.0 — functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
+**Is it production-ready?** It's a young v0.3.0 — functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
