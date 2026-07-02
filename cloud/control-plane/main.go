@@ -112,6 +112,35 @@ func (s *server) kills(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Kills(org))
 }
 
+// setBudget: POST /v1/runs/{run}/budget {"budget_usd": 1.5}
+func (s *server) setBudget(w http.ResponseWriter, r *http.Request) {
+	org := s.orgFor(r)
+	if org == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return
+	}
+	var body struct {
+		BudgetUSD float64 `json:"budget_usd"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
+		return
+	}
+	micros := int64(body.BudgetUSD * 1e6)
+	s.store.SetBudget(org, r.PathValue("run"), micros)
+	writeJSON(w, http.StatusOK, map[string]any{"run": r.PathValue("run"), "budget_micros": micros})
+}
+
+// budgets: GET /v1/budgets → {run: budget_micros} (gateways poll this)
+func (s *server) budgets(w http.ResponseWriter, r *http.Request) {
+	org := s.orgFor(r)
+	if org == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.Budgets(org))
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -122,6 +151,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/summary", s.summary)
 	mux.HandleFunc("POST /v1/runs/{run}/kill", s.kill)
 	mux.HandleFunc("GET /v1/kills", s.kills)
+	mux.HandleFunc("POST /v1/runs/{run}/budget", s.setBudget)
+	mux.HandleFunc("GET /v1/budgets", s.budgets)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

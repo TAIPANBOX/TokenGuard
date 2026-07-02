@@ -52,8 +52,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         };
     };
 
-    let budget = header_f64(&headers, "x-fuse-budget-usd")
-        .map(Microusd::from_usd)
+    // A Cloud-managed budget (set by an operator) overrides the client-supplied
+    // header; otherwise use the header, then the policy default.
+    let budget = st
+        .cloud_budget(&run_id)
+        .or_else(|| header_f64(&headers, "x-fuse-budget-usd").map(Microusd::from_usd))
         .or(st.policy.budget_per_run)
         .unwrap_or(DEFAULT_RUN_BUDGET);
     // A sub-agent's run rolls up into its parent's budget (hierarchical budgets).

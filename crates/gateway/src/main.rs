@@ -228,6 +228,19 @@ async fn serve() {
                 key.clone(),
                 move |run| st.kill(run),
             );
+            // Pull centrally-managed budgets (override the client-supplied budget).
+            let stb = state.clone();
+            tokenfuse_gateway::cloudsink::spawn_budget_poller(
+                base.clone(),
+                key.clone(),
+                move |map| {
+                    let budgets = map
+                        .into_iter()
+                        .map(|(run, micros)| (run, tokenfuse_core::Microusd(micros)))
+                        .collect();
+                    stb.set_cloud_budgets(budgets);
+                },
+            );
             let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(base, key));
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();

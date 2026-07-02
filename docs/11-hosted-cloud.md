@@ -94,9 +94,16 @@ runs a **kill poller** (`cloudsink::spawn_kill_poller`) that fetches
 so the run is hard-stopped (`402 killed`) across the whole fleet, not just on one
 gateway. Enabled automatically whenever `TOKENFUSE_CLOUD_URL` + `_KEY` are set.
 
-## Not yet (follow-ups)
+## Central budgets (implemented)
 
-- **Central budgets / limits** managed in the Cloud and pushed to gateways.
+Set a run's budget from the Cloud and every gateway of the org enforces it,
+overriding the client-supplied `x-fuse-budget-usd` header. The dashboard has a
+per-run **Budget** button (`POST /v1/runs/{run}/budget {budget_usd}`); gateways
+run a **budget poller** (`cloudsink::spawn_budget_poller`) that fetches
+`GET /v1/budgets` and applies the overrides. So an operator can tighten (or
+raise) a runaway run's cap centrally without touching the agent.
+
+## Not yet (follow-ups)
 - **Durable storage** (Postgres/ClickHouse) + retention.
 - **Richer dashboard** — the roadmap's Next.js app (charts, alerts, org/RBAC);
   today's embedded page is the dependency-free v1.

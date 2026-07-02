@@ -29,7 +29,6 @@ struct Batch<'a> {
 }
 
 impl CloudSink {
-    /// `url` is the control plane's ingest endpoint (e.g.
     /// `base` is the control plane's base URL (e.g. `http://control-plane:8080`);
     /// telemetry is POSTed to `{base}/v1/ingest`. `key` is the org API key.
     pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
@@ -90,6 +89,39 @@ impl EventSink for CloudSink {
         let batch = std::mem::take(&mut *self.buf.lock().unwrap());
         self.ship(batch);
     }
+}
+
+/// Poll the control plane's per-run budget overrides and hand them to `apply`
+/// (run id → µUSD), so an operator can set/tighten budgets centrally and every
+/// gateway of the org enforces them. Best-effort; runs until the process exits.
+pub fn spawn_budget_poller<F>(base: String, key: String, apply: F)
+where
+    F: Fn(std::collections::HashMap<String, i64>) + Send + Sync + 'static,
+{
+    let url = format!("{}/v1/budgets", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            let resp = match client.get(&url).bearer_auth(&key).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("cloud budget poll failed: {e}");
+                    continue;
+                }
+            };
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(map) =
+                serde_json::from_slice::<std::collections::HashMap<String, i64>>(&bytes)
+            {
+                apply(map);
+            }
+        }
+    });
 }
 
 /// Poll the control plane's kill list and apply each killed run id locally, so an

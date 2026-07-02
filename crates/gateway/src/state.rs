@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
 use tokenfuse_core::taint::Labels;
-use tokenfuse_core::{DlpMode, Ledger, Policy, PriceBook, SemanticCache};
+use tokenfuse_core::{DlpMode, Ledger, Microusd, Policy, PriceBook, SemanticCache};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
 /// detector. Bounded so a long-lived run cannot grow it without limit.
@@ -43,6 +43,9 @@ pub struct AppState {
     killed: Killed,
     /// Per-run accumulated taint labels.
     taint: Arc<Mutex<HashMap<String, Labels>>>,
+    /// Per-run budgets pushed from the Cloud control plane (override the
+    /// client-supplied budget). Empty unless cloud mode is on.
+    cloud_budgets: Arc<Mutex<HashMap<String, Microusd>>>,
 }
 
 impl AppState {
@@ -72,7 +75,19 @@ impl AppState {
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
+            cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the Cloud-managed budget overrides (run id → µUSD). Called by the
+    /// budget poller when cloud mode is on.
+    pub fn set_cloud_budgets(&self, budgets: HashMap<String, Microusd>) {
+        *self.cloud_budgets.lock().unwrap() = budgets;
+    }
+
+    /// The Cloud-managed budget for a run, if one has been set.
+    pub fn cloud_budget(&self, run_id: &str) -> Option<Microusd> {
+        self.cloud_budgets.lock().unwrap().get(run_id).copied()
     }
 
     /// Replace the ledger backend (e.g. a raft-replicated one). Chainable.

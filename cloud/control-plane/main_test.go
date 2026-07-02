@@ -78,6 +78,31 @@ func TestKillFlow(t *testing.T) {
 	}
 }
 
+func TestBudgetFlow(t *testing.T) {
+	srv := newTestServer()
+	h := srv.routes()
+
+	req := httptest.NewRequest("POST", "/v1/runs/r9/budget", bytes.NewReader([]byte(`{"budget_usd":2.5}`)))
+	req.Header.Set("Authorization", "Bearer devkey")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set budget status = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/budgets", nil)
+	req.Header.Set("Authorization", "Bearer devkey")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var budgets map[string]int64
+	if err := json.Unmarshal(rec.Body.Bytes(), &budgets); err != nil {
+		t.Fatal(err)
+	}
+	if budgets["r9"] != 2_500_000 {
+		t.Fatalf("budgets[r9] = %d, want 2500000", budgets["r9"])
+	}
+}
+
 func TestUnauthorizedRejected(t *testing.T) {
 	srv := newTestServer()
 	h := srv.routes()

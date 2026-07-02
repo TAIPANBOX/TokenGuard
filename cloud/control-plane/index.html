@@ -95,16 +95,38 @@
           <td class="num">${r.cache_hits}</td>
           <td class="num">${r.steps}</td>
           <td>${ago(r.last_seen_millis)}</td>
-          <td>${r.killed
-            ? '<span class="pill" style="color:#f85149">killed</span>'
-            : `<button data-run="${r.run_id}" style="background:#b62324;padding:3px 10px;font-size:12px;">Kill</button>`}</td>
+          <td style="white-space:nowrap">
+            <button data-budget="${r.run_id}" style="background:#30363d;padding:3px 10px;font-size:12px;margin-right:4px">Budget</button>
+            ${r.killed
+              ? '<span class="pill" style="color:#f85149">killed</span>'
+              : `<button data-run="${r.run_id}" style="background:#b62324;padding:3px 10px;font-size:12px;">Kill</button>`}
+          </td>
         </tr>`).join("");
       document.querySelectorAll("button[data-run]").forEach((b) => {
         b.onclick = () => killRun(b.getAttribute("data-run"));
       });
+      document.querySelectorAll("button[data-budget]").forEach((b) => {
+        b.onclick = () => setBudget(b.getAttribute("data-budget"));
+      });
     } catch (e) {
       $("status").textContent = "error: " + e.message;
     }
+  }
+
+  async function setBudget(run) {
+    if (!key) return;
+    const v = prompt("Set budget for run '" + run + "' (USD):");
+    if (v === null) return;
+    const usd = parseFloat(v);
+    if (isNaN(usd)) { alert("not a number"); return; }
+    try {
+      await fetch("/v1/runs/" + encodeURIComponent(run) + "/budget", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ budget_usd: usd }),
+      });
+      refresh();
+    } catch (e) { $("status").textContent = "set budget failed: " + e.message; }
   }
 
   async function killRun(run) {

@@ -41,15 +41,17 @@ type Summary struct {
 // (A durable backend — Postgres/ClickHouse — is a drop-in follow-up behind the
 // same methods.)
 type Store struct {
-	mu     sync.RWMutex
-	orgs   map[string]map[string]*RunAgg
-	killed map[string]map[string]bool // org → run → killed
+	mu      sync.RWMutex
+	orgs    map[string]map[string]*RunAgg
+	killed  map[string]map[string]bool  // org → run → killed
+	budgets map[string]map[string]int64 // org → run → budget µUSD
 }
 
 func NewStore() *Store {
 	return &Store{
-		orgs:   make(map[string]map[string]*RunAgg),
-		killed: make(map[string]map[string]bool),
+		orgs:    make(map[string]map[string]*RunAgg),
+		killed:  make(map[string]map[string]bool),
+		budgets: make(map[string]map[string]int64),
 	}
 }
 
@@ -72,6 +74,28 @@ func (s *Store) Kills(org string) []string {
 		if k {
 			out = append(out, run)
 		}
+	}
+	return out
+}
+
+// SetBudget sets a centrally-managed budget (microdollars) for a run; gateways
+// poll this and apply it, overriding the client-supplied budget.
+func (s *Store) SetBudget(org, run string, micros int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.budgets[org] == nil {
+		s.budgets[org] = make(map[string]int64)
+	}
+	s.budgets[org][run] = micros
+}
+
+// Budgets returns an org's run → budget-micros overrides.
+func (s *Store) Budgets(org string) map[string]int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]int64, len(s.budgets[org]))
+	for run, m := range s.budgets[org] {
+		out[run] = m
 	}
 	return out
 }
