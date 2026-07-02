@@ -29,11 +29,16 @@ crossterm = "0.29.0"
 datafusion = { version = "44", default-features = false, features = ["parquet"] }
 wasmtime = { version = "27", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 fastembed = { version = "4", optional = true }
+# HA: co-locate a raft node so budgets replicate across gateways. Optional — the
+# heavy openraft stack is only pulled in with `--features cluster`. The crate is
+# excluded from the default workspace; this path dep builds it on demand.
+tokenfuse-cluster = { path = "../cluster", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [features]
+cluster = ["dep:tokenfuse-cluster"]
 onnx = ["dep:fastembed"]
 wasm = ["dep:wasmtime"]

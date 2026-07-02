@@ -26,6 +26,7 @@ pub async fn list_runs(State(st): State<AppState>) -> Json<Vec<RunView>> {
     let mut views: Vec<RunView> = st
         .ledger
         .list_runs()
+        .await
         .into_iter()
         .map(|(run_id, s)| {
             let budget = s.budget.as_usd();

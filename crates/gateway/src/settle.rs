@@ -9,13 +9,14 @@
 //! so the budget is never left over-reserved (a leaked reservation would wrongly
 //! block later calls in the same run).
 
+use crate::ledger_backend::LedgerBackend;
 use crate::provider::UsageSlot;
 use crate::sink::{now_millis, CallRecord, EventSink};
 use std::sync::Arc;
-use tokenfuse_core::{Ledger, Microusd, PriceBook, Reservation};
+use tokenfuse_core::{Microusd, PriceBook, Reservation};
 
 pub struct SettleGuard {
-    ledger: Arc<Ledger>,
+    ledger: Arc<dyn LedgerBackend>,
     prices: Arc<PriceBook>,
     sink: Arc<dyn EventSink>,
     model: String,
@@ -27,7 +28,7 @@ pub struct SettleGuard {
 impl SettleGuard {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ledger: Arc<Ledger>,
+        ledger: Arc<dyn LedgerBackend>,
         prices: Arc<PriceBook>,
         sink: Arc<dyn EventSink>,
         model: String,
@@ -89,7 +90,7 @@ mod tests {
     use super::*;
     use crate::provider::UsageSlot;
     use std::sync::Mutex;
-    use tokenfuse_core::{ModelPrice, PriceBook, Usage};
+    use tokenfuse_core::{Ledger, ModelPrice, PriceBook, Usage};
 
     fn setup() -> (Arc<Ledger>, Arc<PriceBook>, UsageSlot, Reservation) {
         let ledger = Arc::new(Ledger::new());
@@ -110,7 +111,7 @@ mod tests {
             ..Default::default()
         });
         let guard = SettleGuard::new(
-            ledger.clone(),
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
             prices,
             Arc::new(crate::sink::NullSink),
             "m".into(),
@@ -132,7 +133,7 @@ mod tests {
         let fallback = Microusd::from_usd(1.0);
         {
             let _guard = SettleGuard::new(
-                ledger.clone(),
+                Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
                 prices,
                 Arc::new(crate::sink::NullSink),
                 "m".into(),

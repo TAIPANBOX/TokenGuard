@@ -58,13 +58,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         .unwrap_or(DEFAULT_RUN_BUDGET);
     // A sub-agent's run rolls up into its parent's budget (hierarchical budgets).
     let parent = header_str(&headers, "x-fuse-parent-run-id");
-    st.ledger.open_run(&run_id, budget, parent.as_deref());
+    st.ledger.open_run(&run_id, budget, parent.as_deref()).await;
 
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
         let spent = st
             .ledger
             .snapshot(&run_id)
+            .await
             .map(|s| s.spent)
             .unwrap_or(Microusd::ZERO);
         return budget_error(
@@ -116,6 +117,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     let step = st
                         .ledger
                         .snapshot(&run_id)
+                        .await
                         .map(|s| s.steps + 1)
                         .unwrap_or(1);
                     st.sink.record(CallRecord {
@@ -146,7 +148,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
         .unwrap_or(Microusd::ZERO);
 
-    let snapshot = st.ledger.snapshot(&run_id).expect("run just opened");
+    let snapshot = st.ledger.snapshot(&run_id).await.expect("run just opened");
     let eval = evaluate(&st.policy, &snapshot, estimate);
 
     // Loop / runaway detection. Signatures come from the request's own message
@@ -219,7 +221,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
     let reservation = match st.policy.mode {
-        Mode::Enforce => match st.ledger.reserve(&run_id, estimate) {
+        Mode::Enforce => match st.ledger.reserve(&run_id, estimate).await {
             Ok(r) => r,
             Err(BudgetError::Exceeded {
                 run_id: hit_run,
@@ -241,9 +243,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &reason,
                 );
             }
-            Err(BudgetError::UnknownRun { .. }) => st.ledger.reserve_unchecked(&run_id, estimate),
+            Err(BudgetError::UnknownRun { .. }) => {
+                st.ledger.reserve_unchecked(&run_id, estimate).await
+            }
         },
-        Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate),
+        Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate).await,
     };
 
     // Agent firewall: accumulate the run's taint from this request (header +
@@ -388,6 +392,7 @@ async fn buffered_managed(
     let spent = st
         .ledger
         .snapshot(&reservation.run_id)
+        .await
         .map(|s| s.spent)
         .unwrap_or(actual);
 
@@ -761,7 +766,7 @@ mod tests {
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
         assert!(resp.headers().contains_key("x-fuse-cost-usd"));
 
-        let snap = ledger.snapshot("run-1").unwrap();
+        let snap = ledger.snapshot("run-1").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.steps, 1);
     }
@@ -910,7 +915,8 @@ mod tests {
         let st = state(Mode::Enforce, StubProvider::default());
         // Parent budget is tiny — smaller than a single child call's estimate.
         st.ledger
-            .open_run("parent", Microusd::from_usd(0.001), None);
+            .open_run("parent", Microusd::from_usd(0.001), None)
+            .await;
 
         let child = Request::post("/v1/messages")
             .header("x-fuse-run-id", "child")
@@ -1047,10 +1053,12 @@ mod tests {
             },
         );
         st.ledger
-            .open_run("run-cancel", Microusd::from_usd(5.0), None);
+            .open_run("run-cancel", Microusd::from_usd(5.0), None)
+            .await;
         let reservation = st
             .ledger
             .reserve("run-cancel", Microusd::from_usd(0.5))
+            .await
             .unwrap();
         let resp = st
             .provider
@@ -1065,7 +1073,7 @@ mod tests {
             let _first = data.next().await;
         }
 
-        let snap = st.ledger.snapshot("run-cancel").unwrap();
+        let snap = st.ledger.snapshot("run-cancel").await.unwrap();
         assert_eq!(snap.reserved, Microusd::ZERO); // released, not leaked
         assert!(snap.spent > Microusd::ZERO); // conservative fallback charge
     }
@@ -1098,7 +1106,7 @@ mod tests {
         assert!(text.contains("message_start"));
         assert!(text.contains("[DONE]"));
 
-        let snap = ledger.snapshot("run-stream").unwrap();
+        let snap = ledger.snapshot("run-stream").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.reserved, Microusd::ZERO); // reservation released on settle
     }

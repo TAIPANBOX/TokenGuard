@@ -167,13 +167,47 @@ HTTP API:
 - **`writes_routed_to_leader_from_any_node`** — a write sent to a follower is
   surfaced as a retryable forward, and commits against the leader.
 
+## Gateway integration (implemented)
+
+The gateway talks to the cluster through an async `LedgerBackend` trait
+(`crates/gateway/src/ledger_backend.rs`):
+
+- The default backend, `LocalLedger`, wraps the in-process `tokenfuse-core::Ledger`
+  — behaviour and performance unchanged when cluster mode is off.
+- Behind the gateway's `cluster` feature, `RaftLedger`
+  (`crates/gateway/src/raft_ledger.rs`) **co-locates a raft node** in the gateway
+  process, runs its HTTP server so peer gateways replicate to it, and turns
+  `open`/`reserve`/`settle` into raft writes (transparently forwarded to the
+  leader). The budget check is therefore linearized across every gateway sharing
+  the cluster.
+
+`reserve`/`open`/`snapshot` are `async` (consensus round-trips); `settle` stays
+synchronous and fire-and-forget so `SettleGuard::drop` still works — the local
+backend settles inline, the raft backend spawns the write.
+
+Enable it at launch (built with `--features cluster`):
+
+```bash
+TOKENFUSE_CLUSTER_ID=1 \
+TOKENFUSE_CLUSTER_ADDR=127.0.0.1:5001 \
+TOKENFUSE_CLUSTER_PEERS=1=http://127.0.0.1:5001,2=http://127.0.0.1:5002,3=http://127.0.0.1:5003 \
+TOKENFUSE_CLUSTER_BOOTSTRAP=1 \
+tokenfuse                       # run one gateway per host; BOOTSTRAP on exactly one
+```
+
+If consensus is unreachable, `reserve` **fails open** (consistent with
+TokenFuse's default) — a cluster outage degrades to "no enforcement", never
+"all agents blocked".
+
+**Current limitations (documented):** the replicated state machine is flat, so
+hierarchical sub-agent budgets (`X-Fuse-Parent-Run-Id`) and per-run step counts
+are honoured only by the local backend; under cluster mode `parent` is ignored
+and `steps` is a local counter. Porting the parent-chain into the SM is a
+follow-up.
+
 ## Not yet (follow-ups)
 
-- **Wire the gateway to the cluster** — today's gateway uses the in-process
-  `tokenfuse-core::Ledger` synchronously. The cluster is a standalone, tested
-  replacement for the ledger's authority; bridging them needs an **async
-  `LedgerBackend`** in the gateway (the hot path and `SettleGuard::drop` are
-  currently sync) selected behind a `cluster` feature. **This is the next PR.**
+- **Hierarchy + steps in the replicated SM** (see limitation above).
 - **Durable storage backend** (redb) behind the storage traits.
 - **`change_membership` join/leave** flow for rolling deploys (the API exposes
   `initialize`; add-learner/promote endpoints are the next increment).

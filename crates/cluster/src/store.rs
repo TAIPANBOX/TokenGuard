@@ -165,6 +165,18 @@ impl StateMachineStore {
     pub async fn read_run(&self, run: &str) -> Option<crate::types::RunState> {
         self.inner.lock().await.ledger.runs.get(run).cloned()
     }
+
+    /// Snapshot every run's replicated accounting (for observability views).
+    pub async fn list_runs(&self) -> Vec<(String, crate::types::RunState)> {
+        self.inner
+            .lock()
+            .await
+            .ledger
+            .runs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
