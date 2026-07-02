@@ -7,11 +7,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 
 ## Current stage
 
-**Phase 0 complete.** Real forwarding + SSE passthrough, and the latency
-benchmark that closes the spike: the enforcement decision path adds **~0.4 µs at
-p99** and a full in-process request is **~4.7 µs at p99** — ~3 orders of
-magnitude under the 3 ms target. Next: the client-cancel settle guard, then
-Phase 2 (loop detection) and the `tokenfuse top` TUI.
+**Phase 0 complete; Phase 2 underway.** Real forwarding + SSE passthrough at
+~0.4 µs p99 overhead, the settle guard, and now **loop / runaway detection**
+(identical-tool-call, ping-pong, context-growth). Next: the `tokenfuse top` TUI
+(needs a runs registry + observability endpoint), then the Python SDK and the
+Parquet trace sink.
 
 ## Status by component
 
@@ -26,14 +26,14 @@ Phase 2 (loop detection) and the `tokenfuse top` TUI.
 | Gateway — real forwarding + SSE passthrough | ✅ done | `HttpProvider` (reqwest/rustls) streams chunks through; `UsageParser` extracts usage from Anthropic + OpenAI SSE and non-stream JSON; settle at end-of-stream. `TOKENFUSE_UPSTREAM` selects real vs stub. Verified live. |
 | Latency benchmark (p99 < 3 ms) | ✅ done | `examples/bench.rs`; decision path **p99 0.38 µs**, full in-process request **p99 4.67 µs** — ~3 orders under target. See BENCHMARKS.md |
 | Client-cancel settle guard | ✅ done | `SettleGuard` settles on Drop — client cancel or upstream error mid-stream never leaks a reservation |
-| Loop detection | ⬜ todo | Phase 2 |
-| `tokenfuse top` TUI | ⬜ todo | Phase 1 (W2) |
+| Loop detection | ✅ done | `crates/core/loops.rs`: identical-tool-call + ping-pong (from the request's own message history) + context-growth (per-run tracker). Wired in: enforce → `402 loop_detected`, shadow/warn → `x-fuse-would-block` header. Verified live. |
+| `tokenfuse top` TUI | ⬜ next | Phase 1 (W2) — needs a runs registry + observability endpoint first |
 | Python SDK | ⬜ todo | Phase 1 |
 | Parquet trace sink | ⬜ todo | Phase 2 (W8) |
 
 ## Test status
 
-`cargo test --all` — 35 passing (core: 19, gateway: 16). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: streaming request forwarded through the gateway to a real HTTP SSE upstream, all frames passed through, run settled.
+`cargo test --all` — 44 passing (core: 27, gateway: 17). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
 
 ## How to run
 

@@ -9,3 +9,4 @@ description = "Core domain for Tokenfuse: money, pricing, ledger, policy."
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true

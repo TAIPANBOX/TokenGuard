@@ -11,6 +11,7 @@
 //! violation but still allows; `Enforce` blocks.
 
 use crate::ledger::RunSnapshot;
+use crate::loops::AnomalyConfig;
 use crate::money::Microusd;
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +26,7 @@ pub enum Mode {
 
 /// A policy is a selector-matched bundle of limits plus a rollout mode. The
 /// selector lives at a higher layer; this is the evaluable core.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
     #[serde(default)]
     pub mode: Mode,
@@ -37,6 +38,9 @@ pub struct Policy {
     pub budget_per_step: Option<Microusd>,
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// Loop / runaway detectors. Evaluated by the gateway via `crate::loops`.
+    #[serde(default)]
+    pub anomalies: AnomalyConfig,
 }
 
 impl Default for Policy {
@@ -46,6 +50,7 @@ impl Default for Policy {
             budget_per_run: None,
             budget_per_step: None,
             max_steps: None,
+            anomalies: AnomalyConfig::default(),
         }
     }
 }

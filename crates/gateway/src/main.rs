@@ -7,7 +7,7 @@
 //! - unset → the deterministic stub, so `cargo run` works offline.
 
 use std::sync::Arc;
-use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
+use tokenfuse_core::{AnomalyConfig, Growth, Ledger, ModelPrice, Policy, PriceBook, Window};
 use tokenfuse_gateway::app;
 use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
@@ -45,10 +45,30 @@ async fn main() {
         }
     };
 
+    // Shadow mode by default (safe to drop in) with loop detectors wired on, so
+    // the running gateway surfaces "would block" without changing behavior.
+    let policy = Policy {
+        anomalies: AnomalyConfig {
+            identical_tool_call: Some(Window {
+                window: 10,
+                threshold: 3,
+            }),
+            pingpong_pair: Some(Window {
+                window: 8,
+                threshold: 2,
+            }),
+            context_growth: Some(Growth {
+                factor: 1.5,
+                consecutive: 3,
+            }),
+        },
+        ..Policy::default()
+    };
+
     let state = AppState::new(
         Arc::new(Ledger::new()),
         Arc::new(prices),
-        Arc::new(Policy::default()), // shadow by default
+        Arc::new(policy),
         provider,
         "default",
     );

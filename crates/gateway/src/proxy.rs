@@ -29,7 +29,9 @@ pub async fn healthz() -> &'static str {
 /// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
 /// as-is once the budget check passes.
 pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let parsed = parse_request(&body);
+    let request: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let parsed = parse_request(&request);
 
     // No run id → unmanaged pass-through (drop-in safe).
     let Some(run_id) = header_str(&headers, "x-fuse-run-id") else {
@@ -51,17 +53,43 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     let snapshot = st.ledger.snapshot(&run_id).expect("run just opened");
     let eval = evaluate(&st.policy, &snapshot, estimate);
 
-    // Policy (step/max-steps) block, enforced only in enforce mode.
-    if st.policy.mode == Mode::Enforce && eval.decision.is_blocking() {
-        return budget_error(
-            "policy_violation",
-            &run_id,
-            budget,
-            snapshot.spent,
-            &st.policy_id,
-            &eval.violated.unwrap_or_default(),
-        );
+    // Loop / runaway detection. Signatures come from the request's own message
+    // history; context growth from the per-run input-size tracker.
+    let input_tokens = (body.len() as u64) / 4;
+    let history = st.record_input(&run_id, input_tokens);
+    let loop_reason = if st.policy.anomalies.is_empty() {
+        None
+    } else {
+        let sigs = tokenfuse_core::loops::tool_call_signatures(&request);
+        tokenfuse_core::loops::detect(&sigs, &history, &st.policy.anomalies)
+    };
+
+    // Enforce-mode blocks (step/max-steps first, then loops), before forwarding.
+    if st.policy.mode == Mode::Enforce {
+        if eval.decision.is_blocking() {
+            return budget_error(
+                "policy_violation",
+                &run_id,
+                budget,
+                snapshot.spent,
+                &st.policy_id,
+                &eval.violated.clone().unwrap_or_default(),
+            );
+        }
+        if let Some(reason) = &loop_reason {
+            return budget_error(
+                "loop_detected",
+                &run_id,
+                budget,
+                snapshot.spent,
+                &st.policy_id,
+                reason,
+            );
+        }
     }
+
+    // For shadow/warn, surface whichever signal tripped in the response header.
+    let would_block = eval.violated.clone().or(loop_reason);
 
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
@@ -93,9 +121,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     };
 
     if parsed.stream {
-        stream_managed(resp, reservation, eval.violated, &parsed.model, &st)
+        stream_managed(resp, reservation, would_block, &parsed.model, &st)
     } else {
-        buffered_managed(resp, reservation, eval.violated, &parsed.model, &st).await
+        buffered_managed(resp, reservation, would_block, &parsed.model, &st).await
     }
 }
 
@@ -284,8 +312,7 @@ struct ParsedRequest {
     stream: bool,
 }
 
-fn parse_request(body: &[u8]) -> ParsedRequest {
-    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+fn parse_request(value: &serde_json::Value) -> ParsedRequest {
     ParsedRequest {
         model: value
             .get("model")
@@ -437,6 +464,39 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn enforce_blocks_on_detected_loop() {
+        use tokenfuse_core::{AnomalyConfig, Window};
+        let mut st = state(Mode::Enforce, StubProvider::default());
+        st.policy = Arc::new(Policy {
+            mode: Mode::Enforce,
+            anomalies: AnomalyConfig {
+                identical_tool_call: Some(Window {
+                    window: 10,
+                    threshold: 3,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // A request whose own history shows the same tool called three times.
+        let call_block = r#"{"role":"assistant","content":[{"type":"tool_use","name":"grep","input":{"q":"x"}}]}"#;
+        let body = format!(
+            r#"{{"model":"test-model","max_tokens":100,"messages":[{call_block},{call_block},{call_block}]}}"#
+        );
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-loop")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "loop_detected");
     }
 
     #[tokio::test]
