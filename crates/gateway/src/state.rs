@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
 use tokenfuse_core::taint::Labels;
-use tokenfuse_core::{Ledger, Policy, PriceBook, SemanticCache};
+use tokenfuse_core::{DlpMode, Ledger, Policy, PriceBook, SemanticCache};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
 /// detector. Bounded so a long-lived run cannot grow it without limit.
@@ -31,6 +31,8 @@ pub struct AppState {
     pub cache: Arc<SemanticCache>,
     /// Agent-firewall config (Off by default).
     pub firewall: Arc<FirewallConfig>,
+    /// Secret-scanning (DLP) mode (Off by default).
+    pub dlp: DlpMode,
     history: History,
     killed: Killed,
     /// Per-run accumulated taint labels.
@@ -57,10 +59,17 @@ impl AppState {
                 CacheConfig::default(), // Off
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
+            dlp: DlpMode::Off,
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Set the DLP (secret-scanning) mode. Chainable.
+    pub fn with_dlp(mut self, dlp: DlpMode) -> Self {
+        self.dlp = dlp;
+        self
     }
 
     /// Attach an agent-firewall config. Chainable.
