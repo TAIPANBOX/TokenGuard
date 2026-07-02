@@ -62,13 +62,19 @@ pub struct Reservation {
     pub step: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RunState {
     budget: Microusd,
     reserved: Microusd,
     spent: Microusd,
     steps: u32,
+    /// Parent run this one rolls up into (hierarchical sub-agent budgets).
+    parent: Option<String>,
 }
+
+/// Max ancestor depth walked when rolling reservations up a run tree — a guard
+/// against accidental cycles or pathological nesting.
+const MAX_CHAIN_DEPTH: usize = 64;
 
 /// In-process reserve/settle ledger. Cheap to clone via `Arc` at the call site.
 #[derive(Default)]
@@ -81,9 +87,10 @@ impl Ledger {
         Ledger::default()
     }
 
-    /// Register a run with its budget. Idempotent for the budget; existing
-    /// counters are preserved so re-declaring a run mid-flight is safe.
-    pub fn open_run(&self, run_id: impl Into<String>, budget: Microusd) {
+    /// Register a run with its budget and optional parent. Idempotent for the
+    /// budget; existing counters (and the parent, once set) are preserved so
+    /// re-declaring a run mid-flight is safe.
+    pub fn open_run(&self, run_id: impl Into<String>, budget: Microusd, parent: Option<&str>) {
         let mut runs = self.runs.lock().unwrap();
         runs.entry(run_id.into())
             .and_modify(|s| s.budget = budget)
@@ -92,7 +99,29 @@ impl Ledger {
                 reserved: Microusd::ZERO,
                 spent: Microusd::ZERO,
                 steps: 0,
+                parent: parent.map(|p| p.to_string()),
             });
+    }
+
+    /// The chain of run ids from `run_id` up through its ancestors (leaf first).
+    /// Missing ancestors and cycles terminate the walk. Assumes the lock is held.
+    fn chain(runs: &HashMap<String, RunState>, run_id: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut cur = Some(run_id.to_string());
+        while let Some(id) = cur {
+            if ids.contains(&id) || ids.len() >= MAX_CHAIN_DEPTH {
+                break;
+            }
+            match runs.get(&id) {
+                Some(s) => {
+                    let parent = s.parent.clone();
+                    ids.push(id);
+                    cur = parent;
+                }
+                None => break,
+            }
+        }
+        ids
     }
 
     pub fn snapshot(&self, run_id: &str) -> Option<RunSnapshot> {
@@ -105,62 +134,84 @@ impl Ledger {
         })
     }
 
-    /// Atomically reserve `estimate` against the run's remaining budget.
-    /// Increments the step counter on success.
+    /// Atomically reserve `estimate` against the run's budget *and every
+    /// ancestor's* budget — so a sub-agent's spend rolls up into its parent's
+    /// cap. Fails (reserving nothing) if any level would be exceeded.
+    /// Increments the leaf run's step counter on success.
     pub fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError> {
         let mut runs = self.runs.lock().unwrap();
-        let state = runs
-            .get_mut(run_id)
-            .ok_or_else(|| BudgetError::UnknownRun {
+        if !runs.contains_key(run_id) {
+            return Err(BudgetError::UnknownRun {
                 run_id: run_id.to_string(),
-            })?;
-
-        let would = state.spent + state.reserved + estimate;
-        if would > state.budget {
-            return Err(BudgetError::Exceeded {
-                run_id: run_id.to_string(),
-                budget: state.budget,
-                spent: state.spent,
-                would,
             });
         }
+        let ids = Self::chain(&runs, run_id);
 
-        state.reserved = state.reserved + estimate;
-        state.steps += 1;
+        // Check every level first (all-or-nothing).
+        for id in &ids {
+            let s = &runs[id];
+            let would = s.spent + s.reserved + estimate;
+            if would > s.budget {
+                return Err(BudgetError::Exceeded {
+                    run_id: id.clone(),
+                    budget: s.budget,
+                    spent: s.spent,
+                    would,
+                });
+            }
+        }
+
+        // Apply to every level; steps increments on the leaf only.
+        for id in &ids {
+            let s = runs.get_mut(id).expect("in chain");
+            s.reserved = s.reserved + estimate;
+        }
+        let leaf = runs.get_mut(run_id).expect("leaf");
+        leaf.steps += 1;
         Ok(Reservation {
             run_id: run_id.to_string(),
             amount: estimate,
-            step: state.steps,
+            step: leaf.steps,
         })
     }
 
-    /// Reserve without a budget check. Used in shadow/warn modes, where a breach
-    /// must be *recorded* (so spend and steps stay accurate) but must not block.
-    /// Always succeeds; opens the run at zero budget if it does not exist.
+    /// Reserve without a budget check across the whole chain. Used in
+    /// shadow/warn modes, where a breach must be *recorded* (so spend and steps
+    /// stay accurate) but must not block. Opens the run at zero budget if absent.
     pub fn reserve_unchecked(&self, run_id: &str, estimate: Microusd) -> Reservation {
         let mut runs = self.runs.lock().unwrap();
-        let state = runs.entry(run_id.to_string()).or_insert(RunState {
+        runs.entry(run_id.to_string()).or_insert(RunState {
             budget: Microusd::ZERO,
             reserved: Microusd::ZERO,
             spent: Microusd::ZERO,
             steps: 0,
+            parent: None,
         });
-        state.reserved = state.reserved + estimate;
-        state.steps += 1;
+        let ids = Self::chain(&runs, run_id);
+        for id in &ids {
+            let s = runs.get_mut(id).expect("in chain");
+            s.reserved = s.reserved + estimate;
+        }
+        let leaf = runs.get_mut(run_id).expect("leaf");
+        leaf.steps += 1;
         Reservation {
             run_id: run_id.to_string(),
             amount: estimate,
-            step: state.steps,
+            step: leaf.steps,
         }
     }
 
     /// Settle a reservation with the real cost: release the reserved estimate
-    /// and add the actual spend. Over- or under-estimates self-correct here.
+    /// and add the actual spend, at the leaf *and every ancestor*. Over- or
+    /// under-estimates self-correct here.
     pub fn settle(&self, reservation: &Reservation, actual: Microusd) {
         let mut runs = self.runs.lock().unwrap();
-        if let Some(state) = runs.get_mut(&reservation.run_id) {
-            state.reserved = state.reserved.saturating_sub(reservation.amount);
-            state.spent = state.spent + actual;
+        let ids = Self::chain(&runs, &reservation.run_id);
+        for id in &ids {
+            if let Some(s) = runs.get_mut(id) {
+                s.reserved = s.reserved.saturating_sub(reservation.amount);
+                s.spent = s.spent + actual;
+            }
         }
     }
 
@@ -212,7 +263,7 @@ mod tests {
     #[test]
     fn reserve_then_settle_tracks_spend_and_releases_reservation() {
         let ledger = Ledger::new();
-        ledger.open_run("r1", usd(5.0));
+        ledger.open_run("r1", usd(5.0), None);
 
         let res = ledger.reserve("r1", usd(1.0)).unwrap();
         let mid = ledger.snapshot("r1").unwrap();
@@ -231,7 +282,7 @@ mod tests {
     #[test]
     fn reservation_blocks_when_it_would_exceed_budget() {
         let ledger = Ledger::new();
-        ledger.open_run("r1", usd(1.0));
+        ledger.open_run("r1", usd(1.0), None);
         ledger.reserve("r1", usd(0.9)).unwrap();
 
         let err = ledger.reserve("r1", usd(0.2)).unwrap_err();
@@ -247,7 +298,7 @@ mod tests {
     #[test]
     fn reserve_unchecked_records_past_budget_without_error() {
         let ledger = Ledger::new();
-        ledger.open_run("r1", usd(1.0));
+        ledger.open_run("r1", usd(1.0), None);
         // Reserve beyond budget: shadow mode records it, does not block.
         let res = ledger.reserve_unchecked("r1", usd(5.0));
         assert_eq!(res.step, 1);
@@ -258,13 +309,50 @@ mod tests {
     }
 
     #[test]
+    fn subagent_spend_rolls_up_into_parent() {
+        let ledger = Ledger::new();
+        ledger.open_run("parent", usd(10.0), None);
+        ledger.open_run("child", usd(8.0), Some("parent"));
+
+        let r = ledger.reserve("child", usd(3.0)).unwrap();
+        ledger.settle(&r, usd(3.0));
+
+        // The child's spend also shows up on the parent.
+        assert_eq!(ledger.snapshot("child").unwrap().spent, usd(3.0));
+        assert_eq!(ledger.snapshot("parent").unwrap().spent, usd(3.0));
+        assert_eq!(ledger.snapshot("parent").unwrap().remaining(), usd(7.0));
+    }
+
+    #[test]
+    fn child_reservation_blocked_by_parent_budget() {
+        let ledger = Ledger::new();
+        // Parent budget ($4) is tighter than the child's own ($100).
+        ledger.open_run("parent", usd(4.0), None);
+        ledger.open_run("child", usd(100.0), Some("parent"));
+
+        // Parent already spent $3 directly.
+        let rp = ledger.reserve("parent", usd(3.0)).unwrap();
+        ledger.settle(&rp, usd(3.0));
+
+        // Child wants $2 — fits its own budget but not the parent's remaining $1.
+        let err = ledger.reserve("child", usd(2.0)).unwrap_err();
+        match err {
+            BudgetError::Exceeded { run_id, .. } => assert_eq!(run_id, "parent"),
+            other => panic!("expected parent Exceeded, got {other:?}"),
+        }
+        // Nothing was reserved anywhere (all-or-nothing).
+        assert_eq!(ledger.snapshot("child").unwrap().reserved, Microusd::ZERO);
+        assert_eq!(ledger.snapshot("parent").unwrap().reserved, Microusd::ZERO);
+    }
+
+    #[test]
     fn concurrent_reservations_never_oversubscribe_budget() {
         use std::sync::Arc;
         use std::thread;
 
         let ledger = Arc::new(Ledger::new());
         // Budget for exactly 10 reservations of $1.
-        ledger.open_run("r1", usd(10.0));
+        ledger.open_run("r1", usd(10.0), None);
 
         let mut handles = Vec::new();
         for _ in 0..50 {

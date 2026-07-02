@@ -93,7 +93,7 @@ mod tests {
 
     fn setup() -> (Arc<Ledger>, Arc<PriceBook>, UsageSlot, Reservation) {
         let ledger = Arc::new(Ledger::new());
-        ledger.open_run("r", Microusd::from_usd(5.0));
+        ledger.open_run("r", Microusd::from_usd(5.0), None);
         let reservation = ledger.reserve("r", Microusd::from_usd(1.0)).unwrap();
         let prices =
             Arc::new(PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0)));
