@@ -284,6 +284,7 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
         peers.insert(id, format!("http://{addr}"));
     }
     let bootstrap = std::env::var("TOKENFUSE_CLUSTER_BOOTSTRAP").is_ok();
+    let data_dir = std::env::var("TOKENFUSE_CLUSTER_DATA_DIR").ok();
     let sock = match addr.parse() {
         Ok(s) => s,
         Err(e) => {
@@ -291,8 +292,14 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
             return None;
         }
     };
-    match tokenfuse_gateway::raft_ledger::RaftLedger::start(id, sock, Arc::new(peers), bootstrap)
-        .await
+    match tokenfuse_gateway::raft_ledger::RaftLedger::start(
+        id,
+        sock,
+        Arc::new(peers),
+        bootstrap,
+        data_dir,
+    )
+    .await
     {
         Ok(rl) => Some(rl),
         Err(e) => {

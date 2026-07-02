@@ -25,21 +25,22 @@ use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 
 use crate::net_http::{HttpNetwork, Peers};
-use crate::store::{LogStore, StateMachineStore};
+use crate::redbstore::{open_node_db, RedbLogStore, RedbStateMachineStore};
+use crate::store::{LedgerReader, LogStore, StateMachineStore};
 use crate::types::{NodeId, Request, Response, RunState, TypeConfig};
 
-/// A raft node reachable over HTTP: its `Raft` handle, a state-machine clone for
-/// local reads, and the peer map it was built with.
+/// A raft node reachable over HTTP: its `Raft` handle, a read handle for local
+/// (eventually-consistent) reads, and the peer map it was built with.
 pub struct HttpNode {
     pub id: NodeId,
     pub raft: Raft<TypeConfig>,
-    pub sm: StateMachineStore,
+    pub sm: Arc<dyn LedgerReader>,
     pub peers: Peers,
 }
 
 impl HttpNode {
-    /// Build a node whose replication uses the HTTP transport. `peers` maps every
-    /// member id (including this one) to its base URL.
+    /// Build a node with **in-memory** storage (fast; state lost on restart).
+    /// `peers` maps every member id (including this one) to its base URL.
     pub async fn build(id: NodeId, peers: Peers) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let config = Arc::new(crate::node_config().validate()?);
         let sm = StateMachineStore::default();
@@ -48,7 +49,28 @@ impl HttpNode {
         Ok(Arc::new(Self {
             id,
             raft,
-            sm,
+            sm: Arc::new(sm),
+            peers,
+        }))
+    }
+
+    /// Build a node with **durable** redb storage under `dir` — budgets survive a
+    /// process restart. One redb file per node (`<dir>/node-<id>.redb`).
+    pub async fn build_durable(
+        id: NodeId,
+        peers: Peers,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let config = Arc::new(crate::node_config().validate()?);
+        let db = open_node_db(dir, id)?;
+        let log = RedbLogStore::new(db.clone())?;
+        let sm = RedbStateMachineStore::new(db)?;
+        let network = HttpNetwork::new(peers.clone());
+        let raft = Raft::new(id, config, network, log, sm.clone()).await?;
+        Ok(Arc::new(Self {
+            id,
+            raft,
+            sm: Arc::new(sm),
             peers,
         }))
     }

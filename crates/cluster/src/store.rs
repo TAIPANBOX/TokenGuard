@@ -179,6 +179,24 @@ impl StateMachineStore {
     }
 }
 
+/// Read-side of a replicated ledger, shared by the in-memory and redb state
+/// machines so a node can serve local reads regardless of its backend.
+#[async_trait::async_trait]
+pub trait LedgerReader: Send + Sync {
+    async fn read_run(&self, run: &str) -> Option<crate::types::RunState>;
+    async fn list_runs(&self) -> Vec<(String, crate::types::RunState)>;
+}
+
+#[async_trait::async_trait]
+impl LedgerReader for StateMachineStore {
+    async fn read_run(&self, run: &str) -> Option<crate::types::RunState> {
+        StateMachineStore::read_run(self, run).await
+    }
+    async fn list_runs(&self) -> Vec<(String, crate::types::RunState)> {
+        StateMachineStore::list_runs(self).await
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let mut inner = self.inner.lock().await;

@@ -35,8 +35,20 @@ impl RaftLedger {
         addr: SocketAddr,
         peers: Peers,
         bootstrap: bool,
+        data_dir: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let node = HttpNode::build(id, peers).await?;
+        let node = match data_dir {
+            Some(dir) if !dir.is_empty() => {
+                tracing::info!(%dir, "raft storage: durable (redb)");
+                HttpNode::build_durable(id, peers, dir).await?
+            }
+            _ => {
+                tracing::info!(
+                    "raft storage: in-memory (set TOKENFUSE_CLUSTER_DATA_DIR for durable)"
+                );
+                HttpNode::build(id, peers).await?
+            }
+        };
 
         // Serve peer RPCs + the admin/app API in the background.
         let serve_node = node.clone();

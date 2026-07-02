@@ -81,9 +81,16 @@ Two openraft **storage-v2** traits, both cloneable handles over
   serialises/installs JSON snapshots. It also exposes `read_run()` for fast
   **local** reads of a run's spend (eventually consistent on followers).
 
-This is the reference **in-memory** backend. A durable deployment swaps it for
-redb/RocksDB behind the exact same two traits — no change to the domain or the
-gateway.
+This is the reference **in-memory** backend. A **durable** backend ships too:
+`redbstore.rs` implements the same two traits over [redb] (an embedded, pure-Rust
+ACID key-value store — one file per node, no C deps). `HttpNode::build_durable(id,
+peers, dir)` selects it; the gateway turns it on with `TOKENFUSE_CLUSTER_DATA_DIR`.
+Writes commit before returning (the durability openraft requires), so budgets
+survive a **process restart**, not just a node crash within a live cluster. Test
+`budgets_survive_a_restart` proves it: write a budget, drop the node, reopen the
+same dir, read it back.
+
+[redb]: https://docs.rs/redb
 
 ### Network — two transports, same traits
 
@@ -210,7 +217,6 @@ exceeded". Per-run `steps` are tracked in the SM and returned on the reservation
 
 ## Not yet (follow-ups)
 
-- **Durable storage backend** (redb) behind the storage traits.
 - **`change_membership` join/leave** flow for rolling deploys (the API exposes
   `initialize`; add-learner/promote endpoints are the next increment).
 - **Linearizable follower reads** via `ensure_linearizable()` + leader forward
