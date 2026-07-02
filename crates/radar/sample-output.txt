@@ -1,0 +1,15 @@
+Sample output from tokenfuse-radar captured live on a Linux host (Ubuntu 24.04,
+kernel 7.x). Radar attaches an eBPF probe to `sys_enter_connect` and reports
+every outbound TCP connection, flagging known LLM providers and local model
+servers — with zero application configuration.
+
+Reproduce on any Linux box with root + a modern kernel: see crates/radar/README.md.
+
+    tokenfuse-radar: watching outbound connections (known LLM IPs: 7)
+    PID      COMM             DEST                  FLAG
+    14113    curl             162.159.140.245:443     <== LLM provider
+    14113    curl             172.66.0.243:443        <== LLM provider
+    14113    curl             162.159.140.245:443     <== LLM provider
+    14115    curl             172.66.147.243:443
+    14115    curl             104.20.23.154:443
+    14117    curl             127.0.0.1:11434         <== local Ollama

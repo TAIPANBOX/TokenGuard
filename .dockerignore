@@ -1,0 +1,13 @@
+# Keep the build context small and reproducible.
+target/
+crates/*/target/
+crates/*/*/target/
+.git/
+.github/
+node_modules/
+data/
+*.parquet
+*.onnx
+docs/
+bench/
+**/*.md

@@ -109,7 +109,31 @@ Three ideas make this safe to put in production:
 
 ### How fast is "in the path"?
 
-The enforcement decision (estimate → policy → reserve → settle) adds **~0.4 µs at p99**; a full request handled in-process is **~4.7 µs at p99** — three orders of magnitude under the 3 ms budget. Method and full table: [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `cargo run -p tokenfuse-gateway --release --example bench`.
+The enforcement decision (estimate → policy → reserve → settle) adds **~0.4 µs at p99**; a full request handled in-process is **~4.7 µs at p99** — three orders of magnitude under the 3 ms budget. Method and full table: [BENCHMARKS.md](BENCHMARKS.md). Reproduce with `cargo run -p tokenfuse-gateway --release --example bench`, or the on-the-wire benchmark with [`bench/run.sh`](bench/run.sh).
+
+---
+
+## 🚀 Run it
+
+**Docker (no toolchain needed)** — the image is published to GitHub Container Registry, so it runs on any host or cloud:
+
+```bash
+# offline trial (deterministic stub upstream)
+docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+
+# in front of a real provider — just point your agent at http://localhost:4100
+docker run -p 4100:4100 \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse
+```
+
+**From source:**
+
+```bash
+cargo run -p tokenfuse-gateway         # starts the gateway on :4100
+```
+
+Everything the project needs lives on GitHub — source, CI (GitHub Actions), and the container image (GHCR). No dedicated server required.
 
 ---
 

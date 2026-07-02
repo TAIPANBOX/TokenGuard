@@ -60,8 +60,11 @@ with a fixed ~41 ms think-time, so the mock's latency cancels in the delta and
 what remains is TokenFuse's own cost (accept the connection, parse the body, run
 the decision path, forward, stream back, settle).
 
-Measured on a **Hetzner CX-class VPS (2 vCPU, 4 GB, Ubuntu 24.04)**, `--release`,
-`wrk -t2 -c16 -d15s`, gateway with cache/firewall/DLP off (pure forwarding path):
+Reproduce anywhere with [`bench/run.sh`](bench/run.sh) (needs `cargo`, `python3`,
+`wrk`) or in GitHub Actions via the manual **bench** workflow — no dedicated
+server required. The figures below were measured on a **2 vCPU / 4 GB Ubuntu
+24.04 box**, `--release`, `wrk -t2 -c16 -d15s`, gateway with cache/firewall/DLP
+off (pure forwarding path):
 
 | Path | p50 | p90 | p99 | req/s |
 |---|---|---|---|---|
