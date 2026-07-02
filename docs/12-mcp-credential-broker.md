@@ -67,10 +67,14 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
   upstream as the **real** secret (the agent only ever sent the handle); a
   poisoned `tools/list` is **blocked**.
 
+## Also enforced
+
+- **DLP on outgoing args** (`TOKENFUSE_MCP_DLP=off｜warn｜block`) — catches raw
+  secrets an agent pasted directly into tool arguments (not via a handle), before
+  injection, reusing `tokenfuse-core::dlp`.
+- **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
+  a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
+
 ## Not yet (follow-ups)
 
-- **DLP on outgoing args** — flag raw secrets an agent pasted directly (not via a
-  handle), reusing `tokenfuse-core::dlp`.
-- **Rug-pull lockfile** on `tools/list` (the `mcp-scan` lockfile diff, applied
-  live) and **response redaction**.
-- **stdio MCP transport** (today: HTTP JSON-RPC).
+- **Response redaction** and **stdio MCP transport** (today: HTTP JSON-RPC).

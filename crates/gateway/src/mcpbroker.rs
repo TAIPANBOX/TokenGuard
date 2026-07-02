@@ -21,8 +21,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tokenfuse_core::mcp;
-use tokenfuse_core::{inject_secrets, SecretVault};
+use tokenfuse_core::mcp::{self, Lock};
+use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
@@ -35,6 +35,12 @@ pub struct BrokerState {
     pub upstream: String,
     pub vault: SecretVault,
     pub scan: ScanMode,
+    /// Scan outgoing tool-call args for raw secrets the agent pasted directly
+    /// (not via a `{{secret:}}` handle). Off｜Shadow(=warn)｜Block.
+    pub dlp: DlpMode,
+    /// Baseline of pinned tool fingerprints; a changed description on
+    /// `tools/list` is a rug-pull. `None` disables the check.
+    pub lock: Option<Lock>,
     pub client: reqwest::Client,
 }
 
@@ -68,6 +74,27 @@ async fn handle(
 
     // 1. Credential brokering: inject secret handles on tool calls.
     if method == "tools/call" {
+        // DLP: catch raw secrets the agent pasted directly into the args (before
+        // injection, so vault-injected secrets aren't flagged).
+        if st.dlp != DlpMode::Off {
+            if let Some(params) = req.get("params") {
+                let findings = dlp::scan(&params.to_string());
+                if !findings.is_empty() {
+                    tracing::warn!(secrets = %dlp::summary(&findings), "mcp broker: raw secret in tool args");
+                    if st.dlp == DlpMode::Block {
+                        return rpc_error(
+                            &id,
+                            -32002,
+                            &format!(
+                                "blocked: raw secret in tool arguments ({})",
+                                dlp::summary(&findings)
+                            ),
+                        )
+                        .into_response();
+                    }
+                }
+            }
+        }
         if let Some(params) = req.get_mut("params") {
             let inj = inject_secrets(params, &st.vault);
             if inj.replaced > 0 {
@@ -108,9 +135,35 @@ async fn handle(
         }
     };
 
-    // 2. Poisoning scan on tool listings.
+    // 2. Poisoning + rug-pull checks on tool listings.
     if method == "tools/list" && st.scan != ScanMode::Off {
         let tools = mcp::parse_tools(&out);
+
+        // Rug-pull: a tool's description/schema changed vs. the pinned lock.
+        if let Some(lock) = &st.lock {
+            let changed: Vec<String> = mcp::diff(&tools, lock)
+                .into_iter()
+                .filter_map(|d| match d {
+                    mcp::Drift::Changed(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            if !changed.is_empty() {
+                tracing::warn!(tools = ?changed, "mcp broker: rug-pull (tool definition changed)");
+                if st.scan == ScanMode::Block {
+                    return rpc_error(
+                        &id,
+                        -32003,
+                        &format!(
+                            "blocked: tool definition changed (rug-pull): {}",
+                            changed.join(", ")
+                        ),
+                    )
+                    .into_response();
+                }
+            }
+        }
+
         let findings = mcp::scan_injection(&tools);
         if !findings.is_empty() {
             tracing::warn!(count = findings.len(), findings = ?findings, "mcp broker: tool poisoning");

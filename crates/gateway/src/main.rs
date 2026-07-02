@@ -102,10 +102,23 @@ async fn mcp_broker() {
         Ok("block") => ScanMode::Block,
         _ => ScanMode::Warn,
     };
+    let dlp = match std::env::var("TOKENFUSE_MCP_DLP").as_deref() {
+        Ok("block") => tokenfuse_core::DlpMode::Block,
+        Ok("off") => tokenfuse_core::DlpMode::Off,
+        _ => tokenfuse_core::DlpMode::Shadow, // warn
+    };
+    // Optional rug-pull baseline: a JSON lockfile of pinned tool fingerprints.
+    let lock = std::env::var("TOKENFUSE_MCP_LOCK").ok().and_then(|p| {
+        std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    });
     let state = Arc::new(BrokerState {
         upstream: upstream.clone(),
         vault,
         scan,
+        dlp,
+        lock,
         client: reqwest::Client::new(),
     });
     let addr = std::env::var("TOKENFUSE_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:4200".to_string());

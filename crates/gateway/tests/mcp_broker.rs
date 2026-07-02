@@ -37,12 +37,23 @@ async fn spawn_server(router: Router) -> String {
 }
 
 fn broker(upstream: String, scan: ScanMode) -> Router {
+    broker_full(upstream, scan, tokenfuse_core::DlpMode::Off, None)
+}
+
+fn broker_full(
+    upstream: String,
+    scan: ScanMode,
+    dlp: tokenfuse_core::DlpMode,
+    lock: Option<tokenfuse_core::mcp::Lock>,
+) -> Router {
     let mut vault = SecretVault::new();
     vault.insert("gh", "ghp_REALSECRET");
     app(Arc::new(BrokerState {
         upstream,
         vault,
         scan,
+        dlp,
+        lock,
         client: reqwest::Client::new(),
     }))
 }
@@ -95,4 +106,67 @@ async fn blocks_poisoned_tool_list() {
 
     assert!(resp.get("error").is_some(), "poisoned list must be blocked");
     assert_eq!(resp["id"], json!(7));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocks_raw_secret_in_args() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(broker_full(
+        upstream,
+        ScanMode::Warn,
+        tokenfuse_core::DlpMode::Block,
+        None,
+    ))
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Agent pasted a raw AWS key directly (not via a {{secret:}} handle).
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "deploy", "arguments": { "key": "AKIAIOSFODNN7EXAMPLE" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        resp.get("error").is_some(),
+        "raw secret in args must be blocked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocks_rug_pull() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    // Pin the tool as it is *now* (benign), then the stub serves a changed one.
+    let pinned = tokenfuse_core::mcp::Lock::from_tools(&tokenfuse_core::mcp::parse_tools(&json!({
+        "tools": [{ "name": "read_file", "description": "Read a file.", "inputSchema": {} }]
+    })));
+    let broker_url = spawn_server(broker_full(
+        upstream,
+        ScanMode::Block,
+        tokenfuse_core::DlpMode::Off,
+        Some(pinned),
+    ))
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The stub's read_file description differs from the pinned one → rug-pull.
+    assert!(
+        resp.get("error").is_some(),
+        "changed tool definition must be blocked"
+    );
 }
