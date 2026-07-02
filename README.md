@@ -222,6 +222,7 @@ The one-line summary: **everyone else reports; TokenFuse acts.**
 | 🔁 Loop detection | Catches "same tool called 3× in a row" and ping-pong loops | Phase 2 |
 | 📈 Burn forecast | Predicts a budget blowout *before* it happens | Phase 2 |
 | 🤝 Self-aware agents (MCP) | The agent can *see* its own budget and *ask a human* for more | Phase 2 |
+| 🔑 MCP credential-broker | Secrets never touch the prompt — the agent passes a *handle*, the broker injects the real value at the boundary | Phase 4 |
 | 🗄️ Zero-DB analytics | Your data in open Parquet files; query with `tokenfuse sql "..."` | Phase 2 |
 | ⚡ Semantic cache | Repeated questions answered for **$0** — the product pays for itself | Phase 2.5 |
 | 🧩 Policies as code (WASM) | Write custom rules in any language; test them on past traffic | Phase 3 |

@@ -8,6 +8,7 @@ pub mod embedder;
 pub mod estimate;
 pub mod firewall;
 pub mod ledger_backend;
+pub mod mcpbroker;
 pub mod mcpcli;
 pub mod obs;
 pub mod otel;
