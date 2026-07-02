@@ -7,12 +7,16 @@ publish = false
 description = "HA budget counters for TokenFuse: a raft-replicated ledger (openraft)"
 
 [dependencies]
-openraft = { version = "0.9", features = ["storage-v2"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# HTTP transport (cross-process raft): a small axum server per node + a reqwest
+# client network. Plain HTTP only, so reqwest needs no TLS backend.
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

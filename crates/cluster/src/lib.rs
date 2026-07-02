@@ -14,7 +14,9 @@
 //! backends (swap the in-memory store for redb and the router for HTTP to
 //! deploy).
 
+pub mod net_http;
 pub mod network;
+pub mod server;
 pub mod store;
 pub mod types;
 
@@ -51,9 +53,10 @@ pub struct Cluster {
     router: Router,
 }
 
-/// Fast timings so tests and the demo converge in well under a second. Real
-/// deployments use larger election timeouts to tolerate network jitter.
-fn demo_config() -> Config {
+/// Raft timings shared by the in-process and HTTP nodes. Fast enough that tests
+/// and the demo converge in well under a second; real deployments raise the
+/// election window to tolerate network jitter.
+pub fn node_config() -> Config {
     Config {
         cluster_name: "tokenfuse".to_string(),
         heartbeat_interval: 50,
@@ -67,7 +70,7 @@ impl Cluster {
     /// Build and initialize an N-node cluster (single-region, in process).
     /// Node `ids[0]` initializes membership and becomes the initial leader.
     pub async fn start(ids: &[NodeId]) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Arc::new(demo_config().validate()?);
+        let config = Arc::new(node_config().validate()?);
         let router = Router::default();
 
         let mut nodes = Vec::new();

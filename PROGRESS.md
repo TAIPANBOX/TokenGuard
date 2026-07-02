@@ -3,7 +3,7 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-02 (HA raft cluster landed)
+**Last updated:** 2026-07-02 (HA raft cluster + HTTP transport landed)
 
 ## Current stage
 
@@ -37,11 +37,12 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | eBPF Radar (W1) | ✅ done | `crates/radar` (+ nested `radar-ebpf`, aya): eBPF on `sys_enter_connect` reports every outbound TCP connection (pid/comm/ip:port) and flags LLM providers + local Ollama/vLLM — **zero app config**. Linux-only; excluded from default workspace, own CI job. **Built & run live on a Hetzner Ubuntu 24.04 VPS (kernel 7.0)** — flagged real Anthropic/OpenAI + Ollama traffic, ignored non-LLM. |
 | Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
 | Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
-| HA cluster / raft (W7) | ✅ done | `crates/cluster` (openraft, storage-v2): the budget ledger replicated across N nodes. `Reserve`/`Settle` are raft log entries, so the affordability check is **linearized** — no cross-node double-spend — and budgets survive a node crash (quorum commit). Reference in-memory storage + in-process router network (swap for redb + HTTP to deploy). `cargo run -p tokenfuse-cluster` demos a 3-node cluster: over-budget reserve denied by consensus, spend read back from a **follower**. Excluded from default workspace; own CI job (fmt + clippy + 3 integration tests on live clusters). |
+| HA cluster / raft (W7) | ✅ done | `crates/cluster` (openraft, storage-v2): the budget ledger replicated across N nodes. `Reserve`/`Settle` are raft log entries, so the affordability check is **linearized** — no cross-node double-spend — and budgets survive a node crash (quorum commit). Reference in-memory storage. `cargo run -p tokenfuse-cluster` demos a 3-node cluster: over-budget reserve denied by consensus, spend read back from a **follower**. Excluded from default workspace; own CI job. |
+| Cluster — HTTP transport | ✅ done | `net_http.rs` (HTTP `RaftNetwork`, JSON-over-HTTP via openraft `serde`) + `server.rs` (axum per-node server: `/raft/*` peer RPCs, `/mgmt/init`, `/mgmt/metrics`, `/api/write`, `/api/read/{run}`) → clusters form **across processes/machines**. `tokenfuse-cluster serve --id N --http … --peers …` runs one node; `demo-http` spins 3 over real sockets. 2 HTTP integration tests (form over `:0`, deny over-budget by consensus, follower read; leader-forward). This is the transport half of the gateway↔cluster integration. |
 
 ## Test status
 
-`cargo test --all` — 92 passing (core: 57, gateway: 35); Python SDK — 11 passing; **`tokenfuse-cluster` — 3 integration tests** on live 3-node raft clusters (excluded crate, own CI job). `cargo clippy --all-targets` clean with `-D warnings` across the workspace, radar, and cluster. **eBPF Radar built + run live on a Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block.
+`cargo test --all` — 92 passing (core: 57, gateway: 35); Python SDK — 11 passing; **`tokenfuse-cluster` — 5 integration tests** on live raft clusters (3 in-process + 2 over HTTP sockets; excluded crate, own CI job). `cargo clippy --all-targets` clean with `-D warnings` across the workspace, radar, and cluster. **eBPF Radar built + run live on a Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block.
 
 ## How to run
 

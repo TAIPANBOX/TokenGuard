@@ -83,13 +83,35 @@ This is the reference **in-memory** backend. A durable deployment swaps it for
 redb/RocksDB behind the exact same two traits — no change to the domain or the
 gateway.
 
-### Network (`network.rs`)
+### Network — two transports, same traits
 
-`Router` is an in-process `RaftNetwork`/`RaftNetworkFactory` that dispatches the
-three raft RPCs (`append_entries`, `vote`, `install_snapshot`) straight to the
-target node's `Raft` handle. It's what makes a whole cluster runnable in one
-binary for the demo and tests. A real deployment implements the same trait over
-HTTP/gRPC; nothing else changes.
+The three raft RPCs (`append_entries`, `vote`, `install_snapshot`) are abstracted
+behind openraft's `RaftNetwork`/`RaftNetworkFactory`. Two implementations ship:
+
+- **In-process (`network.rs`)** — `Router` dispatches RPCs straight to the target
+  node's `Raft` handle. Makes a whole cluster runnable in one binary; used by the
+  demo and the in-process tests.
+- **Cross-process over HTTP (`net_http.rs` + `server.rs`)** — `HttpNetwork`
+  resolves a node id to a peer base URL and POSTs each RPC as JSON; `server.rs`
+  is a small axum server per node that exposes `/raft/append`, `/raft/vote`,
+  `/raft/snapshot` (peer RPCs) plus `/mgmt/init`, `/mgmt/metrics`, `/api/write`,
+  and `/api/read/{run}`. This is what lets gateways on **separate machines** form
+  one cluster. openraft's RPC types are `serde`-serialized (the `serde` feature),
+  so the wire format is just JSON.
+
+Run a real node:
+
+```bash
+tokenfuse-cluster serve --id 1 --http 127.0.0.1:5001 \
+  --peers 1=http://127.0.0.1:5001,2=http://127.0.0.1:5002,3=http://127.0.0.1:5003 --init
+# (repeat on each host with its own --id/--http; --init once)
+```
+
+Or watch three HTTP nodes form a cluster in one process:
+
+```bash
+cargo run -p tokenfuse-cluster -- demo-http
+```
 
 ### Cluster helper (`lib.rs`)
 
@@ -134,16 +156,29 @@ Real 3-node clusters with live election timers (multi-thread runtime):
 - **`settle_moves_reserved_to_spent`** — settle converts a reservation to spend
   across the quorum.
 
+## Tested invariants — HTTP transport (`tests/http_cluster.rs`)
+
+Real clusters formed over `127.0.0.1:0` sockets, driven entirely through the
+HTTP API:
+
+- **`http_cluster_replicates_and_enforces`** — a leader is elected over HTTP, an
+  over-budget reserve is denied by consensus, and the committed reservations are
+  read back from a **follower** over HTTP.
+- **`writes_routed_to_leader_from_any_node`** — a write sent to a follower is
+  surfaced as a retryable forward, and commits against the leader.
+
 ## Not yet (follow-ups)
 
-- **Durable storage backend** (redb) behind the storage traits.
-- **HTTP `RaftNetwork`** + a real `change_membership` join/leave flow for
-  rolling deploys.
 - **Wire the gateway to the cluster** — today's gateway uses the in-process
-  `tokenfuse-core::Ledger`; the cluster is a standalone, tested replacement for
-  the ledger's authority. Bridging them (leader-forwarding + local read cache)
-  is the integration step.
+  `tokenfuse-core::Ledger` synchronously. The cluster is a standalone, tested
+  replacement for the ledger's authority; bridging them needs an **async
+  `LedgerBackend`** in the gateway (the hot path and `SettleGuard::drop` are
+  currently sync) selected behind a `cluster` feature. **This is the next PR.**
+- **Durable storage backend** (redb) behind the storage traits.
+- **`change_membership` join/leave** flow for rolling deploys (the API exposes
+  `initialize`; add-learner/promote endpoints are the next increment).
 - **Linearizable follower reads** via `ensure_linearizable()` + leader forward
-  (the demo uses eventually-consistent local reads).
+  (reads today are eventually-consistent local reads).
+- **HTTPS / auth** on the raft + admin endpoints for cross-machine deploys.
 
 [openraft]: https://docs.rs/openraft
