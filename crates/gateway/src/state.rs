@@ -1,6 +1,7 @@
 //! Shared application state handed to every request handler.
 
 use crate::firewall::FirewallConfig;
+use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
 use crate::sink::{EventSink, NullSink};
 use crate::wasmpolicy::WasmEval;
@@ -20,7 +21,9 @@ type Killed = Arc<Mutex<HashSet<String>>>;
 /// Cloneable handle to the gateway's shared state (all fields are `Arc`).
 #[derive(Clone)]
 pub struct AppState {
-    pub ledger: Arc<Ledger>,
+    /// The budget ledger authority — in-process by default, or a raft-replicated
+    /// backend under the `cluster` feature (see [`crate::ledger_backend`]).
+    pub ledger: Arc<dyn LedgerBackend>,
     pub prices: Arc<PriceBook>,
     pub policy: Arc<Policy>,
     pub provider: Arc<dyn Provider>,
@@ -51,7 +54,9 @@ impl AppState {
         policy_id: impl Into<Arc<str>>,
     ) -> Self {
         AppState {
-            ledger,
+            // Wrap the in-process ledger as the default backend. `with_ledger`
+            // swaps in a raft-replicated backend for HA (cluster feature).
+            ledger: Arc::new(LocalLedger(ledger)),
             prices,
             policy,
             provider,
@@ -68,6 +73,12 @@ impl AppState {
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the ledger backend (e.g. a raft-replicated one). Chainable.
+    pub fn with_ledger(mut self, ledger: Arc<dyn LedgerBackend>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// Set the DLP (secret-scanning) mode. Chainable.

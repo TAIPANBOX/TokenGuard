@@ -6,11 +6,14 @@ pub mod backtestcli;
 pub mod embedder;
 pub mod estimate;
 pub mod firewall;
+pub mod ledger_backend;
 pub mod mcpcli;
 pub mod obs;
 pub mod otel;
 pub mod provider;
 pub mod proxy;
+#[cfg(feature = "cluster")]
+pub mod raft_ledger;
 pub mod settle;
 pub mod sink;
 pub mod sqlq;

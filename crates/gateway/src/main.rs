@@ -206,6 +206,14 @@ async fn serve() {
     }
     state = state.with_sink(sink);
 
+    // HA: replace the in-process ledger with a raft-replicated one shared across
+    // gateways (built with --features cluster; configured via TOKENFUSE_CLUSTER_*).
+    #[cfg(feature = "cluster")]
+    if let Some(rl) = cluster_ledger().await {
+        tracing::info!("budget ledger is raft-replicated (HA cluster mode)");
+        state = state.with_ledger(rl);
+    }
+
     let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -216,6 +224,50 @@ async fn serve() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+}
+
+/// Build the raft-replicated ledger from `TOKENFUSE_CLUSTER_*` env, or `None` if
+/// cluster mode isn't configured. Requires the `cluster` feature.
+///
+/// * `TOKENFUSE_CLUSTER_ID`    — this node's id (enables cluster mode)
+/// * `TOKENFUSE_CLUSTER_ADDR`  — this node's raft HTTP addr (default 127.0.0.1:5000+id)
+/// * `TOKENFUSE_CLUSTER_PEERS` — `1=http://host:port,2=http://…` (all members incl. self)
+/// * `TOKENFUSE_CLUSTER_BOOTSTRAP` — set on exactly one node to initialize
+#[cfg(feature = "cluster")]
+async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::LedgerBackend>> {
+    use std::collections::BTreeMap;
+    let id: u64 = std::env::var("TOKENFUSE_CLUSTER_ID").ok()?.parse().ok()?;
+    let addr = std::env::var("TOKENFUSE_CLUSTER_ADDR")
+        .unwrap_or_else(|_| format!("127.0.0.1:{}", 5000 + id));
+    let peers_spec = std::env::var("TOKENFUSE_CLUSTER_PEERS").unwrap_or_default();
+    let mut peers = BTreeMap::new();
+    for pair in peers_spec.split(',').filter(|s| !s.is_empty()) {
+        if let Some((pid, url)) = pair.split_once('=') {
+            if let Ok(pid) = pid.trim().parse::<u64>() {
+                peers.insert(pid, url.trim().to_string());
+            }
+        }
+    }
+    if peers.is_empty() {
+        peers.insert(id, format!("http://{addr}"));
+    }
+    let bootstrap = std::env::var("TOKENFUSE_CLUSTER_BOOTSTRAP").is_ok();
+    let sock = match addr.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(%addr, "bad TOKENFUSE_CLUSTER_ADDR: {e}");
+            return None;
+        }
+    };
+    match tokenfuse_gateway::raft_ledger::RaftLedger::start(id, sock, Arc::new(peers), bootstrap)
+        .await
+    {
+        Ok(rl) => Some(rl),
+        Err(e) => {
+            tracing::error!("failed to start cluster ledger: {e}");
+            None
+        }
+    }
 }
 
 async fn shutdown_signal() {

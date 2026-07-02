@@ -52,6 +52,42 @@ impl HttpNode {
             peers,
         }))
     }
+
+    /// Initialize the cluster with the configured members (call on exactly one
+    /// node). Returns `Ok` on success or if it was already initialized.
+    pub async fn init(&self) -> Result<(), String> {
+        let members: BTreeMap<NodeId, BasicNode> = self
+            .peers
+            .keys()
+            .map(|&i| (i, BasicNode::default()))
+            .collect();
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Submit a write, transparently forwarding to the current leader over HTTP
+    /// if this node is a follower. Returns the applied [`Response`] or a
+    /// human-readable error. This keeps all openraft error handling inside the
+    /// cluster crate so embedders (the gateway) need only its public API.
+    pub async fn submit(&self, req: Request) -> Result<Response, String> {
+        use openraft::error::{ClientWriteError, RaftError};
+        match self.raft.client_write(req.clone()).await {
+            Ok(r) => Ok(r.data),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => match f.leader_id {
+                Some(leader) if leader != self.id => match self.peers.get(&leader) {
+                    Some(base) => match Client::new(base.clone()).write(&req).await {
+                        Ok(inner) => inner,
+                        Err(e) => Err(e.to_string()),
+                    },
+                    None => Err(format!("no address for leader {leader}")),
+                },
+                _ => Err("no leader elected".into()),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 /// A compact, serde-friendly view of a node's raft metrics.
