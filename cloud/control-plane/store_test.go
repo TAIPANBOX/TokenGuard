@@ -59,3 +59,33 @@ func TestOrgsAreIsolated(t *testing.T) {
 		t.Error("unknown org should have no runs")
 	}
 }
+
+func TestPersistenceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/state.json"
+
+	s := NewStore()
+	s.Ingest("acme", []CallRecord{{RunID: "r1", Model: "claude", CostMicrousd: 1500, Step: 2, TsMillis: 100}})
+	s.Kill("acme", "r1")
+	s.SetBudget("acme", "r1", 500000)
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh store loads the snapshot and sees everything.
+	s2 := NewStore()
+	if err := s2.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	runs := s2.Runs("acme")
+	if len(runs) != 1 || runs[0].SpentMicrousd != 1500 || !runs[0].Killed {
+		t.Fatalf("runs not restored: %+v", runs)
+	}
+	if s2.Budgets("acme")["r1"] != 500000 {
+		t.Fatalf("budget not restored: %v", s2.Budgets("acme"))
+	}
+	// Missing file is a clean start, not an error.
+	if err := NewStore().Load(dir + "/nope.json"); err != nil {
+		t.Fatalf("missing file should be ok: %v", err)
+	}
+}

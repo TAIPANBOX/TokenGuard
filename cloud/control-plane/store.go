@@ -3,7 +3,12 @@
 // and activity — the "single pane of glass" across a fleet of gateways.
 package main
 
-import "sync"
+import (
+	"encoding/json"
+	"os"
+	"sync"
+	"time"
+)
 
 // CallRecord is one settled call, pushed by a gateway's CloudSink. The JSON
 // shape matches crates/gateway/src/sink.rs::CallRecord.
@@ -37,14 +42,16 @@ type Summary struct {
 	SpentMicrousd int64 `json:"spent_microusd"`
 }
 
-// Store is an in-memory, concurrency-safe aggregation keyed by org → run.
-// (A durable backend — Postgres/ClickHouse — is a drop-in follow-up behind the
-// same methods.)
+// Store is a concurrency-safe aggregation keyed by org → run. It can persist to
+// disk (a periodic JSON snapshot) so state survives a restart; a SQL/columnar
+// backend (Postgres/ClickHouse) for scale + retention is a drop-in follow-up
+// behind the same methods.
 type Store struct {
 	mu      sync.RWMutex
 	orgs    map[string]map[string]*RunAgg
 	killed  map[string]map[string]bool  // org → run → killed
 	budgets map[string]map[string]int64 // org → run → budget µUSD
+	dirty   bool
 }
 
 func NewStore() *Store {
@@ -55,10 +62,78 @@ func NewStore() *Store {
 	}
 }
 
+// snapshot is the on-disk shape of the whole store.
+type snapshot struct {
+	Orgs    map[string]map[string]*RunAgg `json:"orgs"`
+	Killed  map[string]map[string]bool    `json:"killed"`
+	Budgets map[string]map[string]int64   `json:"budgets"`
+}
+
+// Load reads a snapshot from `path` into the store. A missing file is not an
+// error (fresh start).
+func (s *Store) Load(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var snap snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if snap.Orgs != nil {
+		s.orgs = snap.Orgs
+	}
+	if snap.Killed != nil {
+		s.killed = snap.Killed
+	}
+	if snap.Budgets != nil {
+		s.budgets = snap.Budgets
+	}
+	return nil
+}
+
+// Save atomically writes a snapshot to `path` (tmp file + rename).
+func (s *Store) Save(path string) error {
+	s.mu.RLock()
+	data, err := json.Marshal(snapshot{Orgs: s.orgs, Killed: s.killed, Budgets: s.budgets})
+	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// Autosave snapshots to `path` every `every` while the store has unsaved
+// changes. Runs until the process exits.
+func (s *Store) Autosave(path string, every time.Duration) {
+	for range time.Tick(every) {
+		s.mu.Lock()
+		d := s.dirty
+		s.dirty = false
+		s.mu.Unlock()
+		if d {
+			if err := s.Save(path); err != nil {
+				// best-effort; keep serving
+				continue
+			}
+		}
+	}
+}
+
 // Kill marks a run killed for an org; gateways poll this and hard-stop it.
 func (s *Store) Kill(org, run string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dirty = true
 	if s.killed[org] == nil {
 		s.killed[org] = make(map[string]bool)
 	}
@@ -83,6 +158,7 @@ func (s *Store) Kills(org string) []string {
 func (s *Store) SetBudget(org, run string, micros int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dirty = true
 	if s.budgets[org] == nil {
 		s.budgets[org] = make(map[string]int64)
 	}
@@ -104,6 +180,7 @@ func (s *Store) Budgets(org string) map[string]int64 {
 func (s *Store) Ingest(org string, records []CallRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dirty = true
 	runs, ok := s.orgs[org]
 	if !ok {
 		runs = make(map[string]*RunAgg)

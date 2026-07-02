@@ -13,6 +13,9 @@ services:
     environment:
       PORT: "8080"
       TOKENFUSE_CLOUD_KEYS: "devkey:demo"
+      TOKENFUSE_CLOUD_DATA: "/data/state.json"   # durable across restarts
+    volumes:
+      - cloud-data:/data
     ports:
       - "8080:8080"
 
@@ -38,3 +41,6 @@ services:
       - "4100:4100"
     depends_on:
       - control-plane
+
+volumes:
+  cloud-data:

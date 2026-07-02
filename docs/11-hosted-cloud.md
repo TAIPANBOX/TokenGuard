@@ -39,8 +39,11 @@ enforcement.
   org key, auto-refreshes every 3 s).
 - **`GET /healthz`**.
 
-Storage is in-memory and concurrency-safe, keyed `org → run`. A durable backend
-(Postgres/ClickHouse) is a drop-in behind the same `Store` methods. Org API keys
+Storage is concurrency-safe, keyed `org → run`, and **durable**: set
+`TOKENFUSE_CLOUD_DATA=<path>` and the store loads a JSON snapshot on startup and
+autosaves every 2 s (atomic tmp+rename), so it survives a restart. A SQL/columnar
+backend (Postgres/ClickHouse) for scale + retention is a drop-in behind the same
+`Store` methods. Org API keys
 come from `TOKENFUSE_CLOUD_KEYS="key1:org1,key2:org2"` (dev default: `devkey`).
 
 ### Gateway side (`crates/gateway/src/cloudsink.rs`)
@@ -116,6 +119,6 @@ raise) a runaway run's cap centrally without touching the agent.
   `docker compose` on `:3000`.
 
 ## Not yet (follow-ups)
-- **Durable storage** (Postgres/ClickHouse) + retention.
+- **SQL/columnar store** (Postgres/ClickHouse) for scale + retention (today: durable JSON snapshot).
 - **Auth hardening** — per-org key rotation, TLS, rate limits; dashboard
   org/RBAC and alerts.

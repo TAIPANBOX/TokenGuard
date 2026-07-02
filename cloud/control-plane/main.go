@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 //go:embed index.html
@@ -188,6 +189,14 @@ func main() {
 	srv := &server{
 		store: NewStore(),
 		keys:  parseKeys(os.Getenv("TOKENFUSE_CLOUD_KEYS")),
+	}
+	// Durable persistence: load a snapshot and autosave every 2s (TOKENFUSE_CLOUD_DATA).
+	if data := os.Getenv("TOKENFUSE_CLOUD_DATA"); data != "" {
+		if err := srv.store.Load(data); err != nil {
+			log.Printf("could not load snapshot %s: %v", data, err)
+		}
+		go srv.store.Autosave(data, 2*time.Second)
+		log.Printf("persisting state to %s", data)
 	}
 	log.Printf("tokenfuse cloud control plane listening on :%s (%d org key(s))", addr, len(srv.keys))
 	if err := http.ListenAndServe(":"+addr, srv.routes()); err != nil {
