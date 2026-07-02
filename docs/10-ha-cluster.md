@@ -194,15 +194,24 @@ The gateway talks to the cluster through an async `LedgerBackend` trait
 synchronous and fire-and-forget so `SettleGuard::drop` still works — the local
 backend settles inline, the raft backend spawns the write.
 
-Enable it at launch (built with `--features cluster`):
+The raft stack is opt-in (feature `cluster`), so it ships as its own image tag
+**`ghcr.io/taipanbox/tokenfuse:cluster`** (the plain `tokenfuse` image stays
+lean). Run one gateway per host; bootstrap on exactly one:
 
 ```bash
-TOKENFUSE_CLUSTER_ID=1 \
-TOKENFUSE_CLUSTER_ADDR=127.0.0.1:5001 \
-TOKENFUSE_CLUSTER_PEERS=1=http://127.0.0.1:5001,2=http://127.0.0.1:5002,3=http://127.0.0.1:5003 \
-TOKENFUSE_CLUSTER_BOOTSTRAP=1 \
-tokenfuse                       # run one gateway per host; BOOTSTRAP on exactly one
+docker run -p 4100:4100 -p 5001:5001 -v tf1:/data \
+  -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_CLUSTER_ID=1 \
+  -e TOKENFUSE_CLUSTER_ADDR=0.0.0.0:5001 \
+  -e TOKENFUSE_CLUSTER_PEERS=1=http://host1:5001,2=http://host2:5001,3=http://host3:5001 \
+  -e TOKENFUSE_CLUSTER_DATA_DIR=/data \
+  -e TOKENFUSE_CLUSTER_BOOTSTRAP=1 \
+  ghcr.io/taipanbox/tokenfuse:cluster
 ```
+
+(From source, the same flags work on a binary built with `--features cluster`.)
+`TOKENFUSE_CLUSTER_DATA_DIR` makes each node's raft state durable (redb); omit it
+for in-memory.
 
 If consensus is unreachable, `reserve` **fails open** (consistent with
 TokenFuse's default) — a cluster outage degrades to "no enforcement", never

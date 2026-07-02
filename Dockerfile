@@ -8,14 +8,21 @@
 #   docker run -p 4100:4100 -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
 #     ghcr.io/taipanbox/tokenfuse
 #
-# Builds the default gateway (drop-in proxy). The heavy optional features
-# (cluster/onnx/wasm) are opt-in and not included here.
+# Builds the default gateway (drop-in proxy). Pass FEATURES=cluster to bake in
+# the raft HA stack (the `:cluster` image tag); onnx/wasm are also opt-in.
+#
+#   docker build --build-arg FEATURES=cluster -t tokenfuse:cluster .
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p tokenfuse-gateway \
+ARG FEATURES=""
+RUN if [ -n "$FEATURES" ]; then \
+        cargo build --release -p tokenfuse-gateway --features "$FEATURES"; \
+    else \
+        cargo build --release -p tokenfuse-gateway; \
+    fi \
     && strip target/release/tokenfuse
 
 # ---- runtime stage --------------------------------------------------------
