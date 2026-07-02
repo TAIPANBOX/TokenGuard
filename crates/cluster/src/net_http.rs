@@ -34,13 +34,21 @@ pub type Peers = Arc<BTreeMap<NodeId, String>>;
 pub struct HttpNetwork {
     peers: Peers,
     client: reqwest::Client,
+    token: Option<Arc<str>>,
 }
 
 impl HttpNetwork {
     pub fn new(peers: Peers) -> Self {
+        Self::with_token(peers, None)
+    }
+
+    /// `token`, if set, is sent as `Authorization: Bearer <token>` on every peer
+    /// RPC (must match the peers' `TOKENFUSE_CLUSTER_TOKEN`).
+    pub fn with_token(peers: Peers, token: Option<String>) -> Self {
         Self {
             peers,
             client: reqwest::Client::new(),
+            token: token.map(Arc::from),
         }
     }
 }
@@ -61,6 +69,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetwork {
             target,
             base,
             client: self.client.clone(),
+            token: self.token.clone(),
         }
     }
 }
@@ -70,6 +79,7 @@ pub struct HttpConn {
     target: NodeId,
     base: String,
     client: reqwest::Client,
+    token: Option<Arc<str>>,
 }
 
 impl HttpConn {
@@ -90,10 +100,11 @@ impl HttpConn {
             return Err(RPCError::Network(NetworkError::new(&e)));
         }
         let url = format!("{}{}", self.base, path);
-        let resp = self
-            .client
-            .post(&url)
-            .json(req)
+        let mut builder = self.client.post(&url).json(req);
+        if let Some(tok) = &self.token {
+            builder = builder.bearer_auth(tok);
+        }
+        let resp = builder
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;

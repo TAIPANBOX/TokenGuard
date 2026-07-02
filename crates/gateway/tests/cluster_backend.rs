@@ -19,7 +19,7 @@ async fn raft_backend_enforces_and_settles() {
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("http://{addr}"));
     let rl: Arc<dyn LedgerBackend> =
-        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None)
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
             .await
             .unwrap();
 
@@ -70,7 +70,7 @@ async fn raft_backend_enforces_parent_budget() {
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("http://{addr}"));
     let rl: Arc<dyn LedgerBackend> =
-        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None)
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
             .await
             .unwrap();
 

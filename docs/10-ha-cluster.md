@@ -240,10 +240,21 @@ Nodes join and leave a running cluster — no downtime, no re-bootstrap:
 start a single-voter node, add a second as a learner over HTTP, promote to
 `{1,2}`, and confirm a write replicates to the newly-joined node.
 
+## Authentication (implemented)
+
+Set `TOKENFUSE_CLUSTER_TOKEN` (a shared secret) and every endpoint except
+`/healthz` requires `Authorization: Bearer <token>` — peer raft RPCs, the admin
+`/mgmt/*` calls, and the app `/api/*` calls. Each node presents the token to its
+peers (`HttpNetwork`), the admin/app `Client` attaches it, and leader-forwarded
+writes carry it. Without the env var, auth is off (dev default). The gateway
+passes it through the same variable. Test `cluster_token_secures_endpoints`:
+missing/wrong token → `401`, correct token → `200` and writes succeed.
+
 ## Not yet (follow-ups)
 
+- **TLS** — put the nodes behind a TLS-terminating proxy/mesh for `https://`
+  today; native in-node TLS termination (cert/key) is the next increment.
 - **Linearizable follower reads** via `ensure_linearizable()` + leader forward
   (reads today are eventually-consistent local reads).
-- **HTTPS / auth** on the raft + admin endpoints for cross-machine deploys.
 
 [openraft]: https://docs.rs/openraft

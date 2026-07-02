@@ -306,6 +306,9 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
     }
     let bootstrap = std::env::var("TOKENFUSE_CLUSTER_BOOTSTRAP").is_ok();
     let data_dir = std::env::var("TOKENFUSE_CLUSTER_DATA_DIR").ok();
+    let token = std::env::var("TOKENFUSE_CLUSTER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let sock = match addr.parse() {
         Ok(s) => s,
         Err(e) => {
@@ -319,6 +322,7 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
         Arc::new(peers),
         bootstrap,
         data_dir,
+        token,
     )
     .await
     {

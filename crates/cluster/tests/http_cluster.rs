@@ -29,7 +29,7 @@ async fn start_http_cluster() -> Vec<String> {
 
     for (i, l) in listeners.into_iter().enumerate() {
         let id = i as u64 + 1;
-        let node = HttpNode::build(id, peers.clone()).await.unwrap();
+        let node = HttpNode::build(id, peers.clone(), None).await.unwrap();
         tokio::spawn(async move {
             let _ = server::serve_on(node, l).await;
         });
@@ -163,7 +163,9 @@ async fn membership_grow_add_learner_then_promote() {
     let peers: Peers = Arc::new(peers_map.clone());
     let urls: Vec<String> = peers_map.values().cloned().collect();
     for (i, l) in listeners.into_iter().enumerate() {
-        let node = HttpNode::build(i as u64 + 1, peers.clone()).await.unwrap();
+        let node = HttpNode::build(i as u64 + 1, peers.clone(), None)
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let _ = server::serve_on(node, l).await;
         });
@@ -216,4 +218,89 @@ async fn membership_grow_add_learner_then_promote() {
         seen,
         "node 2 joined at runtime must receive replicated writes"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_token_secures_endpoints() {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+    let peers: Peers = Arc::new(BTreeMap::from([(1u64, url.clone())]));
+
+    let node = HttpNode::build(1, peers, Some("s3cret".into()))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = server::serve_on(node, l).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let http = reqwest::Client::new();
+    // /healthz is public.
+    assert!(http
+        .get(format!("{url}/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    // Admin endpoint without a token → 401.
+    assert_eq!(
+        http.get(format!("{url}/mgmt/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // Wrong token → 401.
+    assert_eq!(
+        http.get(format!("{url}/mgmt/metrics"))
+            .bearer_auth("nope")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // Correct token → 200.
+    assert!(http
+        .get(format!("{url}/mgmt/metrics"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+
+    // An authed Client can drive the node: init, elect, write.
+    let c = Client::with_token(url.clone(), Some("s3cret".into()));
+    c.init_single().await.unwrap().unwrap();
+    for _ in 0..100 {
+        if c.metrics()
+            .await
+            .map(|m| m.leader.is_some())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    c.write(&Request::Open {
+        run: "a".into(),
+        budget_micros: USD,
+        parent: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let r = c
+        .write(&Request::Reserve {
+            run: "a".into(),
+            micros: 30 * 10_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(r.accepted);
 }

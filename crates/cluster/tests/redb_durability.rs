@@ -31,7 +31,7 @@ async fn budgets_survive_a_restart() {
 
     // --- round 1: open durable node, write a budget, then "crash" (drop) ---
     {
-        let node = HttpNode::build_durable(1, peers.clone(), &dir)
+        let node = HttpNode::build_durable(1, peers.clone(), &dir, None)
             .await
             .unwrap();
         node.init().await.unwrap();
@@ -60,7 +60,7 @@ async fn budgets_survive_a_restart() {
 
     // --- round 2: reopen the SAME dir; the state must have persisted ---
     {
-        let node = HttpNode::build_durable(1, peers.clone(), &dir)
+        let node = HttpNode::build_durable(1, peers.clone(), &dir, None)
             .await
             .unwrap();
         let s = node

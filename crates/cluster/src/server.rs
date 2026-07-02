@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request as HttpRequest, State};
+use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use openraft::error::{InstallSnapshotError, RaftError};
@@ -36,21 +39,30 @@ pub struct HttpNode {
     pub raft: Raft<TypeConfig>,
     pub sm: Arc<dyn LedgerReader>,
     pub peers: Peers,
+    /// Shared cluster token. When set, every endpoint except `/healthz` requires
+    /// `Authorization: Bearer <token>`, and this node presents it to peers.
+    pub token: Option<Arc<str>>,
 }
 
 impl HttpNode {
     /// Build a node with **in-memory** storage (fast; state lost on restart).
     /// `peers` maps every member id (including this one) to its base URL.
-    pub async fn build(id: NodeId, peers: Peers) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+    /// `token`, if set, secures every endpoint except `/healthz`.
+    pub async fn build(
+        id: NodeId,
+        peers: Peers,
+        token: Option<String>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let config = Arc::new(crate::node_config().validate()?);
         let sm = StateMachineStore::default();
-        let network = HttpNetwork::new(peers.clone());
+        let network = HttpNetwork::with_token(peers.clone(), token.clone());
         let raft = Raft::new(id, config, network, LogStore::default(), sm.clone()).await?;
         Ok(Arc::new(Self {
             id,
             raft,
             sm: Arc::new(sm),
             peers,
+            token: token.map(Arc::from),
         }))
     }
 
@@ -60,18 +72,20 @@ impl HttpNode {
         id: NodeId,
         peers: Peers,
         dir: impl AsRef<std::path::Path>,
+        token: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let config = Arc::new(crate::node_config().validate()?);
         let db = open_node_db(dir, id)?;
         let log = RedbLogStore::new(db.clone())?;
         let sm = RedbStateMachineStore::new(db)?;
-        let network = HttpNetwork::new(peers.clone());
+        let network = HttpNetwork::with_token(peers.clone(), token.clone());
         let raft = Raft::new(id, config, network, log, sm.clone()).await?;
         Ok(Arc::new(Self {
             id,
             raft,
             sm: Arc::new(sm),
             peers,
+            token: token.map(Arc::from),
         }))
     }
 
@@ -133,10 +147,13 @@ impl HttpNode {
             Ok(r) => Ok(r.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => match f.leader_id {
                 Some(leader) if leader != self.id => match self.peers.get(&leader) {
-                    Some(base) => match Client::new(base.clone()).write(&req).await {
-                        Ok(inner) => inner,
-                        Err(e) => Err(e.to_string()),
-                    },
+                    Some(base) => {
+                        let tok = self.token.as_ref().map(|t| t.to_string());
+                        match Client::with_token(base.clone(), tok).write(&req).await {
+                            Ok(inner) => inner,
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
                     None => Err(format!("no address for leader {leader}")),
                 },
                 _ => Err("no leader elected".into()),
@@ -154,9 +171,35 @@ pub struct MetricsSummary {
     pub state: String,
 }
 
-/// Build the axum router for a node.
+/// Reject requests without a valid `Authorization: Bearer <token>` when the node
+/// has a cluster token configured. `/healthz` is exempt (mounted separately).
+async fn require_auth(
+    State(n): State<Arc<HttpNode>>,
+    req: HttpRequest,
+    next: Next,
+) -> AxumResponse {
+    match &n.token {
+        None => next.run(req).await,
+        Some(tok) => {
+            let ok = req
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h == format!("Bearer {tok}"))
+                .unwrap_or(false);
+            if ok {
+                next.run(req).await
+            } else {
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+            }
+        }
+    }
+}
+
+/// Build the axum router for a node. All endpoints except `/healthz` require the
+/// cluster token (when one is configured).
 pub fn router(node: Arc<HttpNode>) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/raft/append", post(r_append))
         .route("/raft/vote", post(r_vote))
         .route("/raft/snapshot", post(r_snapshot))
@@ -167,8 +210,12 @@ pub fn router(node: Arc<HttpNode>) -> Router {
         .route("/mgmt/metrics", get(m_metrics))
         .route("/api/write", post(a_write))
         .route("/api/read/{run}", get(a_read))
+        .route_layer(middleware::from_fn_with_state(node.clone(), require_auth))
+        .with_state(node.clone());
+    let public = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(node)
+        .with_state(node);
+    protected.merge(public)
 }
 
 /// Bind `addr` and serve this node until the process exits.
@@ -273,32 +320,45 @@ async fn a_read(State(n): State<Arc<HttpNode>>, Path(run): Path<String>) -> Json
 pub struct Client {
     base: String,
     http: reqwest::Client,
+    token: Option<String>,
 }
 
 impl Client {
     pub fn new(base: impl Into<String>) -> Self {
+        Self::with_token(base, None)
+    }
+
+    /// `token`, if set, is sent as `Authorization: Bearer <token>` on every call.
+    pub fn with_token(base: impl Into<String>, token: Option<String>) -> Self {
         Self {
             base: base.into(),
             http: reqwest::Client::new(),
+            token,
+        }
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        let b = self.http.post(format!("{}{}", self.base, path));
+        match &self.token {
+            Some(t) => b.bearer_auth(t),
+            None => b,
+        }
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        let b = self.http.get(format!("{}{}", self.base, path));
+        match &self.token {
+            Some(t) => b.bearer_auth(t),
+            None => b,
         }
     }
 
     pub async fn init(&self) -> Result<Result<(), String>, reqwest::Error> {
-        self.http
-            .post(format!("{}/mgmt/init", self.base))
-            .send()
-            .await?
-            .json()
-            .await
+        self.post("/mgmt/init").send().await?.json().await
     }
 
     pub async fn init_single(&self) -> Result<Result<(), String>, reqwest::Error> {
-        self.http
-            .post(format!("{}/mgmt/init-single", self.base))
-            .send()
-            .await?
-            .json()
-            .await
+        self.post("/mgmt/init-single").send().await?.json().await
     }
 
     pub async fn add_learner(
@@ -306,8 +366,7 @@ impl Client {
         id: NodeId,
         addr: &str,
     ) -> Result<Result<(), String>, reqwest::Error> {
-        self.http
-            .post(format!("{}/mgmt/add-learner", self.base))
+        self.post("/mgmt/add-learner")
             .json(&serde_json::json!({ "id": id, "addr": addr }))
             .send()
             .await?
@@ -319,8 +378,7 @@ impl Client {
         &self,
         voters: &BTreeSet<NodeId>,
     ) -> Result<Result<(), String>, reqwest::Error> {
-        self.http
-            .post(format!("{}/mgmt/change-membership", self.base))
+        self.post("/mgmt/change-membership")
             .json(voters)
             .send()
             .await?
@@ -329,27 +387,15 @@ impl Client {
     }
 
     pub async fn metrics(&self) -> Result<MetricsSummary, reqwest::Error> {
-        self.http
-            .get(format!("{}/mgmt/metrics", self.base))
-            .send()
-            .await?
-            .json()
-            .await
+        self.get("/mgmt/metrics").send().await?.json().await
     }
 
     pub async fn write(&self, req: &Request) -> Result<Result<Response, String>, reqwest::Error> {
-        self.http
-            .post(format!("{}/api/write", self.base))
-            .json(req)
-            .send()
-            .await?
-            .json()
-            .await
+        self.post("/api/write").json(req).send().await?.json().await
     }
 
     pub async fn read(&self, run: &str) -> Result<Option<RunState>, reqwest::Error> {
-        self.http
-            .get(format!("{}/api/read/{run}", self.base))
+        self.get(&format!("/api/read/{run}"))
             .send()
             .await?
             .json()

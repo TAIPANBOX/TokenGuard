@@ -85,8 +85,9 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("--id required")?;
     let http = flags.get("http").cloned().ok_or("--http addr required")?;
     let peers = parse_peers(flags.get("peers").map(|s| s.as_str()).unwrap_or(""));
+    let token = flags.get("token").cloned();
 
-    let node = HttpNode::build(id, peers).await?;
+    let node = HttpNode::build(id, peers, token).await?;
     let addr = http.parse()?;
     println!("node {id} serving on http://{http}");
 
@@ -124,7 +125,7 @@ async fn demo_http() -> Result<(), Box<dyn std::error::Error>> {
     // Start every node's HTTP server.
     for (i, port) in ports.iter().enumerate() {
         let id = i as u64 + 1;
-        let node = HttpNode::build(id, peers.clone()).await?;
+        let node = HttpNode::build(id, peers.clone(), None).await?;
         let addr = format!("127.0.0.1:{port}").parse()?;
         tokio::spawn(async move {
             let _ = server::serve(node, addr).await;

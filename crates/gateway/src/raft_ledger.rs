@@ -30,23 +30,25 @@ pub struct RaftLedger {
 impl RaftLedger {
     /// Build the co-located raft node, start its HTTP server on `addr`, and
     /// optionally initialize the cluster (do this on exactly one node).
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         id: u64,
         addr: SocketAddr,
         peers: Peers,
         bootstrap: bool,
         data_dir: Option<String>,
+        token: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let node = match data_dir {
             Some(dir) if !dir.is_empty() => {
                 tracing::info!(%dir, "raft storage: durable (redb)");
-                HttpNode::build_durable(id, peers, dir).await?
+                HttpNode::build_durable(id, peers, dir, token).await?
             }
             _ => {
                 tracing::info!(
                     "raft storage: in-memory (set TOKENFUSE_CLUSTER_DATA_DIR for durable)"
                 );
-                HttpNode::build(id, peers).await?
+                HttpNode::build(id, peers, token).await?
             }
         };
 
