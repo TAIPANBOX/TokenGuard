@@ -7,7 +7,7 @@
 //! - unset → the deterministic stub, so `cargo run` works offline.
 
 use std::sync::Arc;
-use tokenfuse_core::{AnomalyConfig, Growth, Ledger, ModelPrice, Policy, PriceBook, Window};
+use tokenfuse_core::{AnomalyConfig, Growth, Ledger, Mode, ModelPrice, Policy, PriceBook, Window};
 use tokenfuse_gateway::app;
 use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
@@ -106,9 +106,17 @@ async fn serve() {
         }
     };
 
-    // Shadow mode by default (safe to drop in) with loop detectors wired on, so
-    // the running gateway surfaces "would block" without changing behavior.
+    // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Default is
+    // shadow (safe to drop in — surfaces "would block" without changing
+    // behavior); set enforce to actually return 402 and cut the circuit.
+    let mode = match std::env::var("TOKENFUSE_MODE").as_deref() {
+        Ok("enforce") => Mode::Enforce,
+        Ok("warn") => Mode::Warn,
+        _ => Mode::Shadow,
+    };
+    tracing::info!(?mode, "policy mode");
     let policy = Policy {
+        mode,
         anomalies: AnomalyConfig {
             identical_tool_call: Some(Window {
                 window: 10,

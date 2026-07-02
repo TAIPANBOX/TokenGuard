@@ -181,6 +181,16 @@ curl http://localhost:4100/v1/messages \
 - **No `x-fuse-run-id`?** The call is passed through untouched — safe to drop in.
 - **Want the live view?** `docker exec <container> tokenfuse top` (or `cargo run -p tokenfuse-gateway top`) shows every run and its $/min.
 
+**Observe first, then enforce.** By default TokenFuse runs in **shadow** mode — it *records* what it would block but changes nothing, so you can drop it in risk-free. When you're ready to actually cut the circuit (return `402` on a breach), start it in **enforce** mode:
+
+```bash
+docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse
+```
+
+`TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
+
 > Everything the project needs lives on GitHub — source, CI, and the container image (GHCR). **No dedicated server required.**
 
 ---
