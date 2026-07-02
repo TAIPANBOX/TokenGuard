@@ -30,10 +30,13 @@ struct Batch<'a> {
 
 impl CloudSink {
     /// `url` is the control plane's ingest endpoint (e.g.
-    /// `http://control-plane:8080/v1/ingest`); `key` is the org API key.
-    pub fn new(url: impl Into<String>, key: impl Into<String>) -> Self {
+    /// `base` is the control plane's base URL (e.g. `http://control-plane:8080`);
+    /// telemetry is POSTed to `{base}/v1/ingest`. `key` is the org API key.
+    pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
+        let base = base.into();
+        let url = format!("{}/v1/ingest", base.trim_end_matches('/'));
         CloudSink {
-            url: url.into(),
+            url,
             key: key.into(),
             client: reqwest::Client::new(),
             buf: Mutex::new(Vec::new()),
@@ -87,4 +90,38 @@ impl EventSink for CloudSink {
         let batch = std::mem::take(&mut *self.buf.lock().unwrap());
         self.ship(batch);
     }
+}
+
+/// Poll the control plane's kill list and apply each killed run id locally, so an
+/// operator's "Kill" in the Cloud dashboard propagates to every gateway of the
+/// org (which then hard-stops that run — `402 killed`). Best-effort; runs until
+/// the process exits.
+pub fn spawn_kill_poller<F>(base: String, key: String, apply: F)
+where
+    F: Fn(&str) + Send + Sync + 'static,
+{
+    let url = format!("{}/v1/kills", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            let resp = match client.get(&url).bearer_auth(&key).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("cloud kill poll failed: {e}");
+                    continue;
+                }
+            };
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(runs) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                for run in runs {
+                    apply(&run);
+                }
+            }
+        }
+    });
 }

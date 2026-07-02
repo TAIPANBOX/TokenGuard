@@ -90,6 +90,28 @@ func (s *server) summary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.Summary(org))
 }
 
+// kill: POST /v1/runs/{run}/kill → mark a run killed (operator / dashboard)
+func (s *server) kill(w http.ResponseWriter, r *http.Request) {
+	org := s.orgFor(r)
+	if org == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return
+	}
+	run := r.PathValue("run")
+	s.store.Kill(org, run)
+	writeJSON(w, http.StatusOK, map[string]string{"killed": run})
+}
+
+// kills: GET /v1/kills → run ids this org has killed (gateways poll this)
+func (s *server) kills(w http.ResponseWriter, r *http.Request) {
+	org := s.orgFor(r)
+	if org == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.Kills(org))
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -98,6 +120,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/ingest", s.ingest)
 	mux.HandleFunc("GET /v1/runs", s.runs)
 	mux.HandleFunc("GET /v1/summary", s.summary)
+	mux.HandleFunc("POST /v1/runs/{run}/kill", s.kill)
+	mux.HandleFunc("GET /v1/kills", s.kills)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

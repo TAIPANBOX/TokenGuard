@@ -45,6 +45,39 @@ func TestIngestThenQueryWithAuth(t *testing.T) {
 	}
 }
 
+func TestKillFlow(t *testing.T) {
+	srv := newTestServer()
+	h := srv.routes()
+
+	req := httptest.NewRequest("POST", "/v1/runs/runaway-1/kill", nil)
+	req.Header.Set("Authorization", "Bearer devkey")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("kill status = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/kills", nil)
+	req.Header.Set("Authorization", "Bearer devkey")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var kills []string
+	if err := json.Unmarshal(rec.Body.Bytes(), &kills); err != nil {
+		t.Fatal(err)
+	}
+	if len(kills) != 1 || kills[0] != "runaway-1" {
+		t.Fatalf("kills = %v, want [runaway-1]", kills)
+	}
+
+	// Kill requires auth.
+	req = httptest.NewRequest("POST", "/v1/runs/x/kill", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauth kill status = %d, want 401", rec.Code)
+	}
+}
+
 func TestUnauthorizedRejected(t *testing.T) {
 	srv := newTestServer()
 	h := srv.routes()

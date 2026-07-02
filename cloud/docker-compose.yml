@@ -23,7 +23,7 @@ services:
       # Point at a real provider to use it for real; omit for the offline stub.
       # TOKENFUSE_UPSTREAM: "https://api.anthropic.com/v1/messages"
       TOKENFUSE_MODE: "enforce"
-      TOKENFUSE_CLOUD_URL: "http://control-plane:8080/v1/ingest"
+      TOKENFUSE_CLOUD_URL: "http://control-plane:8080"
       TOKENFUSE_CLOUD_KEY: "devkey"
     ports:
       - "4100:4100"

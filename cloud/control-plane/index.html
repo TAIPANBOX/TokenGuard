@@ -49,7 +49,7 @@
   <table>
     <thead><tr>
       <th>Run</th><th>Model</th><th class="num">Spent</th><th class="num">Calls</th>
-      <th class="num">Cache hits</th><th class="num">Steps</th><th>Last seen</th>
+      <th class="num">Cache hits</th><th class="num">Steps</th><th>Last seen</th><th></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -87,7 +87,7 @@
       $("empty").style.display = runs.length ? "none" : "block";
       $("empty").textContent = "No runs yet — send some traffic through a gateway.";
       $("rows").innerHTML = runs.map((r) => `
-        <tr>
+        <tr${r.killed ? ' style="opacity:.55"' : ""}>
           <td>${r.run_id}</td>
           <td><span class="pill">${r.model || "—"}</span></td>
           <td class="num">${usd(r.spent_microusd)}</td>
@@ -95,10 +95,26 @@
           <td class="num">${r.cache_hits}</td>
           <td class="num">${r.steps}</td>
           <td>${ago(r.last_seen_millis)}</td>
+          <td>${r.killed
+            ? '<span class="pill" style="color:#f85149">killed</span>'
+            : `<button data-run="${r.run_id}" style="background:#b62324;padding:3px 10px;font-size:12px;">Kill</button>`}</td>
         </tr>`).join("");
+      document.querySelectorAll("button[data-run]").forEach((b) => {
+        b.onclick = () => killRun(b.getAttribute("data-run"));
+      });
     } catch (e) {
       $("status").textContent = "error: " + e.message;
     }
+  }
+
+  async function killRun(run) {
+    if (!key || !confirm("Kill run '" + run + "'? Gateways will hard-stop it.")) return;
+    try {
+      await fetch("/v1/runs/" + encodeURIComponent(run) + "/kill", {
+        method: "POST", headers: { Authorization: "Bearer " + key },
+      });
+      refresh();
+    } catch (e) { $("status").textContent = "kill failed: " + e.message; }
   }
 
   $("save").onclick = () => {

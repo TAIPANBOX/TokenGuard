@@ -27,6 +27,7 @@ type RunAgg struct {
 	CacheHits     int    `json:"cache_hits"`
 	Steps         uint32 `json:"steps"`
 	LastSeen      int64  `json:"last_seen_millis"`
+	Killed        bool   `json:"killed"`
 }
 
 // Summary is org-wide totals.
@@ -40,12 +41,39 @@ type Summary struct {
 // (A durable backend — Postgres/ClickHouse — is a drop-in follow-up behind the
 // same methods.)
 type Store struct {
-	mu   sync.RWMutex
-	orgs map[string]map[string]*RunAgg
+	mu     sync.RWMutex
+	orgs   map[string]map[string]*RunAgg
+	killed map[string]map[string]bool // org → run → killed
 }
 
 func NewStore() *Store {
-	return &Store{orgs: make(map[string]map[string]*RunAgg)}
+	return &Store{
+		orgs:   make(map[string]map[string]*RunAgg),
+		killed: make(map[string]map[string]bool),
+	}
+}
+
+// Kill marks a run killed for an org; gateways poll this and hard-stop it.
+func (s *Store) Kill(org, run string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.killed[org] == nil {
+		s.killed[org] = make(map[string]bool)
+	}
+	s.killed[org][run] = true
+}
+
+// Kills lists the run ids an org has killed.
+func (s *Store) Kills(org string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []string{}
+	for run, k := range s.killed[org] {
+		if k {
+			out = append(out, run)
+		}
+	}
+	return out
 }
 
 // Ingest folds a batch of records into an org's aggregates.
@@ -85,8 +113,11 @@ func (s *Store) Runs(org string) []RunAgg {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []RunAgg{}
+	killed := s.killed[org]
 	for _, agg := range s.orgs[org] {
-		out = append(out, *agg)
+		a := *agg
+		a.Killed = killed[a.RunID]
+		out = append(out, a)
 	}
 	return out
 }

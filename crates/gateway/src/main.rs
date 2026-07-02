@@ -212,15 +212,23 @@ async fn serve() {
             });
         }
     }
-    // TokenFuse Cloud: push telemetry to a control plane for a cross-fleet view.
-    // TOKENFUSE_CLOUD_URL (ingest endpoint) + TOKENFUSE_CLOUD_KEY (org key).
-    if let (Ok(url), Ok(key)) = (
+    // TokenFuse Cloud: push telemetry to a control plane for a cross-fleet view,
+    // and pull operator kills back down. TOKENFUSE_CLOUD_URL is the control
+    // plane base URL; TOKENFUSE_CLOUD_KEY is the org key.
+    if let (Ok(base), Ok(key)) = (
         std::env::var("TOKENFUSE_CLOUD_URL"),
         std::env::var("TOKENFUSE_CLOUD_KEY"),
     ) {
-        if !url.is_empty() && !key.is_empty() {
-            tracing::info!(%url, "shipping telemetry to TokenFuse Cloud");
-            let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(url, key));
+        if !base.is_empty() && !key.is_empty() {
+            tracing::info!(%base, "connected to TokenFuse Cloud");
+            // Pull kills from the cloud and apply them to this gateway's runs.
+            let st = state.clone();
+            tokenfuse_gateway::cloudsink::spawn_kill_poller(
+                base.clone(),
+                key.clone(),
+                move |run| st.kill(run),
+            );
+            let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(base, key));
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();
             tokio::spawn(async move {

@@ -54,7 +54,7 @@ below the batch size. It composes with the other sinks via `TeeSink`.
 Enable it on any gateway:
 
 ```bash
-TOKENFUSE_CLOUD_URL=http://control-plane:8080/v1/ingest \
+TOKENFUSE_CLOUD_URL=http://control-plane:8080 \
 TOKENFUSE_CLOUD_KEY=devkey \
   tokenfuse
 ```
@@ -85,11 +85,17 @@ Three managed calls through the gateway → the Cloud aggregated **3 runs / 3 ca
 / $0.0315**, per-run spend and last-seen correct; unauthenticated requests get
 `401`. Control plane: `go test` (aggregation, org isolation, auth, dashboard).
 
+## Kill from the cloud (implemented)
+
+The dashboard has a **Kill** button per run. It calls `POST /v1/runs/{run}/kill`
+on the control plane, which records the kill per org. Every gateway of that org
+runs a **kill poller** (`cloudsink::spawn_kill_poller`) that fetches
+`GET /v1/kills` every few seconds and applies each id to its local kill set —
+so the run is hard-stopped (`402 killed`) across the whole fleet, not just on one
+gateway. Enabled automatically whenever `TOKENFUSE_CLOUD_URL` + `_KEY` are set.
+
 ## Not yet (follow-ups)
 
-- **Kill from the cloud** — the dashboard is read-only today; propagating a kill
-  back to the owning gateway needs a pull/stream channel (the gateway already has
-  a local kill API + Slack button).
 - **Central budgets / limits** managed in the Cloud and pushed to gateways.
 - **Durable storage** (Postgres/ClickHouse) + retention.
 - **Richer dashboard** — the roadmap's Next.js app (charts, alerts, org/RBAC);
