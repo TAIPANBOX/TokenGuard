@@ -52,6 +52,23 @@ impl EventSink for NullSink {
     fn flush(&self) {}
 }
 
+/// Fan a record out to two sinks (e.g. Parquet + OTel).
+pub struct TeeSink {
+    pub first: Arc<dyn EventSink>,
+    pub second: Arc<dyn EventSink>,
+}
+
+impl EventSink for TeeSink {
+    fn record(&self, rec: CallRecord) {
+        self.first.record(rec.clone());
+        self.second.record(rec);
+    }
+    fn flush(&self) {
+        self.first.flush();
+        self.second.flush();
+    }
+}
+
 /// Buffers records and writes them as rotating Parquet files in `dir`.
 pub struct ParquetSink {
     dir: PathBuf,

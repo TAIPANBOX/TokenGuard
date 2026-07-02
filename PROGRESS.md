@@ -31,12 +31,13 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | Cache ONNX embedder | ✅ done | Optional `onnx` cargo feature: real multilingual-e5-small embeddings via `fastembed`/ort (`TOKENFUSE_CACHE_EMBEDDER=onnx`). Default stays `HashEmbedder` (dep-free); CI builds default only. Compiles + clippy-clean with the feature. |
 | Agent firewall / taint (Ring 3.1) | ✅ done | `crates/core/taint.rs`: tools → labels/capabilities, monotonic per-run taint, rule eval. Gateway accumulates taint from `X-Fuse-Taint` + tool history; a model tool call needing a capability denied under the run's taint → `403 taint_blocked` (enforce) or `x-fuse-taint` note (shadow). `TOKENFUSE_FIREWALL=off\|shadow\|enforce`. SDK gains `TaintBlocked`. |
 | DLP secret scanning (Ring 3.2) | ✅ done | `crates/core/dlp.rs`: pattern detectors (AWS/OpenAI/Anthropic/Google/GitHub/Slack keys, JWT, private key, Bearer) with overlap-dedup + redaction. Gateway scans the outgoing prompt; `TOKENFUSE_DLP=off\|shadow\|mask\|block` → `403 dlp_blocked`, masks to `[REDACTED:kind]`, or flags via `x-fuse-dlp`. SDK gains `DlpBlocked`. Verified live. |
+| OTel export (W9) | ✅ done | `gateway/otel.rs`: one OTLP/JSON span per call over HTTP (`gen_ai.*` + `tokenfuse.*` attrs; one trace per run) to `TOKENFUSE_OTLP_ENDPOINT`. `TeeSink` composes it with the Parquet trace. No heavy OTel deps; default off. Verified live against a mock collector. |
 | Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
 | Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
 
 ## Test status
 
-`cargo test --all` — 84 passing (core: 52, gateway: 32); Python SDK — 11 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: DLP `block` returns `403 dlp_blocked` on an AWS key in the prompt.
+`cargo test --all` — 87 passing (core: 52, gateway: 35); Python SDK — 11 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: DLP `block` → `403 dlp_blocked`; OTLP span exported to a mock collector (`llm.call`, one trace per run).
 
 ## How to run
 
