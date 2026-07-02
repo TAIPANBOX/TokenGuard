@@ -9,6 +9,7 @@ pub mod loops;
 pub mod money;
 pub mod policy;
 pub mod pricing;
+pub mod taint;
 
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
@@ -17,3 +18,4 @@ pub use loops::{AnomalyConfig, Growth, Window};
 pub use money::Microusd;
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
 pub use pricing::{ModelPrice, PriceBook, Usage};
+pub use taint::{FirewallMode, Labels, TaintRule};

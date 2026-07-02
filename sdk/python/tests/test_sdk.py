@@ -73,6 +73,13 @@ def test_unknown_type_falls_back_to_base_error():
         tokenfuse.raise_for_fuse(402, {"error": {"type": "something_new"}})
 
 
+def test_raise_for_fuse_taint_blocked_403():
+    body = {"error": {"type": "taint_blocked", "run_id": "r6", "reason": "web denies exec"}}
+    with pytest.raises(tokenfuse.TaintBlocked) as ei:
+        tokenfuse.raise_for_fuse(403, body)
+    assert ei.value.run_id == "r6"
+
+
 def test_check_response_duck_typed():
     class FakeResp:
         status_code = 402

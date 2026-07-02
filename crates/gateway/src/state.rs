@@ -1,10 +1,12 @@
 //! Shared application state handed to every request handler.
 
+use crate::firewall::FirewallConfig;
 use crate::provider::Provider;
 use crate::sink::{EventSink, NullSink};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
+use tokenfuse_core::taint::Labels;
 use tokenfuse_core::{Ledger, Policy, PriceBook, SemanticCache};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
@@ -27,8 +29,12 @@ pub struct AppState {
     pub sink: Arc<dyn EventSink>,
     /// Semantic response cache (Off by default).
     pub cache: Arc<SemanticCache>,
+    /// Agent-firewall config (Off by default).
+    pub firewall: Arc<FirewallConfig>,
     history: History,
     killed: Killed,
+    /// Per-run accumulated taint labels.
+    taint: Arc<Mutex<HashMap<String, Labels>>>,
 }
 
 impl AppState {
@@ -50,9 +56,25 @@ impl AppState {
                 Box::new(HashEmbedder::default()),
                 CacheConfig::default(), // Off
             )),
+            firewall: Arc::new(FirewallConfig::disabled()),
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
+            taint: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach an agent-firewall config. Chainable.
+    pub fn with_firewall(mut self, firewall: Arc<FirewallConfig>) -> Self {
+        self.firewall = firewall;
+        self
+    }
+
+    /// Merge `new_labels` into a run's taint set and return the full current set.
+    pub fn accumulate_taint(&self, run_id: &str, new_labels: Labels) -> Labels {
+        let mut map = self.taint.lock().unwrap();
+        let entry = map.entry(run_id.to_string()).or_default();
+        entry.extend(new_labels);
+        entry.clone()
     }
 
     /// Attach an event sink (e.g. the Parquet trace). Chainable.
