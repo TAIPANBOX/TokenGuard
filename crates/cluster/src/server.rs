@@ -9,7 +9,7 @@
 //! * `GET  /api/read/{run}`— local (eventually-consistent) read of a run
 //! * `GET  /healthz`
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -76,16 +76,50 @@ impl HttpNode {
     }
 
     /// Initialize the cluster with the configured members (call on exactly one
-    /// node). Returns `Ok` on success or if it was already initialized.
+    /// node). Each member's address travels in its `BasicNode`, so nodes can be
+    /// reached from the replicated membership. Returns `Ok` on success or if it
+    /// was already initialized.
     pub async fn init(&self) -> Result<(), String> {
         let members: BTreeMap<NodeId, BasicNode> = self
             .peers
-            .keys()
-            .map(|&i| (i, BasicNode::default()))
+            .iter()
+            .map(|(&i, url)| (i, BasicNode::new(url)))
             .collect();
         self.raft
             .initialize(members)
             .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Initialize a single-voter cluster (just this node). Grow it afterwards
+    /// with [`add_learner`](Self::add_learner) + [`change_membership`].
+    pub async fn init_single(&self) -> Result<(), String> {
+        let url = self.peers.get(&self.id).cloned().unwrap_or_default();
+        let members = BTreeMap::from([(self.id, BasicNode::new(url))]);
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Add a learner (a node that replicates but does not vote) at `addr`,
+    /// blocking until it catches up. Promote it to a voter with
+    /// [`change_membership`](Self::change_membership).
+    pub async fn add_learner(&self, id: NodeId, addr: &str) -> Result<(), String> {
+        self.raft
+            .add_learner(id, BasicNode::new(addr), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Set the voter set (join/leave). Learners not in the set are demoted;
+    /// call `add_learner` first for any new voter.
+    pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), String> {
+        self.raft
+            .change_membership(voters, false)
+            .await
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
@@ -127,6 +161,9 @@ pub fn router(node: Arc<HttpNode>) -> Router {
         .route("/raft/vote", post(r_vote))
         .route("/raft/snapshot", post(r_snapshot))
         .route("/mgmt/init", post(m_init))
+        .route("/mgmt/init-single", post(m_init_single))
+        .route("/mgmt/add-learner", post(m_add_learner))
+        .route("/mgmt/change-membership", post(m_change_membership))
         .route("/mgmt/metrics", get(m_metrics))
         .route("/api/write", post(a_write))
         .route("/api/read/{run}", get(a_read))
@@ -175,9 +212,31 @@ async fn r_snapshot(
 // ---- management endpoints -------------------------------------------------
 
 async fn m_init(State(n): State<Arc<HttpNode>>) -> Json<Result<(), String>> {
-    let members: BTreeMap<NodeId, BasicNode> =
-        n.peers.keys().map(|&i| (i, BasicNode::default())).collect();
-    Json(n.raft.initialize(members).await.map_err(|e| e.to_string()))
+    Json(n.init().await)
+}
+
+async fn m_init_single(State(n): State<Arc<HttpNode>>) -> Json<Result<(), String>> {
+    Json(n.init_single().await)
+}
+
+#[derive(Deserialize)]
+struct AddLearner {
+    id: NodeId,
+    addr: String,
+}
+
+async fn m_add_learner(
+    State(n): State<Arc<HttpNode>>,
+    Json(body): Json<AddLearner>,
+) -> Json<Result<(), String>> {
+    Json(n.add_learner(body.id, &body.addr).await)
+}
+
+async fn m_change_membership(
+    State(n): State<Arc<HttpNode>>,
+    Json(voters): Json<BTreeSet<NodeId>>,
+) -> Json<Result<(), String>> {
+    Json(n.change_membership(voters).await)
 }
 
 async fn m_metrics(State(n): State<Arc<HttpNode>>) -> Json<MetricsSummary> {
@@ -227,6 +286,42 @@ impl Client {
     pub async fn init(&self) -> Result<Result<(), String>, reqwest::Error> {
         self.http
             .post(format!("{}/mgmt/init", self.base))
+            .send()
+            .await?
+            .json()
+            .await
+    }
+
+    pub async fn init_single(&self) -> Result<Result<(), String>, reqwest::Error> {
+        self.http
+            .post(format!("{}/mgmt/init-single", self.base))
+            .send()
+            .await?
+            .json()
+            .await
+    }
+
+    pub async fn add_learner(
+        &self,
+        id: NodeId,
+        addr: &str,
+    ) -> Result<Result<(), String>, reqwest::Error> {
+        self.http
+            .post(format!("{}/mgmt/add-learner", self.base))
+            .json(&serde_json::json!({ "id": id, "addr": addr }))
+            .send()
+            .await?
+            .json()
+            .await
+    }
+
+    pub async fn change_membership(
+        &self,
+        voters: &BTreeSet<NodeId>,
+    ) -> Result<Result<(), String>, reqwest::Error> {
+        self.http
+            .post(format!("{}/mgmt/change-membership", self.base))
+            .json(voters)
             .send()
             .await?
             .json()
