@@ -56,12 +56,35 @@ impl HttpNetwork {
 /// Build a reqwest client (rustls). If `TOKENFUSE_CLUSTER_CA` points at a PEM
 /// file, trust it too — so nodes can use a self-signed cluster CA for `https://`.
 /// Public deployments with CA-signed certs need no extra config.
+///
+/// For **mutual TLS**, `TOKENFUSE_CLUSTER_CLIENT_CERT` + `_CLIENT_KEY` (PEM) make
+/// this node present a client certificate on every peer RPC, so an mTLS peer
+/// (`serve_mtls`) accepts it. Missing/unreadable files degrade to no client cert.
 pub fn build_client() -> reqwest::Client {
     let mut b = reqwest::Client::builder();
     if let Ok(path) = std::env::var("TOKENFUSE_CLUSTER_CA") {
         if let Ok(pem) = std::fs::read(&path) {
             if let Ok(cert) = reqwest::Certificate::from_pem(&pem) {
                 b = b.add_root_certificate(cert);
+            }
+        }
+    }
+    if let (Ok(cert_path), Ok(key_path)) = (
+        std::env::var("TOKENFUSE_CLUSTER_CLIENT_CERT"),
+        std::env::var("TOKENFUSE_CLUSTER_CLIENT_KEY"),
+    ) {
+        if !cert_path.is_empty() && !key_path.is_empty() {
+            match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+                (Ok(mut cert), Ok(mut key)) => {
+                    // reqwest wants cert + key concatenated in one PEM buffer.
+                    cert.push(b'\n');
+                    cert.append(&mut key);
+                    match reqwest::Identity::from_pem(&cert) {
+                        Ok(id) => b = b.identity(id),
+                        Err(e) => tracing::error!("cluster client identity: {e}"),
+                    }
+                }
+                _ => tracing::error!("cluster client cert/key unreadable"),
             }
         }
     }

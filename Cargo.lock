@@ -5477,6 +5477,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",
