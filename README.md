@@ -227,6 +227,14 @@ TokenFuse is **complementary** to observability and gateways — many teams will
 
 Everything below is **implemented and shipped in v0.2.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
 
+<div align="center">
+
+<img src="docs/assets/tokenfuse-top.gif" alt="tokenfuse top — a live terminal view of every run's spend vs. budget, killing a runaway" width="720">
+
+<sub><code>tokenfuse top</code> — a live <code>htop</code>-style view of every run's spend against its budget; press <kbd>k</kbd> to kill a runaway.</sub>
+
+</div>
+
 **Cost & control**
 - 💰 **Per-run budgets** — a hard cap for a whole task, with hierarchical roll-up so a sub-agent's spend counts against its parent.
 - 🔁 **Loop / runaway detection** — identical-call, ping-pong, and context-growth detectors.
