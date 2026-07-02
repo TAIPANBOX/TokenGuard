@@ -1,0 +1,29 @@
+# TokenFuse Cloud — the whole stack in one command:
+#
+#   cd cloud && docker compose up
+#
+# Then open http://localhost:8080, enter the org key `devkey`, and send traffic
+# through the gateway on :4100 — runs and spend show up live in the dashboard.
+# Runs anywhere Docker runs; no dedicated server.
+services:
+  control-plane:
+    build: ./control-plane
+    environment:
+      PORT: "8080"
+      TOKENFUSE_CLOUD_KEYS: "devkey:demo"
+    ports:
+      - "8080:8080"
+
+  gateway:
+    image: ghcr.io/taipanbox/tokenfuse:latest
+    environment:
+      TOKENFUSE_ADDR: "0.0.0.0:4100"
+      # Point at a real provider to use it for real; omit for the offline stub.
+      # TOKENFUSE_UPSTREAM: "https://api.anthropic.com/v1/messages"
+      TOKENFUSE_MODE: "enforce"
+      TOKENFUSE_CLOUD_URL: "http://control-plane:8080/v1/ingest"
+      TOKENFUSE_CLOUD_KEY: "devkey"
+    ports:
+      - "4100:4100"
+    depends_on:
+      - control-plane

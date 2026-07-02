@@ -4,6 +4,7 @@ crates/*/target/
 crates/*/*/target/
 .git/
 .github/
+cloud/
 node_modules/
 data/
 *.parquet

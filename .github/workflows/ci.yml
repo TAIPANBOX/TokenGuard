@@ -44,6 +44,24 @@ jobs:
         working-directory: sdk/python
         run: python -m pytest -q
 
+  cloud:
+    name: cloud (control plane · Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: gofmt
+        working-directory: cloud/control-plane
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        working-directory: cloud/control-plane
+        run: go vet ./...
+      - name: test
+        working-directory: cloud/control-plane
+        run: go test ./...
+
   cluster:
     name: cluster (raft HA)
     runs-on: ubuntu-latest

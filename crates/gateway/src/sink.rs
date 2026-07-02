@@ -18,7 +18,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 
 /// One settled call, the unit of the trace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
     pub ts_millis: i64,
     pub run_id: String,

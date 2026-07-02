@@ -227,6 +227,7 @@ The one-line summary: **everyone else reports; TokenFuse acts.**
 | 📡 Radar (eBPF) | Finds *shadow* agents on your machines with **zero config** | Phase 4 |
 | 🔒 Agent firewall (taint) | Blocks risky actions after an agent touches untrusted data | Phase 4 |
 | 🧬 HA cluster (raft) | Budgets survive a node crash; the affordability check is **linearized** across nodes so no two agents double-spend the same ceiling | Phase 4 |
+| ☁️ Hosted Cloud | Many gateways roll up into one dashboard — a **single pane of glass** for spend across your fleet (`cloud/`, `docker compose up`) | Phase 3 |
 
 ---
 

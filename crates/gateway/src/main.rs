@@ -212,6 +212,30 @@ async fn serve() {
             });
         }
     }
+    // TokenFuse Cloud: push telemetry to a control plane for a cross-fleet view.
+    // TOKENFUSE_CLOUD_URL (ingest endpoint) + TOKENFUSE_CLOUD_KEY (org key).
+    if let (Ok(url), Ok(key)) = (
+        std::env::var("TOKENFUSE_CLOUD_URL"),
+        std::env::var("TOKENFUSE_CLOUD_KEY"),
+    ) {
+        if !url.is_empty() && !key.is_empty() {
+            tracing::info!(%url, "shipping telemetry to TokenFuse Cloud");
+            let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(url, key));
+            // Periodic flush so telemetry ships promptly, not only once a batch fills.
+            let flusher = cloud.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    flusher.flush();
+                }
+            });
+            sink = Arc::new(TeeSink {
+                first: sink,
+                second: cloud,
+            });
+        }
+    }
     state = state.with_sink(sink);
 
     // HA: replace the in-process ledger with a raft-replicated one shared across
