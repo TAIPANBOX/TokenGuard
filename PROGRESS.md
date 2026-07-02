@@ -3,7 +3,7 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-02 (HA raft cluster + HTTP transport + gateway integration landed)
+**Last updated:** 2026-07-02 (HA cluster: transport + gateway integration + hierarchical budgets)
 
 ## Current stage
 
@@ -39,7 +39,8 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
 | HA cluster / raft (W7) | ✅ done | `crates/cluster` (openraft, storage-v2): the budget ledger replicated across N nodes. `Reserve`/`Settle` are raft log entries, so the affordability check is **linearized** — no cross-node double-spend — and budgets survive a node crash (quorum commit). Reference in-memory storage. `cargo run -p tokenfuse-cluster` demos a 3-node cluster: over-budget reserve denied by consensus, spend read back from a **follower**. Excluded from default workspace; own CI job. |
 | Cluster — HTTP transport | ✅ done | `net_http.rs` (HTTP `RaftNetwork`, JSON-over-HTTP via openraft `serde`) + `server.rs` (axum per-node server: `/raft/*` peer RPCs, `/mgmt/init`, `/mgmt/metrics`, `/api/write`, `/api/read/{run}`) → clusters form **across processes/machines**. `tokenfuse-cluster serve --id N --http … --peers …` runs one node; `demo-http` spins 3 over real sockets. 2 HTTP integration tests (form over `:0`, deny over-budget by consensus, follower read; leader-forward). |
-| Gateway↔cluster integration | ✅ done | Async `LedgerBackend` trait (`ledger_backend.rs`): `LocalLedger` (default, wraps in-process `Ledger` — no behavior change) or `RaftLedger` (`raft_ledger.rs`, feature `cluster`) which co-locates a raft node so budgets are enforced by consensus across gateways. Hot path refactored sync→async (`open`/`reserve`/`snapshot` await; `settle` stays sync fire-and-forget so `SettleGuard::drop` is unchanged). Configured via `TOKENFUSE_CLUSTER_*`; fails open on consensus outage. Raft-backed backend test (`tests/cluster_backend.rs`, gated). Default gateway 35 tests still green. **Limitations:** flat SM → hierarchy/steps local-only under cluster mode. |
+| Gateway↔cluster integration | ✅ done | Async `LedgerBackend` trait (`ledger_backend.rs`): `LocalLedger` (default, wraps in-process `Ledger` — no behavior change) or `RaftLedger` (`raft_ledger.rs`, feature `cluster`) which co-locates a raft node so budgets are enforced by consensus across gateways. Hot path refactored sync→async (`open`/`reserve`/`snapshot` await; `settle` stays sync fire-and-forget so `SettleGuard::drop` is unchanged). Configured via `TOKENFUSE_CLUSTER_*`; fails open on consensus outage. Gated tests (`tests/cluster_backend.rs`): enforce/deny/settle + parent-budget. Default gateway 35 tests still green. |
+| Cluster — hierarchical budgets + steps | ✅ done | The replicated SM models `parent` chains and per-run `steps`, mirroring `tokenfuse-core::Ledger`: `Reserve` fits the run **and every ancestor** (all-or-nothing), rolls up the chain, and names the `blocked_run` on denial; `Settle` rolls up too. So sub-agent budgets (`X-Fuse-Parent-Run-Id`) are enforced in cluster mode, not just locally. In-process test `subagent_reserve_rolls_up_and_parent_budget_blocks` + gateway `raft_backend_enforces_parent_budget`. |
 
 ## Test status
 

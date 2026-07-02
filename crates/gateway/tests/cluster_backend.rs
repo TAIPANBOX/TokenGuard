@@ -63,3 +63,45 @@ async fn raft_backend_enforces_and_settles() {
     }
     assert!(settled, "settle must replicate to the state machine");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_backend_enforces_parent_budget() {
+    let addr = "127.0.0.1:5601";
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("http://{addr}"));
+    let rl: Arc<dyn LedgerBackend> =
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true)
+            .await
+            .unwrap();
+
+    // Wait for readiness by opening the parent until it replicates.
+    let mut ready = false;
+    for _ in 0..100 {
+        rl.open_run("parent", Microusd::from_usd(1.0), None).await;
+        if rl
+            .snapshot("parent")
+            .await
+            .is_some_and(|s| s.budget == Microusd::from_usd(1.0))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready);
+    // Child has a huge own budget but rolls up into the $1.00 parent.
+    rl.open_run("child", Microusd::from_usd(100.0), Some("parent"))
+        .await;
+
+    let a = rl.reserve("child", Microusd::from_usd(0.6)).await;
+    assert!(a.is_ok(), "first child reserve fits child and parent");
+
+    // Second child reserve fits the child but busts the parent → denied, and the
+    // error must name the *parent* as the blocked run.
+    match rl.reserve("child", Microusd::from_usd(0.6)).await {
+        Err(BudgetError::Exceeded { run_id, .. }) => {
+            assert_eq!(run_id, "parent", "the parent must be the blocking run");
+        }
+        other => panic!("expected parent-budget denial, got {other:?}"),
+    }
+}

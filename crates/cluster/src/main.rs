@@ -157,6 +157,7 @@ async fn demo_http() -> Result<(), Box<dyn std::error::Error>> {
     n1.write(&Request::Open {
         run: run.into(),
         budget_micros: USD,
+        parent: None,
     })
     .await?
     .map_err(|e| format!("open: {e}"))?;
@@ -215,6 +216,7 @@ async fn demo_in_process() -> Result<(), Box<dyn std::error::Error>> {
         .write(Request::Open {
             run: run.to_string(),
             budget_micros: USD,
+            parent: None,
         })
         .await?;
     println!("opened budget for {run}: $1.00\n");

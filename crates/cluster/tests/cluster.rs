@@ -43,6 +43,7 @@ async fn elects_leader_and_replicates_budget() {
         .write(Request::Open {
             run: run.into(),
             budget_micros: USD,
+            parent: None,
         })
         .await
         .unwrap();
@@ -76,6 +77,7 @@ async fn consensus_never_oversubscribes_budget() {
         .write(Request::Open {
             run: run.into(),
             budget_micros: USD,
+            parent: None,
         })
         .await
         .unwrap();
@@ -129,6 +131,7 @@ async fn settle_moves_reserved_to_spent() {
         .write(Request::Open {
             run: run.into(),
             budget_micros: USD,
+            parent: None,
         })
         .await
         .unwrap();
@@ -154,6 +157,63 @@ async fn settle_moves_reserved_to_spent() {
         st.spent_micros == 20 * 10_000 && st.reserved_micros == 0
     })
     .await;
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_reserve_rolls_up_and_parent_budget_blocks() {
+    let cluster = Cluster::start(&[1, 2, 3]).await.unwrap();
+    cluster
+        .wait_for_leader(Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Parent caps the whole task at $1.00; the child's own budget is huge.
+    cluster
+        .write(Request::Open {
+            run: "parent".into(),
+            budget_micros: USD,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    cluster
+        .write(Request::Open {
+            run: "child".into(),
+            budget_micros: 100 * USD,
+            parent: Some("parent".into()),
+        })
+        .await
+        .unwrap();
+
+    // First child reserve fits child *and* parent.
+    let a = cluster
+        .write(Request::Reserve {
+            run: "child".into(),
+            micros: 60 * 10_000,
+        })
+        .await
+        .unwrap();
+    assert!(a.accepted);
+
+    // The reservation rolled up: the parent now shows $0.60 reserved.
+    quorum_sees(&cluster, "parent", |st| st.reserved_micros == 60 * 10_000).await;
+
+    // A second child reserve fits the child ($1.20 < $100) but busts the parent
+    // ($1.20 > $1.00) — denied, and the blocked run is the parent.
+    let b = cluster
+        .write(Request::Reserve {
+            run: "child".into(),
+            micros: 60 * 10_000,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !b.accepted,
+        "must be blocked by the parent's tighter budget"
+    );
+    assert_eq!(b.blocked_run.as_deref(), Some("parent"));
 
     cluster.shutdown().await;
 }

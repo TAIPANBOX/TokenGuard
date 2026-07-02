@@ -57,14 +57,16 @@ per-node hope.
 
 `crates/cluster/src/types.rs` defines the replicated domain:
 
-- **`Request`** — `Open{run, budget}` · `Reserve{run, µUSD}` · `Settle{run,
-  reserved, actual}`. Amounts are integer **microdollars**, matching
+- **`Request`** — `Open{run, budget, parent}` · `Reserve{run, µUSD}` ·
+  `Settle{run, reserved, actual}`. Amounts are integer **microdollars**, matching
   `tokenfuse-core::Money`; no floats ever enter the consensus path.
 - **`LedgerState::apply`** — the single place a budget is enforced. `Reserve`
-  is accepted iff `spent + reserved + amount ≤ budget`; otherwise it returns
-  `accepted: false` with a `budget_exceeded` reason and leaves state untouched.
+  walks the run's ancestor chain and is accepted iff `spent + reserved + amount ≤
+  budget` at **every** level; on success it rolls the reservation up the chain
+  and bumps the leaf's step. Otherwise it returns `accepted: false`, names the
+  `blocked_run`, and leaves state untouched. `Settle` rolls up the chain too.
 - **`Response`** — accept/deny plus the post-apply `spent` / `reserved` /
-  `budget`, so the caller learns the authoritative numbers.
+  `budget`, the leaf `step`, and the `blocked_run` on denial.
 
 ### Storage (`store.rs`)
 
@@ -199,15 +201,15 @@ If consensus is unreachable, `reserve` **fails open** (consistent with
 TokenFuse's default) — a cluster outage degrades to "no enforcement", never
 "all agents blocked".
 
-**Current limitations (documented):** the replicated state machine is flat, so
-hierarchical sub-agent budgets (`X-Fuse-Parent-Run-Id`) and per-run step counts
-are honoured only by the local backend; under cluster mode `parent` is ignored
-and `steps` is a local counter. Porting the parent-chain into the SM is a
-follow-up.
+**Hierarchical budgets + steps are replicated too.** `Open` carries the run's
+`parent`, so the replicated state machine walks the ancestor chain: a `Reserve`
+must fit the run's budget *and every ancestor's* (all-or-nothing) and rolls the
+reservation up the chain, exactly like `tokenfuse-core::Ledger`. A denial names
+the blocked run (leaf or ancestor), so the gateway still reports "parent run X
+exceeded". Per-run `steps` are tracked in the SM and returned on the reservation.
 
 ## Not yet (follow-ups)
 
-- **Hierarchy + steps in the replicated SM** (see limitation above).
 - **Durable storage backend** (redb) behind the storage traits.
 - **`change_membership` join/leave** flow for rolling deploys (the API exposes
   `initialize`; add-learner/promote endpoints are the next increment).

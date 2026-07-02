@@ -64,6 +64,7 @@ async fn http_cluster_replicates_and_enforces() {
     n1.write(&Request::Open {
         run: run.into(),
         budget_micros: USD,
+        parent: None,
     })
     .await
     .unwrap()
@@ -128,6 +129,7 @@ async fn writes_routed_to_leader_from_any_node() {
     n1.write(&Request::Open {
         run: run.into(),
         budget_micros: USD,
+        parent: None,
     })
     .await
     .unwrap()
