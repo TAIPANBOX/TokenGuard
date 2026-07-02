@@ -3,6 +3,7 @@
 //! drive `app()` directly.
 
 pub mod backtestcli;
+pub mod embedder;
 pub mod estimate;
 pub mod obs;
 pub mod provider;

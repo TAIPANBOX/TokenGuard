@@ -120,7 +120,7 @@ async fn serve() {
         _ => tokenfuse_core::cache::CacheMode::Shadow,
     };
     state = state.with_cache(Arc::new(tokenfuse_core::SemanticCache::new(
-        Box::new(tokenfuse_core::cache::HashEmbedder::default()),
+        tokenfuse_gateway::embedder::build(),
         tokenfuse_core::cache::CacheConfig {
             mode: cache_mode,
             ..Default::default()
