@@ -262,10 +262,16 @@ Combine with `TOKENFUSE_CLUSTER_TOKEN` for authenticated, encrypted transport.
 Test `serves_over_https_with_token` (self-signed cert, HTTPS `/healthz` + token-
 gated `/mgmt/metrics`).
 
+## Linearizable reads (implemented)
+
+Local reads (`sm.read_run`) are eventually consistent. For a **linearizable**
+read, `HttpNode::read_run_linearizable` calls `ensure_linearizable()` (confirming
+leadership + a committed read index) and forwards to the leader if this node is a
+follower — exposed as `GET /api/read-linear/{run}` and the `Client::read_linear`
+helper. Test `linearizable_read_from_follower`.
+
 ## Not yet (follow-ups)
 
-- **Linearizable follower reads** via `ensure_linearizable()` + leader forward
-  (reads today are eventually-consistent local reads).
 - **mTLS / client-cert** auth (today: server TLS + shared bearer token).
 
 [openraft]: https://docs.rs/openraft

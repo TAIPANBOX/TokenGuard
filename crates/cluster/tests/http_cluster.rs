@@ -357,3 +357,38 @@ async fn serves_over_https_with_token() {
         .status()
         .is_success());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_read_from_follower() {
+    let urls = start_http_cluster().await;
+    let n1 = Client::new(urls[0].clone());
+    let n2 = Client::new(urls[1].clone());
+    n1.init().await.unwrap().unwrap();
+    assert!(wait_for_leader(&n1).await.is_some());
+
+    n1.write(&Request::Open {
+        run: "lin".into(),
+        budget_micros: USD,
+        parent: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    n1.write(&Request::Reserve {
+        run: "lin".into(),
+        micros: 20 * 10_000,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    // A linearizable read via node 2 (likely a follower) forwards to the leader
+    // and returns the committed value — no polling needed.
+    let s = n2
+        .read_linear("lin")
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("run must be visible via a linearizable read");
+    assert_eq!(s.reserved_micros, 20 * 10_000);
+}
