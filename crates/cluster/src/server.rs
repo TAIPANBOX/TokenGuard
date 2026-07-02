@@ -137,6 +137,31 @@ impl HttpNode {
             .map_err(|e| e.to_string())
     }
 
+    /// **Linearizable** read of a run: confirms leadership + a committed read
+    /// index before reading, and forwards to the leader if this node is a
+    /// follower. Stronger than [`sm.read_run`](crate::store::LedgerReader), which
+    /// is an eventually-consistent local read.
+    pub async fn read_run_linearizable(&self, run: &str) -> Result<Option<RunState>, String> {
+        use openraft::error::{CheckIsLeaderError, ForwardToLeader, RaftError};
+        match self.raft.ensure_linearizable().await {
+            Ok(_) => Ok(self.sm.read_run(run).await),
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
+                leader_id: Some(leader),
+                ..
+            }))) if leader != self.id => match self.peers.get(&leader) {
+                Some(base) => {
+                    let tok = self.token.as_ref().map(|t| t.to_string());
+                    match Client::with_token(base.clone(), tok).read_linear(run).await {
+                        Ok(inner) => inner,
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                None => Err(format!("no address for leader {leader}")),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Submit a write, transparently forwarding to the current leader over HTTP
     /// if this node is a follower. Returns the applied [`Response`] or a
     /// human-readable error. This keeps all openraft error handling inside the
@@ -210,6 +235,7 @@ pub fn router(node: Arc<HttpNode>) -> Router {
         .route("/mgmt/metrics", get(m_metrics))
         .route("/api/write", post(a_write))
         .route("/api/read/{run}", get(a_read))
+        .route("/api/read-linear/{run}", get(a_read_linear))
         .route_layer(middleware::from_fn_with_state(node.clone(), require_auth))
         .with_state(node.clone());
     let public = Router::new()
@@ -335,6 +361,13 @@ async fn a_read(State(n): State<Arc<HttpNode>>, Path(run): Path<String>) -> Json
     Json(n.sm.read_run(&run).await)
 }
 
+async fn a_read_linear(
+    State(n): State<Arc<HttpNode>>,
+    Path(run): Path<String>,
+) -> Json<Result<Option<RunState>, String>> {
+    Json(n.read_run_linearizable(&run).await)
+}
+
 // ---- thin client (for the demo binary and tests) --------------------------
 
 /// A minimal HTTP client for a node's management + application API.
@@ -417,6 +450,17 @@ impl Client {
 
     pub async fn read(&self, run: &str) -> Result<Option<RunState>, reqwest::Error> {
         self.get(&format!("/api/read/{run}"))
+            .send()
+            .await?
+            .json()
+            .await
+    }
+
+    pub async fn read_linear(
+        &self,
+        run: &str,
+    ) -> Result<Result<Option<RunState>, String>, reqwest::Error> {
+        self.get(&format!("/api/read-linear/{run}"))
             .send()
             .await?
             .json()
