@@ -133,6 +133,16 @@ async fn serve() {
     tracing::info!(mode = ?firewall.mode, "agent firewall");
     state = state.with_firewall(Arc::new(firewall));
 
+    // DLP: TOKENFUSE_DLP = off | shadow | mask | block (default off).
+    let dlp = match std::env::var("TOKENFUSE_DLP").as_deref() {
+        Ok("shadow") => tokenfuse_core::DlpMode::Shadow,
+        Ok("mask") => tokenfuse_core::DlpMode::Mask,
+        Ok("block") => tokenfuse_core::DlpMode::Block,
+        _ => tokenfuse_core::DlpMode::Off,
+    };
+    tracing::info!(?dlp, "secret scanning (DLP)");
+    state = state.with_dlp(dlp);
+
     // Opt in to the Parquet trace with TOKENFUSE_DATA_DIR; query it via
     // `tokenfuse sql "..."`. Without it, telemetry is a no-op.
     if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {

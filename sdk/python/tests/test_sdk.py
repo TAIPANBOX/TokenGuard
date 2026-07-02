@@ -80,6 +80,13 @@ def test_raise_for_fuse_taint_blocked_403():
     assert ei.value.run_id == "r6"
 
 
+def test_raise_for_fuse_dlp_blocked_403():
+    body = {"error": {"type": "dlp_blocked", "run_id": "r7", "reason": "1 secret(s): aws_access_key"}}
+    with pytest.raises(tokenfuse.DlpBlocked) as ei:
+        tokenfuse.raise_for_fuse(403, body)
+    assert ei.value.run_id == "r7"
+
+
 def test_check_response_duck_typed():
     class FakeResp:
         status_code = 402

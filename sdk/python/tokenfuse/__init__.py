@@ -39,6 +39,7 @@ __all__ = [
     "PolicyViolation",
     "Killed",
     "TaintBlocked",
+    "DlpBlocked",
 ]
 
 DEFAULT_GATEWAY = "http://127.0.0.1:4100"
@@ -121,12 +122,18 @@ class TaintBlocked(FuseError):
     (error type ``taint_blocked``, HTTP 403)."""
 
 
+class DlpBlocked(FuseError):
+    """A secret was detected in the prompt and the request was blocked
+    (error type ``dlp_blocked``, HTTP 403)."""
+
+
 _ERROR_TYPES: dict[str, type[FuseError]] = {
     "budget_exceeded": BudgetExceeded,
     "loop_detected": LoopDetected,
     "policy_violation": PolicyViolation,
     "killed": Killed,
     "taint_blocked": TaintBlocked,
+    "dlp_blocked": DlpBlocked,
 }
 
 # Statuses that carry a TokenFuse error contract: 402 (budget/policy) and

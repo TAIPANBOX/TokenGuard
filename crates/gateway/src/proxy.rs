@@ -20,7 +20,9 @@ use axum::response::Response;
 use futures::StreamExt;
 use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
-use tokenfuse_core::{evaluate, BudgetError, Microusd, Mode, Reservation, SemanticCache};
+use tokenfuse_core::{
+    dlp, evaluate, BudgetError, DlpMode, Microusd, Mode, Reservation, SemanticCache,
+};
 
 /// Where a non-streaming response should be cached after it settles.
 struct CacheCtx {
@@ -37,7 +39,7 @@ pub async fn healthz() -> &'static str {
 
 /// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
 /// as-is once the budget check passes.
-pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: Bytes) -> Response {
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let parsed = parse_request(&request);
@@ -73,6 +75,25 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
             &st.policy_id,
             "run killed by operator",
         );
+    }
+
+    // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
+    let mut dlp_note: Option<String> = None;
+    if st.dlp != DlpMode::Off {
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let findings = dlp::scan(&text);
+        if !findings.is_empty() {
+            let summary = dlp::summary(&findings);
+            match st.dlp {
+                DlpMode::Block => return dlp_block(&run_id, &summary),
+                DlpMode::Mask => {
+                    body = Bytes::from(dlp::redact(&text, &findings).into_bytes());
+                    dlp_note = Some(format!("masked {summary}"));
+                }
+                DlpMode::Shadow => dlp_note = Some(format!("found {summary}")),
+                DlpMode::Off => {}
+            }
+        }
     }
 
     // Semantic cache (non-streaming, tool-free requests only). A hit in `on`
@@ -220,12 +241,13 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     };
 
     if parsed.stream {
-        stream_managed(resp, reservation, would_block, &parsed.model, &st)
+        stream_managed(resp, reservation, would_block, dlp_note, &parsed.model, &st)
     } else {
         buffered_managed(
             resp,
             reservation,
             would_block,
+            dlp_note,
             &parsed.model,
             &st,
             cache_ctx,
@@ -243,6 +265,7 @@ fn stream_managed(
     resp: ProviderResponse,
     reservation: Reservation,
     would_block: Option<String>,
+    dlp_note: Option<String>,
     model: &str,
     st: &AppState,
 ) -> Response {
@@ -291,6 +314,9 @@ fn stream_managed(
     if let Some(reason) = would_block {
         builder = builder.header("x-fuse-would-block", reason);
     }
+    if let Some(note) = dlp_note {
+        builder = builder.header("x-fuse-dlp", note);
+    }
     builder
         .body(Body::from_stream(wrapped))
         .expect("valid response")
@@ -303,6 +329,7 @@ async fn buffered_managed(
     resp: ProviderResponse,
     reservation: Reservation,
     would_block: Option<String>,
+    dlp_note: Option<String>,
     model: &str,
     st: &AppState,
     cache_ctx: Option<CacheCtx>,
@@ -408,7 +435,30 @@ async fn buffered_managed(
     if let Some(note) = firewall_note {
         builder = builder.header("x-fuse-taint", format!("would-block: {note}"));
     }
+    if let Some(note) = dlp_note {
+        builder = builder.header("x-fuse-dlp", note);
+    }
     builder.body(Body::from(bytes)).expect("valid response")
+}
+
+/// DLP block: a secret was found in the outgoing prompt.
+fn dlp_block(run_id: &str, summary: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "dlp_blocked",
+            "run_id": run_id,
+            "reason": summary,
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-dlp", format!("blocked: {summary}"))
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
 }
 
 /// Firewall block: the model asked for a capability denied under the run's taint.
@@ -743,6 +793,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlp_block_stops_request_with_a_secret() {
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.dlp = DlpMode::Block;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"my key is AKIA1234567890ABCDEF"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "dlp")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "dlp_blocked");
+    }
+
+    #[tokio::test]
+    async fn dlp_shadow_flags_but_forwards() {
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.dlp = DlpMode::Shadow;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"key AKIA1234567890ABCDEF"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "dlp2")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("x-fuse-dlp"));
+    }
+
+    #[tokio::test]
     async fn firewall_blocks_exec_after_web_taint() {
         use crate::firewall::FirewallConfig;
         let mut st = state(
@@ -947,7 +1029,7 @@ mod tests {
             .await
             .unwrap();
 
-        let response = stream_managed(resp, reservation, None, "test-model", &st);
+        let response = stream_managed(resp, reservation, None, None, "test-model", &st);
         {
             // Consume a single chunk, then drop the stream (simulated cancel).
             let mut data = response.into_body().into_data_stream();
