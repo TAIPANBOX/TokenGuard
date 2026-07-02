@@ -1,8 +1,12 @@
 name: release
 
-# Build and publish the gateway container image to GitHub Container Registry
-# (ghcr.io) — so TokenFuse runs on any host or cloud with `docker run`, with no
-# dependence on a personal server. Uses the built-in GITHUB_TOKEN (no secrets).
+# Build and publish the container images to GitHub Container Registry (ghcr.io)
+# — so TokenFuse runs on any host or cloud with `docker run` / `docker compose`,
+# with no dependence on a personal server. Uses the built-in GITHUB_TOKEN.
+#
+# Images:
+#   ghcr.io/<owner>/tokenfuse                — the gateway (root Dockerfile)
+#   ghcr.io/<owner>/tokenfuse-control-plane  — the Cloud control plane
 on:
   push:
     tags: ["v*"]
@@ -14,8 +18,17 @@ permissions:
 
 jobs:
   image:
-    name: build + push image (ghcr.io)
+    name: build + push ${{ matrix.image }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: tokenfuse
+            context: .
+            dockerfile: Dockerfile
+          - image: tokenfuse-control-plane
+            context: cloud/control-plane
+            dockerfile: cloud/control-plane/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -29,7 +42,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
@@ -37,9 +50,10 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

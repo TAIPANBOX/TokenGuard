@@ -7,7 +7,9 @@
 # Runs anywhere Docker runs; no dedicated server.
 services:
   control-plane:
-    build: ./control-plane
+    image: ghcr.io/taipanbox/tokenfuse-control-plane:latest
+    # Or build locally instead of pulling: `docker compose build`
+    # build: ./control-plane
     environment:
       PORT: "8080"
       TOKENFUSE_CLOUD_KEYS: "devkey:demo"

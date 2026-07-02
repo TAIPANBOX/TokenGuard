@@ -61,14 +61,23 @@ TOKENFUSE_CLOUD_KEY=devkey \
 
 ## Run the whole stack
 
+Both images are published to GHCR, so nothing builds locally:
+
 ```bash
 cd cloud
-docker compose up
+docker compose up          # pulls ghcr.io/taipanbox/tokenfuse{,-control-plane}
 ```
 
 Brings up the control plane (`:8080`, with the dashboard) and a gateway (`:4100`)
 already wired to it. Open **http://localhost:8080**, enter `devkey`, send traffic
 through `:4100`, and watch runs + spend appear live.
+
+Run the control plane on its own anywhere:
+
+```bash
+docker run -p 8080:8080 -e TOKENFUSE_CLOUD_KEYS=devkey:acme \
+  ghcr.io/taipanbox/tokenfuse-control-plane
+```
 
 ## Verified end-to-end
 
