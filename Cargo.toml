@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gateway"]
+members = ["crates/core", "crates/gateway", "crates/tokenfuse"]
 # radar is Linux/eBPF-only (its own nested workspace); excluded so the default
 # build and macOS/CI stay light. Build it explicitly on Linux — see crates/radar.
 exclude = ["crates/radar", "crates/cluster"]

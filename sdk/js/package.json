@@ -1,0 +1,23 @@
+{
+  "name": "tokenfuse",
+  "version": "0.3.0",
+  "description": "JavaScript/TypeScript client helpers for TokenFuse — runtime cost control for AI agents.",
+  "keywords": ["llm", "agents", "finops", "budget", "tokenfuse"],
+  "license": "Apache-2.0",
+  "author": "Yurii Kostiuk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TAIPANBOX/tokenfuse.git",
+    "directory": "sdk/js"
+  },
+  "homepage": "https://github.com/TAIPANBOX/tokenfuse#readme",
+  "bugs": "https://github.com/TAIPANBOX/tokenfuse/issues",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=16" },
+  "scripts": {
+    "test": "node test.js"
+  }
+}

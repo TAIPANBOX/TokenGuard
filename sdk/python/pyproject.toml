@@ -4,16 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenfuse"
-version = "0.0.1"
+version = "0.3.0"
 description = "Python SDK for TokenFuse — runtime cost control for AI agents."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Yurii Kostiuk" }]
 keywords = ["llm", "agents", "finops", "budget", "tokenfuse"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
 
 [project.urls]
 Homepage = "https://github.com/TAIPANBOX/tokenfuse"
+Repository = "https://github.com/TAIPANBOX/tokenfuse"
+Issues = "https://github.com/TAIPANBOX/tokenfuse/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

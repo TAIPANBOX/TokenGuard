@@ -44,6 +44,18 @@ jobs:
         working-directory: sdk/python
         run: python -m pytest -q
 
+  js-sdk:
+    name: js sdk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test
+        working-directory: sdk/js
+        run: node test.js
+
   cloud:
     name: cloud (control plane · Go)
     runs-on: ubuntu-latest

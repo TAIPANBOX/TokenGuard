@@ -40,7 +40,10 @@ __all__ = [
     "Killed",
     "TaintBlocked",
     "DlpBlocked",
+    "__version__",
 ]
+
+__version__ = "0.3.0"
 
 DEFAULT_GATEWAY = "http://127.0.0.1:4100"
 
