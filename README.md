@@ -10,7 +10,7 @@
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
-![control%20plane](https://img.shields.io/badge/control%20plane-Go-00ADD8)
+![control%20plane](https://img.shields.io/badge/control%20plane-Rust-DEA584)
 ![dashboard](https://img.shields.io/badge/dashboard-Next.js-black)
 
 </div>
@@ -250,7 +250,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 
 **Ops & platform**
 - 🧬 **HA raft cluster** — replicated budgets, durable storage, runtime membership, token auth + TLS.
-- ☁️ **Hosted Cloud** — Go control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
+- ☁️ **Hosted Cloud** — Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
 - 🗄️ **Zero-DB analytics** — telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images.
 
@@ -258,7 +258,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 
 ## 🏗️ Architecture
 
-One fast **Rust** binary in the request path, a **Go** control plane for the Cloud, a **Next.js** dashboard. Telemetry lives in open **Parquet** files instead of a heavy database.
+One fast **Rust** binary in the request path, a **Rust** control plane for the Cloud, a **Next.js** dashboard. Telemetry lives in open **Parquet** files instead of a heavy database.
 
 ```mermaid
 flowchart TB

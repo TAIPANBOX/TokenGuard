@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -85,6 +85,7 @@ impl IntoResponse for AuthError {
 /// Build the control-plane router.
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route("/", get(dashboard))
         .route("/healthz", get(healthz))
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
@@ -100,6 +101,12 @@ pub fn app(state: AppState) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// `GET /` — the embedded zero-deploy dashboard (a self-contained vanilla
+/// HTML/JS page that calls the API with relative paths).
+async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("../index.html"))
 }
 
 #[derive(Deserialize)]

@@ -46,8 +46,8 @@ jobs:
               type=ref,event=tag,suffix=-cluster
           - name: tokenfuse-control-plane
             image: tokenfuse-control-plane
-            context: cloud/control-plane
-            dockerfile: cloud/control-plane/Dockerfile
+            context: .
+            dockerfile: crates/cloud/Dockerfile
             build-args: ""
             scope: control-plane
             tags: |

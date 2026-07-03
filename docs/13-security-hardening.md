@@ -57,7 +57,7 @@ an authentication provider. The two honest framings:
 | **Egress header allow-list** | `provider::FORWARD_HEADERS` | Only known headers are forwarded upstream; arbitrary client headers are dropped. |
 | **Cluster auth (bearer token)** | `crates/cluster` | Every endpoint except `/healthz` requires `Authorization: Bearer <token>`. |
 | **Cluster mutual TLS** | `server::serve_mtls` | Client-cert peer authentication over rustls `WebPkiClientVerifier`, on top of the token. |
-| **Cloud RBAC** | `cloud/control-plane` | `admin` vs `viewer` roles; mutations (kill, set-budget) require `admin`. Orgs isolated by key. |
+| **Cloud RBAC** | `crates/cloud` | `admin` vs `viewer` roles; mutations (kill, set-budget) require `admin`. Orgs isolated by key. |
 | **Secrets kept out of context** | MCP broker + DLP | `{{secret:NAME}}` handles injected only on the wire; raw-secret DLP on args; response redaction. See [12](12-mcp-credential-broker.md). |
 | **Dependency audit** | CI `security` job | `cargo audit` on every push/PR, for both the workspace and `crates/cluster`. |
 

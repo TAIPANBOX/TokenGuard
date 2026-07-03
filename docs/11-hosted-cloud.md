@@ -1,9 +1,10 @@
 # 11 · Hosted Cloud — a control plane across your gateways
 
-> Status: **v1 implemented** (`cloud/control-plane` + gateway `CloudSink`). A Go
+> Status: **v1 implemented** (`crates/cloud` + gateway `CloudSink`). A Rust
 > control plane ingests telemetry from many gateways and serves an aggregated,
 > per-organization view through an embedded web dashboard. Runs anywhere Docker
-> runs — no dedicated server.
+> runs — no dedicated server. (Originally a Go service; ported to Rust in the
+> Go→Rust consolidation — see [02-architecture.md](02-architecture.md), ADR-7.)
 
 ## Why
 
@@ -22,13 +23,13 @@ enforcement.
 ```
  gateway A ─┐  POST /v1/ingest {records:[…]}   (Bearer org-key)
  gateway B ─┼──────────────────────────────▶  ┌──────────────────────┐
- gateway C ─┘                                  │   control plane (Go) │
+ gateway C ─┘                                  │  control plane (Rust)│
                                                │  org → run aggregates│
  browser ──── GET / (dashboard) ───────────▶  │  + embedded dashboard │
           ─── GET /v1/runs, /v1/summary ────▶  └──────────────────────┘
 ```
 
-### Control plane (`cloud/control-plane`, Go, single static binary)
+### Control plane (`crates/cloud`, Rust/axum, single static binary)
 
 - **`POST /v1/ingest`** — a gateway pushes a batch of `CallRecord`s; the org is
   resolved from the `Authorization: Bearer <key>` header.
@@ -97,7 +98,7 @@ docker run -p 8080:8080 -e TOKENFUSE_CLOUD_KEYS=devkey:acme \
 
 Three managed calls through the gateway → the Cloud aggregated **3 runs / 3 calls
 / $0.0315**, per-run spend and last-seen correct; unauthenticated requests get
-`401`. Control plane: `go test` (aggregation, org isolation, auth, dashboard).
+`401`. Control plane: `cargo test -p tokenfuse-cloud` (aggregation, org isolation, auth, RBAC, alerts, persistence, dashboard).
 
 ## Kill from the cloud (implemented)
 
