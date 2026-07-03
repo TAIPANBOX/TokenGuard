@@ -15,30 +15,34 @@ struct PairView: View {
     var body: some View {
         ZStack {
             Palette.ink.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(spacing: 0) {
+                BrandMark(size: 82)
+                    .padding(.top, 12)
                 Spacer()
-                brand
-                VStack(alignment: .leading, spacing: 14) {
-                    field(label: "PLANE URL", text: $url, placeholder: "https://…")
-                    field(label: "PAIRING CODE", text: $code, placeholder: "8-char code")
-                }
-                if let error {
-                    Text(error).font(.mono).foregroundStyle(Palette.ember)
-                }
-                Button(action: pair) {
-                    HStack {
-                        if busy { ProgressView().tint(.white) }
-                        Text(busy ? "Pairing…" : "Pair this iPhone")
-                            .font(.system(size: 16, weight: .bold))
+                VStack(alignment: .leading, spacing: 20) {
+                    brand
+                    VStack(alignment: .leading, spacing: 14) {
+                        field(label: "PLANE URL", text: $url, placeholder: "https://…")
+                        field(label: "PAIRING CODE", text: $code, placeholder: "8-char code")
                     }
-                    .frame(maxWidth: .infinity).padding(.vertical, 14)
-                    .background(Palette.iris, in: RoundedRectangle(cornerRadius: 14))
-                    .foregroundStyle(.white)
-                }
-                .disabled(busy || url.isEmpty || code.isEmpty)
-                .opacity(busy || url.isEmpty || code.isEmpty ? 0.5 : 1)
+                    if let error {
+                        Text(error).font(.mono).foregroundStyle(Palette.ember)
+                    }
+                    Button(action: pair) {
+                        HStack {
+                            if busy { ProgressView().tint(.white) }
+                            Text(busy ? "Pairing…" : "Pair this iPhone")
+                                .font(.system(size: 16, weight: .bold))
+                        }
+                        .frame(maxWidth: .infinity).padding(.vertical, 14)
+                        .background(Palette.iris, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
+                    }
+                    .disabled(busy || url.isEmpty || code.isEmpty)
+                    .opacity(busy || url.isEmpty || code.isEmpty ? 0.5 : 1)
 
-                seal
+                    seal
+                }
                 Spacer()
             }
             .padding(22)
