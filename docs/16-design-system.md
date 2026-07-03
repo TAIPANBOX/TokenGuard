@@ -1,4 +1,4 @@
-# 16 — Design system: TokenFuse Pocket
+# 16 — Design system: TokenFuse
 
 **Status:** approved direction (2026-07-03). The single source of truth for the
 look of every surface — iOS app, Apple Watch, and the web dashboard. SwiftUI
@@ -9,7 +9,7 @@ from the tokens here. Interactive reference mockups live in
 
 ## Concept — "The Fuse Panel"
 
-A fuse carries current until it must break the circuit. TokenFuse Pocket is the
+A fuse carries current until it must break the circuit. TokenFuse is the
 panel where you watch the current (an agent's **burn rate**) and pull the
 breaker (**kill**). One instrument carries the identity across every screen and
 surface: the **fuse** — a burn meter that reads cool while you're under budget,

@@ -22,7 +22,7 @@
 | Cloud control plane | Rust: axum + utoipa (OpenAPI) — *superseded from Go, see ADR-7 and [14-mobile-companion.md](14-mobile-companion.md)* |
 | Dashboard | Next.js (client generated from the control-plane OpenAPI spec) |
 | SDK | Python + TypeScript (thin: base_url + headers + typed errors) |
-| Mobile | Swift 6 / SwiftUI (iOS 26 SDK) — TokenFuse Pocket, see [14-mobile-companion.md](14-mobile-companion.md) |
+| Mobile | Swift 6 / SwiftUI (iOS 26 SDK) — TokenFuse, see [14-mobile-companion.md](14-mobile-companion.md) |
 
 Language split: Rust — everything in the request path **and the Cloud control plane** (one server language, shared `tokenfuse_core` types); Next.js — web without heroics; Swift — the native mobile companion.
 

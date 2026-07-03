@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🧯 TokenFuse
+<img src="docs/assets/logo.png" width="76" alt="TokenFuse">
+
+# TokenFuse
 
 ### The runtime firewall for AI agents — enforce budgets, stop runaways, keep secrets out of the model.
 
@@ -30,7 +32,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard — fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity — <i>the fuse</i> — shared with the <a href="#-mobile-companion--tokenfuse-pocket">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The hosted Cloud dashboard — fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity — <i>the fuse</i> — shared with the <a href="#-tokenfuse-for-ios">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
 
 </div>
 
@@ -43,7 +45,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 - [How it works](#-how-it-works)
 - [How TokenFuse compares](#-how-tokenfuse-compares) ← vs. observability, gateways, guardrails
 - [What's inside](#-whats-inside)
-- [Mobile companion](#-mobile-companion--tokenfuse-pocket) ← the fleet in your pocket
+- [TokenFuse for iOS](#-tokenfuse-for-ios) ← the fleet on your phone
 - [Architecture](#-architecture)
 - [Project status](#-project-status)
 - [The bigger picture](#-the-bigger-picture-a-runtime-firewall)
@@ -74,7 +76,7 @@ Autonomous agents read untrusted web pages, call external **MCP** tools, and hol
 
 ```mermaid
 flowchart LR
-    A["🤖 Your AI agent"] -->|"just change base_url"| T["🧯 TokenFuse"]
+    A["🤖 Your AI agent"] -->|"just change base_url"| T["⚡ TokenFuse"]
     T -->|"forwards if OK"| P["☁️ LLM provider<br/>(Anthropic, OpenAI…)"]
     T -.->|"blocks if runaway"| X["🛑 402 stop"]
     T -.-> D["📊 Dashboard · alerts · reports"]
@@ -162,7 +164,7 @@ Every request flows through TokenFuse. It estimates the cost *before* the call, 
 ```mermaid
 sequenceDiagram
     participant A as 🤖 Agent
-    participant T as 🧯 TokenFuse
+    participant T as ⚡ TokenFuse
     participant L as ☁️ LLM provider
     A->>T: request (tagged with run id)
     T->>T: estimate cost + check budget & loops
@@ -200,7 +202,7 @@ There are excellent tools *around* this problem. None of them sit in the request
 
 ### Capability matrix
 
-| Capability | 🧯 TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
+| Capability | ⚡ TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
 |---|:---:|:---:|:---:|:---:|
 | Show how much you spent | ✅ | ✅ | ✅ | — |
 | Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ |
@@ -253,15 +255,15 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 **Ops & platform**
 - 🧬 **HA raft cluster** — replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud** — Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
-- 📱 **[Mobile companion](#-mobile-companion--tokenfuse-pocket)** (iOS) — pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
+- 📱 **[TokenFuse for iOS](#-tokenfuse-for-ios)** — pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
 - 🗄️ **Zero-DB analytics** — telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images.
 
 ---
 
-## 📱 Mobile companion — TokenFuse Pocket
+## 📱 TokenFuse for iOS
 
-<img align="right" width="88" src="docs/assets/pocket-icon.png" alt="TokenFuse Pocket app icon">
+<img align="right" width="88" src="docs/assets/logo.png" alt="TokenFuse app icon">
 
 A native **iOS** command deck for your fleet. Pair a device once, then watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** — the kill is *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Per-run budgets from your phone behind **Face ID**, live burn charts, and the burn rate in the **Dynamic Island** and on the Lock Screen.
 
@@ -322,7 +324,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-Since v0.3.0, the **[iOS companion](#-mobile-companion--tokenfuse-pocket)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity — one look across the browser and the phone.
+Since v0.3.0, **[TokenFuse for iOS](#-tokenfuse-for-ios)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity — one look across the browser and the phone.
 
 It has **not** yet had a production hardening pass or a security audit — treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
@@ -401,7 +403,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | [08 · Security extensions](docs/08-security-extensions.md) | MCP broker, RAG scanning, agent identity |
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
-| [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iOS app (TokenFuse Pocket) plan + wire protocol, and the shared "fuse" visual identity |
+| [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iOS app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
 
 ---
 

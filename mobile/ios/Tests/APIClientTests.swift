@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import TokenFusePocket
+@testable import TokenFuse
 
 /// A URLProtocol that answers requests from a canned handler — lets us test the
 /// client's decoding + auth without a network.

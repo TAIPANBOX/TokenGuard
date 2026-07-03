@@ -1,7 +1,7 @@
 import CryptoKit
 import XCTest
 
-@testable import TokenFusePocket
+@testable import TokenFuse
 
 /// The client crypto that authorizes mutations. Wire interop with the Rust
 /// server (p256) is proven live; these lock down the format + a sign/verify

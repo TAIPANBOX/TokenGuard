@@ -56,7 +56,7 @@ struct PairView: View {
 
     private var brand: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("TokenFuse Pocket").font(.instrument(30))
+            Text("TokenFuse").font(.instrument(30))
             Text("Hold the breaker on your agents.")
                 .font(.system(size: 15)).foregroundStyle(Palette.dim)
         }

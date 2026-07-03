@@ -1,7 +1,7 @@
 import SwiftData
 import XCTest
 
-@testable import TokenFusePocket
+@testable import TokenFuse
 
 @MainActor
 final class CacheTests: XCTestCase {

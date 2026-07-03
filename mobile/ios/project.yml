@@ -1,7 +1,7 @@
 # XcodeGen project spec — the .xcodeproj is generated, not committed, so it
 # stays reviewable as YAML (see docs/14-mobile-companion.md, ADR 14.6).
 #   brew install xcodegen && cd mobile/ios && xcodegen generate
-name: TokenFusePocket
+name: TokenFuse
 options:
   bundleIdPrefix: com.taipanbox.tokenfuse
   deploymentTarget:
@@ -17,7 +17,7 @@ settings:
     CODE_SIGNING_ALLOWED: NO
     CODE_SIGNING_REQUIRED: NO
 targets:
-  TokenFusePocket:
+  TokenFuse:
     type: application
     platform: iOS
     sources:
@@ -28,6 +28,8 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
+        # The name shown under the icon and in-app — matches the web dashboard.
+        CFBundleDisplayName: TokenFuse
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -39,7 +41,7 @@ targets:
           NSAllowsLocalNetworking: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -59,25 +61,25 @@ targets:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket.widget
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.widget
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "1,2"
-  TokenFusePocketTests:
+  TokenFuseTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - path: Tests
     dependencies:
-      - target: TokenFusePocket
+      - target: TokenFuse
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.tests
         GENERATE_INFOPLIST_FILE: YES
 schemes:
-  TokenFusePocket:
+  TokenFuse:
     build:
       targets:
-        TokenFusePocket: all
+        TokenFuse: all
     test:
       targets:
-        - TokenFusePocketTests
+        - TokenFuseTests

@@ -6,7 +6,7 @@ import Security
 /// (`errSecMissingEntitlement`, -34018), so it transparently falls back to a
 /// protected file in the app sandbox. A signed device always uses the Keychain.
 enum Keychain {
-    private static let service = "com.taipanbox.tokenfuse.pocket"
+    private static let service = "com.taipanbox.tokenfuse"
 
     static func set(_ data: Data, for account: String) {
         delete(account)

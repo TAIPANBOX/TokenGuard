@@ -1,4 +1,4 @@
-# 14 — Mobile Companion: TokenFuse Pocket (iOS)
+# 14 — Mobile Companion: TokenFuse (iOS)
 
 **Status:** approved plan, not started · **Written:** 2026-07-03 (architecture session)
 **Supersedes:** the "Go — Cloud control plane" decision in [02-architecture.md](02-architecture.md)
@@ -12,7 +12,7 @@ Read [PROGRESS.md](../PROGRESS.md) first for current code state.
 
 ## 1. Product
 
-**TokenFuse Pocket** — a native iOS command center for TokenFuse. Not a
+**TokenFuse** — a native iOS command center for TokenFuse. Not a
 dashboard-on-a-phone: an *enforcement* organ, consistent with the project's
 "enforcement, not observability" positioning.
 
@@ -42,7 +42,7 @@ Face-ID kill, Action-Button "physical agent kill switch", Apple Watch kill.
 | 14.7 | **Build with iOS 26 SDK, minimum deployment iOS 17.2** | Liquid Glass look comes free from the 26 SDK; 17.2 = ActivityKit push-to-start floor; Dynamic Island available since 16.1 |
 | 14.8 | Monorepo: app lives in **`mobile/ios/`** | Same `feat/* → PR → CI → merge` flow; CI jobs are already per-component |
 | 14.9 | **Rejected:** Swift-on-server (third ecosystem; OpenAPI solves type sharing better), gRPC/Connect (overkill), Flutter/KMP/RN (would forfeit Dynamic Island / Watch / Enclave / App Intents — i.e. the product), GraphQL/K8s |
-| 14.10 | Bundle ID `com.taipanbox.tokenfuse.pocket`; working name **TokenFuse Pocket** | Final App Store name decided at Phase C |
+| 14.10 | Bundle ID `com.taipanbox.tokenfuse`; working name **TokenFuse** | Final App Store name decided at Phase C |
 
 ## 3. Architecture
 
@@ -141,7 +141,7 @@ crypto layer must be a protocol (`SigningKey`) with two impls: `EnclaveKey`
   run is live and on terminal events; ends the Activity on kill/completion.
 - Env: `TOKENFUSE_APNS_KEY_PATH` (.p8), `TOKENFUSE_APNS_KEY_ID`,
   `TOKENFUSE_APNS_TEAM_ID`, `TOKENFUSE_APNS_TOPIC`
-  (`com.taipanbox.tokenfuse.pocket`), `TOKENFUSE_APNS_ENV=sandbox|production`.
+  (`com.taipanbox.tokenfuse`), `TOKENFUSE_APNS_ENV=sandbox|production`.
   Unset ⇒ push disabled, everything else works (fail-open, house style).
 - APNs must be behind a trait (`PushSender`) with a recording fake for tests;
   `a2` used only in the real impl.
@@ -200,11 +200,11 @@ Phase B exit: internal TestFlight build.
 |---|---|
 | C1 | Demo mode: `TOKENFUSE_CLOUD_DEMO=true` seeds synthetic orgs/runs with lifelike burn patterns (for TestFlight reviewers and **App Review demo account** — mandatory) |
 | C2 | Privacy manifest (`PrivacyInfo.xcprivacy`), App Store metadata under `mobile/ios/fastlane/metadata/` (text only; upload manual via Organizer — no fastlane dependency for MVP), screenshots checklist |
-| C3 | Release runbook `docs/15-pocket-release.md`: archive → notarize → TestFlight → external beta → submission; production APNs switch |
+| C3 | Release runbook `docs/15-release.md`: archive → notarize → TestFlight → external beta → submission; production APNs switch |
 
 **Human-only checklist (cannot be done by the agent):**
 - [ ] Apple Developer Program enrollment ($99/yr)
-- [ ] Create App ID / bundle `com.taipanbox.tokenfuse.pocket`, APNs `.p8` key (download once, store safely; give the agent only the path)
+- [ ] Create App ID / bundle `com.taipanbox.tokenfuse`, APNs `.p8` key (download once, store safely; give the agent only the path)
 - [ ] Xcode install (~40 GB) + license accept + one physical iPhone in dev mode
 - [ ] Decide production hosting for the plane (fly.io/Hetzner) + domain
 - [ ] App Store Connect: app record, pricing (free), review notes with demo org key

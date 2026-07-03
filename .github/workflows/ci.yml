@@ -187,8 +187,8 @@ jobs:
         working-directory: mobile/ios
         run: |
           xcodebuild build \
-            -project TokenFusePocket.xcodeproj \
-            -scheme TokenFusePocket \
+            -project TokenFuse.xcodeproj \
+            -scheme TokenFuse \
             -destination 'generic/platform=iOS Simulator' \
             -quiet \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
@@ -198,8 +198,8 @@ jobs:
           SIM=$(xcrun simctl list devices available | grep -m1 -oE 'iPhone [0-9]+( Pro)?' || echo 'iPhone 16')
           echo "Testing on: $SIM"
           xcodebuild test \
-            -project TokenFusePocket.xcodeproj \
-            -scheme TokenFusePocket \
+            -project TokenFuse.xcodeproj \
+            -scheme TokenFuse \
             -destination "platform=iOS Simulator,name=$SIM" \
             -quiet \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

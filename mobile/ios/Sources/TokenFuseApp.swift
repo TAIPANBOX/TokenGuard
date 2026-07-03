@@ -2,7 +2,7 @@ import SwiftData
 import SwiftUI
 
 @main
-struct TokenFusePocketApp: App {
+struct TokenFuseApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
