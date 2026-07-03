@@ -190,12 +190,14 @@ export default function Page() {
   const brand = (
     <div className="brand">
       <svg width="30" height="30" viewBox="0 0 34 34" fill="none" aria-hidden>
-        <rect x="1" y="1" width="32" height="32" rx="9" fill="#0D131B" stroke="rgba(255,255,255,.12)" />
-        <path d="M17 6 L11 19 H16 L14 28 L24 14 H18 L20 6 Z" fill="url(#g)" />
+        <rect x="1" y="1" width="32" height="32" rx="9" fill="url(#g)" />
+        <g transform="translate(17 17) scale(0.92) translate(-11 -12)">
+          <path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="none" stroke="#0A0E13"
+            strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
+        </g>
         <defs>
-          <linearGradient id="g" x1="10" y1="6" x2="24" y2="28">
-            <stop stopColor="#46E3B4" />
-            <stop offset=".55" stopColor="#F4B23E" />
+          <linearGradient id="g" x1="2" y1="2" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+            <stop stopColor="#F6B740" />
             <stop offset="1" stopColor="#FF574B" />
           </linearGradient>
         </defs>

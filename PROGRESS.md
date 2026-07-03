@@ -3,7 +3,7 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-03 (mobile companion: B9 — app icon + polish; **Phase B complete**; web dashboard restyled to the fuse identity; README + fresh visuals: real dashboard hero + app screenshot gallery; **renamed the iOS app "TokenFuse Pocket" → "TokenFuse"** to match the web, and unified the bolt emblem across README/app/web)
+**Last updated:** 2026-07-03 (mobile companion: B9 — app icon + polish; **Phase B complete**; web dashboard restyled to the fuse identity; README + fresh visuals: real dashboard hero + app screenshot gallery; **renamed the iOS app "TokenFuse Pocket" → "TokenFuse"** to match the web, and unified the bolt emblem across README/app/web — now an amber→ember tile with a black-keyline bolt, the same mark on the app icon, dashboard header, README and showcase)
 
 ## Current stage
 
