@@ -1,0 +1,31 @@
+name: publish npm
+
+# Manual publish of the `tokenfuse` npm package (sdk/js) to the public registry.
+#
+# Where to put the token:
+#   GitHub → repo Settings → Secrets and variables → Actions → New repository
+#   secret, name it exactly  NPM_TOKEN  and paste an npm *automation* token
+#   (npmjs.com → Access Tokens → Generate → Automation).
+#
+# Then run: Actions tab → "publish npm" → Run workflow. The token stays in the
+# encrypted secret; it is never written to the repo.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: build + publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test
+        working-directory: sdk/js
+        run: node test.js
+      - name: Publish to npm
+        working-directory: sdk/js
+        run: npm publish
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
