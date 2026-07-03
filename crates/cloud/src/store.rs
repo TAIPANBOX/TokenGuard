@@ -5,6 +5,7 @@
 //! docs/14-mobile-companion.md, PR A3.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,27 @@ struct Inner {
     killed: HashMap<String, HashMap<String, bool>>,
     /// org → run → central budget (microdollars)
     budgets: HashMap<String, HashMap<String, i64>>,
+    /// set on any mutation, cleared by autosave — avoids writing an unchanged file
+    dirty: bool,
+}
+
+/// On-disk snapshot of the whole store. Two shapes: a borrowing one for writing
+/// (no clone) and an owning one for reading.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    orgs: &'a HashMap<String, HashMap<String, RunAgg>>,
+    killed: &'a HashMap<String, HashMap<String, bool>>,
+    budgets: &'a HashMap<String, HashMap<String, i64>>,
+}
+
+#[derive(Default, Deserialize)]
+struct SnapshotOwned {
+    #[serde(default)]
+    orgs: HashMap<String, HashMap<String, RunAgg>>,
+    #[serde(default)]
+    killed: HashMap<String, HashMap<String, bool>>,
+    #[serde(default)]
+    budgets: HashMap<String, HashMap<String, i64>>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -90,6 +112,7 @@ impl Store {
     /// Fold a batch of records into an org's aggregates.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
         let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
         let runs = inner.orgs.entry(org.to_string()).or_default();
         for r in records {
             let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
@@ -149,6 +172,7 @@ impl Store {
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
         let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
         inner
             .killed
             .entry(org.to_string())
@@ -175,6 +199,7 @@ impl Store {
     /// this and apply it over the client-supplied budget.
     pub fn set_budget(&self, org: &str, run: &str, micros: i64) {
         let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
         inner
             .budgets
             .entry(org.to_string())
@@ -218,6 +243,69 @@ impl Store {
             }
         }
         out
+    }
+
+    /// Atomically write a JSON snapshot to `path` (private tmp file + rename).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let data = {
+            let inner = self.inner.read().unwrap();
+            let snap = SnapshotRef {
+                orgs: &inner.orgs,
+                killed: &inner.killed,
+                budgets: &inner.budgets,
+            };
+            serde_json::to_vec(&snap)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        };
+        let tmp = path.with_extension("tmp");
+        write_file_private(&tmp, &data)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load a snapshot from `path` into the store. A missing file is a clean
+    /// start, not an error.
+    pub fn load(&self, path: &Path) -> std::io::Result<()> {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let snap: SnapshotOwned = serde_json::from_slice(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut inner = self.inner.write().unwrap();
+        inner.orgs = snap.orgs;
+        inner.killed = snap.killed;
+        inner.budgets = snap.budgets;
+        Ok(())
+    }
+
+    /// Read and clear the dirty flag; an autosave loop saves only when `true`.
+    pub fn take_dirty(&self) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let d = inner.dirty;
+        inner.dirty = false;
+        d
+    }
+}
+
+/// Write `data` to `path` with owner-only permissions on unix (the snapshot can
+/// hold budget/kill state), a plain write elsewhere.
+fn write_file_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
     }
 }
 
@@ -314,5 +402,54 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].run_id, "r1");
         assert!((alerts[0].fraction - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-persist.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                model: "claude".into(),
+                cost_microusd: 1500,
+                step: 2,
+                ts_millis: 100,
+                ..Default::default()
+            }],
+        );
+        s.kill("acme", "r1");
+        s.set_budget("acme", "r1", 500_000);
+        s.save(&path).expect("save");
+
+        // A fresh store loads the snapshot and sees everything.
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let runs = s2.runs("acme");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].spent_microusd, 1500);
+        assert!(runs[0].killed);
+        assert_eq!(s2.budgets("acme")["r1"], 500_000);
+
+        // A missing file is a clean start, not an error.
+        let missing = dir.join(format!("tf-cloud-{}-nope.json", std::process::id()));
+        Store::new()
+            .load(&missing)
+            .expect("missing file should be ok");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dirty_flag_tracks_mutations() {
+        let s = Store::new();
+        assert!(!s.take_dirty(), "fresh store is clean");
+        s.ingest("acme", &[rec("r1", 1)]);
+        assert!(s.take_dirty(), "ingest marks dirty");
+        assert!(!s.take_dirty(), "take clears the flag");
     }
 }

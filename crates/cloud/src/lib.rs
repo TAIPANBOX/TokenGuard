@@ -9,4 +9,4 @@ pub mod store;
 
 pub use http::{app, AppState};
 pub use keys::{parse_keys, Principal};
-pub use store::Store;
+pub use store::{CallRecord, Store};

@@ -21,7 +21,7 @@ fn state_with(store: Arc<Store>) -> AppState {
             role: "admin".into(),
         },
     );
-    AppState::new(store, Arc::new(keys))
+    AppState::new(store, Arc::new(keys), 0.8)
 }
 
 #[tokio::test]
