@@ -75,6 +75,36 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.tests
         GENERATE_INFOPLIST_FILE: YES
+  # watchOS app — a standalone build for now (own bundle id, config via launch
+  # args / UserDefaults); W2 turns it into an iPhone-companion over WatchConnectivity.
+  # Reuses the design system, API layer and store from the iPhone sources.
+  TokenFuseWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - path: WatchApp
+      - path: Sources/APIModels.swift
+      - path: Sources/APIClient.swift
+      - path: Sources/DesignSystem.swift
+      - path: Sources/Fuse.swift
+      - path: Sources/RunsStore.swift
+      - path: Sources/CachedRun.swift
+      - path: Sources/LaunchArgs.swift
+    info:
+      path: WatchApp/Info.plist
+      properties:
+        WKApplication: true
+        # Standalone for now — no iPhone companion until W2 wires WatchConnectivity.
+        WKWatchOnly: true
+        CFBundleDisplayName: TokenFuse
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.watch
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "4"
 schemes:
   TokenFuse:
     build:
@@ -83,3 +113,7 @@ schemes:
     test:
       targets:
         - TokenFuseTests
+  TokenFuseWatch:
+    build:
+      targets:
+        TokenFuseWatch: all

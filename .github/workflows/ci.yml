@@ -203,3 +203,12 @@ jobs:
             -destination "platform=iOS Simulator,name=$SIM" \
             -quiet \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: Build watch app (simulator · no signing)
+        working-directory: mobile/ios
+        run: |
+          xcodebuild build \
+            -project TokenFuse.xcodeproj \
+            -scheme TokenFuseWatch \
+            -destination 'generic/platform=watchOS Simulator' \
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
