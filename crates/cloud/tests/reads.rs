@@ -129,6 +129,22 @@ async fn reads_require_a_valid_key() {
 }
 
 #[tokio::test]
+async fn dashboard_is_served_at_root() {
+    let (state, _) = test_state();
+    let resp = app(state)
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("TokenFuse Cloud"),
+        "dashboard HTML not served"
+    );
+}
+
+#[tokio::test]
 async fn cors_preflight_is_answered() {
     let (state, _) = test_state();
     let resp = app(state)

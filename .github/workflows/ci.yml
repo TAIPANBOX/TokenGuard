@@ -56,23 +56,9 @@ jobs:
         working-directory: sdk/js
         run: node test.js
 
-  cloud:
-    name: cloud (control plane · Go)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.23"
-      - name: gofmt
-        working-directory: cloud/control-plane
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - name: vet
-        working-directory: cloud/control-plane
-        run: go vet ./...
-      - name: test
-        working-directory: cloud/control-plane
-        run: go test ./...
+  # The Cloud control plane is now a Rust workspace member (crates/cloud); it is
+  # built, clippy-checked and tested by the `fmt · clippy · test` job above. The
+  # former Go `cloud` job was removed in the Go→Rust port (ADR-7, PR A5).
 
   dashboard:
     name: dashboard (Next.js)
