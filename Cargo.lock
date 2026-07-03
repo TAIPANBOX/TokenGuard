@@ -5438,6 +5438,20 @@ name = "tokenfuse"
 version = "0.3.0"
 
 [[package]]
+name = "tokenfuse-cloud"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tokenfuse-cluster"
 version = "0.0.1"
 dependencies = [
