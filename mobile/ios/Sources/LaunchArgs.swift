@@ -9,4 +9,8 @@ enum LaunchArgs {
         guard let index = args.firstIndex(of: key), index + 1 < args.count else { return nil }
         return args[index + 1]
     }
+
+    static func has(_ key: String) -> Bool {
+        ProcessInfo.processInfo.arguments.contains(key)
+    }
 }

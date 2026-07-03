@@ -28,9 +28,9 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <div align="center">
 
-<img src="docs/assets/dashboard.gif" alt="TokenFuse Cloud dashboard: live spend per run, with a runaway agent being killed" width="760">
+<img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard — live spend across your fleet, with a one-click kill-switch. `cd cloud && docker compose up`.</sub>
+<sub>The hosted Cloud dashboard — fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity — <i>the fuse</i> — shared with the <a href="#-mobile-companion--tokenfuse-pocket">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
 
 </div>
 
@@ -266,6 +266,21 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 A native **iOS** command deck for your fleet. Pair a device once, then watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** — the kill is *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Per-run budgets from your phone behind **Face ID**, live burn charts, and the burn rate in the **Dynamic Island** and on the Lock Screen.
 
 Built in **SwiftUI**, it shares one visual language — *the fuse* (mint → amber → ember) — with the [web dashboard](cloud/dashboard), and its API layer is generated from the same [`openapi.json`](mobile/ios/openapi.json) as the control plane. Runs on the simulator or a device with a free Apple ID — no paid account needed to try it.
+
+<table>
+<tr>
+<td width="25%"><img src="mobile/screenshots/pair.png" alt="Pair this iPhone — a signing key is generated on-device"></td>
+<td width="25%"><img src="mobile/screenshots/runs.png" alt="Fleet burn rate with live per-run fuses"></td>
+<td width="25%"><img src="mobile/screenshots/detail.png" alt="Run detail: burn chart and slide-to-arm kill breaker"></td>
+<td width="25%"><img src="mobile/screenshots/home-island.png" alt="Live burn rate in the Dynamic Island"></td>
+</tr>
+<tr>
+<td align="center"><sub>Pair once · key in the Enclave</sub></td>
+<td align="center"><sub>Fleet burn rate, live</sub></td>
+<td align="center"><sub>Burn chart · slide-to-arm kill</sub></td>
+<td align="center"><sub>Dynamic Island</sub></td>
+</tr>
+</table>
 
 → [Mobile plan & wire protocol](docs/14-mobile-companion.md) · [Design system](docs/16-design-system.md) · [interactive mockups](mobile/design/)
 

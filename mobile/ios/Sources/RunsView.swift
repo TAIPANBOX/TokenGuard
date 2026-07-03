@@ -52,7 +52,9 @@ struct RunsView: View {
             .task {
                 await reload()
                 openRunIfRequested()
-                await Notifications.requestIfNeeded()
+                if !LaunchArgs.has("-noNotifPrompt") {
+                    await Notifications.requestIfNeeded()
+                }
             }
             .onChange(of: Router.shared.openRun) { _, _ in openRunIfRequested() }
             .refreshable { await reload() }
