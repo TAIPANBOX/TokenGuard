@@ -7,8 +7,9 @@ name: publish npm
 #   secret, name it exactly  NPM_TOKEN  and paste an npm *automation* token
 #   (npmjs.com → Access Tokens → Generate → Automation).
 #
-# Then run: Actions tab → "publish npm" → Run workflow. The token stays in the
-# encrypted secret; it is never written to the repo.
+# Then run: Actions tab → "publish npm" → Run workflow. actions/setup-node wires
+# the token into a temporary .npmrc via NODE_AUTH_TOKEN — nothing is committed to
+# the repo, so it never shadows a local `npm login`.
 on:
   workflow_dispatch:
 
@@ -21,6 +22,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          registry-url: "https://registry.npmjs.org"
       - name: Test
         working-directory: sdk/js
         run: node test.js
@@ -28,4 +30,4 @@ jobs:
         working-directory: sdk/js
         run: npm publish
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
