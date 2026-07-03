@@ -144,8 +144,11 @@ struct RunsView: View {
                 Text("spent \(usd(summary.spentMicrousd.usd))")
                     .font(.mono).foregroundStyle(Palette.dim)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Fleet burn rate \(String(format: "%.2f", store.fleetRate)) dollars per minute, spent \(usd(summary.spentMicrousd.usd)) today")
             if !store.fleetSeries.isEmpty {
                 BurnChart(buckets: store.fleetSeries, compact: true)
+                    .accessibilityHidden(true)
             }
             if store.totalCapsMicros > 0 {
                 Fuse(fraction: summary.spentMicrousd.usd / store.totalCaps)
@@ -232,6 +235,22 @@ struct RunRow: View {
                 .stroke(over ? Palette.ember.opacity(0.35) : Palette.line)
         )
         .opacity(run.killed ? 0.55 : 1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityText)
+        .accessibilityHint("Opens the run")
+    }
+
+    private var accessibilityText: String {
+        var parts = ["Run \(run.agg.runId)"]
+        if !run.agg.model.isEmpty { parts.append(run.agg.model) }
+        parts.append("spent \(String(format: "$%.2f", run.spent))")
+        if let budget = run.budget { parts.append("of \(String(format: "$%.2f", budget))") }
+        if run.killed {
+            parts.append("killed")
+        } else if run.hasBudget {
+            parts.append(Heat.of(fraction: run.fraction).label)
+        }
+        return parts.joined(separator: ", ")
     }
 
     @ViewBuilder private func statusPill(heat: Heat) -> some View {

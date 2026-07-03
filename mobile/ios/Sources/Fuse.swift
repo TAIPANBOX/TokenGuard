@@ -22,10 +22,12 @@ struct Fuse: View {
                     )
                     .frame(width: max(4, min(1.0, fraction) * geo.size.width))
                     .shadow(color: heat.accent.opacity(0.5), radius: heat.glow)
+                    .animation(.easeOut(duration: 0.5), value: fraction)
             }
         }
         .frame(height: height)
         .overlay(Capsule().stroke(Palette.line, lineWidth: 1))
+        .accessibilityElement()
         .accessibilityLabel("Burn \(Int((fraction * 100).rounded())) percent of budget")
     }
 }
