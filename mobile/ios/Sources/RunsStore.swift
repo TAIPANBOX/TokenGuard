@@ -1,8 +1,9 @@
 import Foundation
 import Observation
+import SwiftData
 
 /// A run joined with its central budget, ready for display.
-struct RunDisplay: Identifiable, Sendable {
+struct RunDisplay: Identifiable, Sendable, Hashable {
     let agg: RunAgg
     let budgetMicros: Int64?
 
@@ -33,8 +34,17 @@ final class RunsStore {
 
     var totalCaps: Double { totalCapsMicros.usd }
 
-    func load(using client: APIClient) async {
-        if phase != .loaded { phase = .loading }
+    /// Load the fleet. On first entry the SwiftData cache is shown immediately
+    /// (instant / offline), then the plane is refreshed and the cache rewritten.
+    /// A network failure keeps the cached rows visible.
+    func load(using client: APIClient, org: String, context: ModelContext?) async {
+        if runs.isEmpty, let context, let cached = Self.readCache(org: org, context: context), !cached.isEmpty {
+            runs = cached
+            phase = .loaded
+        } else if phase != .loaded {
+            phase = .loading
+        }
+
         do {
             async let runsReq = client.runs()
             async let summaryReq = client.summary()
@@ -47,8 +57,23 @@ final class RunsStore {
                 .map { RunDisplay(agg: $0, budgetMicros: budgets[$0.runId]) }
                 .sorted { $0.fraction > $1.fraction }
             self.phase = .loaded
+            if let context { Self.writeCache(org: org, runs: self.runs, context: context) }
         } catch {
-            self.phase = .failed(error.localizedDescription)
+            // Keep showing the cache if we have it; only surface an error when bare.
+            if runs.isEmpty { self.phase = .failed(error.localizedDescription) }
         }
+    }
+
+    private static func readCache(org: String, context: ModelContext) -> [RunDisplay]? {
+        let descriptor = FetchDescriptor<CachedRun>(predicate: #Predicate { $0.org == org })
+        guard let cached = try? context.fetch(descriptor) else { return nil }
+        return cached.map(\.display).sorted { $0.fraction > $1.fraction }
+    }
+
+    private static func writeCache(org: String, runs: [RunDisplay], context: ModelContext) {
+        let descriptor = FetchDescriptor<CachedRun>(predicate: #Predicate { $0.org == org })
+        for stale in (try? context.fetch(descriptor)) ?? [] { context.delete(stale) }
+        for run in runs { context.insert(CachedRun(org: org, run: run)) }
+        try? context.save()
     }
 }

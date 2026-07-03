@@ -1,8 +1,10 @@
 import Foundation
 import Security
 
-/// Minimal Keychain wrapper for small secrets (the device token + signing key
-/// material), stored device-only and available when unlocked.
+/// Small-secret storage (device token + signing key material). Prefers the
+/// Keychain; on unsigned simulator/dev builds the Keychain lacks the entitlement
+/// (`errSecMissingEntitlement`, -34018), so it transparently falls back to a
+/// protected file in the app sandbox. A signed device always uses the Keychain.
 enum Keychain {
     private static let service = "com.taipanbox.tokenfuse.pocket"
 
@@ -15,7 +17,9 @@ enum Keychain {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
-        SecItemAdd(query as CFDictionary, nil)
+        if SecItemAdd(query as CFDictionary, nil) != errSecSuccess {
+            try? data.write(to: fallbackURL(account), options: [.completeFileProtection])
+        }
     }
 
     static func get(_ account: String) -> Data? {
@@ -27,8 +31,10 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data {
+            return data
+        }
+        return try? Data(contentsOf: fallbackURL(account))
     }
 
     static func delete(_ account: String) {
@@ -38,5 +44,13 @@ enum Keychain {
             kSecAttrAccount as String: account,
         ]
         SecItemDelete(query as CFDictionary)
+        try? FileManager.default.removeItem(at: fallbackURL(account))
+    }
+
+    private static func fallbackURL(_ account: String) -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("tf-secrets", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(account)
     }
 }

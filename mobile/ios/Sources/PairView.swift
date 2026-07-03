@@ -44,6 +44,14 @@ struct PairView: View {
             .padding(22)
         }
         .foregroundStyle(Palette.fg)
+        .task {
+            // Screenshot / UI-check hook: pair automatically from launch args.
+            if !busy, let u = LaunchArgs.value("-autoPairURL"), let c = LaunchArgs.value("-autoPairCode") {
+                url = u
+                code = c
+                pair()
+            }
+        }
     }
 
     private var brand: some View {
