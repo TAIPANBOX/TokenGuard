@@ -1,3 +1,4 @@
+@preconcurrency import ActivityKit
 import SwiftUI
 
 /// One run in full: a big instrument readout, the fuse, stats, the slide-to-arm
@@ -14,6 +15,7 @@ struct RunDetailView: View {
     @State private var showBudget = false
     @State private var series: [SeriesBucket] = []
     @State private var rate: Double = 0
+    @State private var activity: Activity<BurnAttributes>?
 
     private var heat: Heat { Heat.of(fraction: run.fraction) }
 
@@ -33,6 +35,10 @@ struct RunDetailView: View {
         .task {
             series = (try? await account.reads.series(run: run.agg.runId, window: "1h", step: "60s")) ?? []
             rate = series.burnRatePerMin(stepSeconds: 60)
+            // Screenshot hook: auto-start the Live Activity for this run.
+            if LaunchArgs.value("-liveRun") == run.agg.runId, activity == nil {
+                activity = LiveBurn.start(run: run, org: account.session.org, rate: rate)
+            }
         }
         .foregroundStyle(Palette.fg)
         .navigationBarTitleDisplayMode(.inline)
@@ -110,20 +116,39 @@ struct RunDetailView: View {
             Text("Kill is signed by this device · Face ID")
                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.faint)
 
-            Button {
-                showBudget = true
-            } label: {
-                HStack {
-                    Image(systemName: "dial.min")
-                    Text("Set budget")
+            HStack(spacing: 10) {
+                secondaryButton(icon: "dial.min", title: "Set budget") { showBudget = true }
+                if LiveBurn.isAvailable {
+                    secondaryButton(
+                        icon: activity == nil ? "bolt.badge.clock" : "stop.circle",
+                        title: activity == nil ? "Live Activity" : "Stop"
+                    ) { toggleLiveActivity() }
                 }
-                .font(.system(size: 15, weight: .semibold))
-                .frame(maxWidth: .infinity).padding(.vertical, 13)
-                .foregroundStyle(Palette.iris)
-                .background(Palette.panel, in: RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.line))
             }
-            .disabled(busy)
+        }
+    }
+
+    private func secondaryButton(icon: String, title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Image(systemName: icon)
+                Text(title)
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .frame(maxWidth: .infinity).padding(.vertical, 13)
+            .foregroundStyle(Palette.iris)
+            .background(Palette.panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.line))
+        }
+        .disabled(busy)
+    }
+
+    private func toggleLiveActivity() {
+        if let current = activity {
+            activity = nil
+            Task { await LiveBurn.end(current) }
+        } else {
+            activity = LiveBurn.start(run: run, org: account.session.org, rate: rate)
         }
     }
 
