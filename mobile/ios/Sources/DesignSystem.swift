@@ -75,6 +75,53 @@ enum Heat: Equatable {
     }
 }
 
+/// The TokenFuse emblem — an amber→ember tile with a black-keyline bolt whose
+/// interior is the ground showing through. The same mark as the app icon, the
+/// web dashboard and the README. Drawn natively so it stays crisp at any size.
+struct BrandMark: View {
+    var size: CGFloat = 80
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.2237, style: .continuous)
+            .fill(
+                LinearGradient(
+                    colors: [Color(hex: 0xF6B740), Color(hex: 0xFF574B)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing
+                )
+            )
+            .overlay(
+                BoltShape()
+                    .stroke(Palette.ink, style: StrokeStyle(
+                        lineWidth: size * 0.07, lineCap: .round, lineJoin: .round))
+                    .padding(size * 0.18)
+            )
+            .frame(width: size, height: size)
+            .shadow(color: Color(hex: 0xF6B740).opacity(0.28), radius: size * 0.16, y: size * 0.04)
+            .accessibilityLabel("TokenFuse")
+    }
+}
+
+/// Lucide "zap" bolt (`M13 2 4 14h6l-1 8 9-12h-6z`), drawn in a 24-unit box and
+/// fitted, centred, into the given rect.
+struct BoltShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let pts: [CGPoint] = [
+            .init(x: 13, y: 2), .init(x: 4, y: 14), .init(x: 10, y: 14),
+            .init(x: 9, y: 22), .init(x: 18, y: 10), .init(x: 12, y: 10),
+        ]
+        let s = min(rect.width, rect.height) / 24
+        let ox = rect.minX + (rect.width - 24 * s) / 2
+        let oy = rect.minY + (rect.height - 24 * s) / 2
+        var p = Path()
+        for (i, pt) in pts.enumerated() {
+            let cp = CGPoint(x: ox + pt.x * s, y: oy + pt.y * s)
+            if i == 0 { p.move(to: cp) } else { p.addLine(to: cp) }
+        }
+        p.closeSubpath()
+        return p
+    }
+}
+
 extension Font {
     /// Big tabular instrument number — the number is the display typography.
     static func instrument(_ size: CGFloat) -> Font {
