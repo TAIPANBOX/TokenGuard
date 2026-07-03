@@ -24,7 +24,17 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+# APNs push (real sender) — only pulled in with `--features apns`.
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "http2",
+] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[features]
+# Build the real APNs client; needs `p256` PKCS#8/PEM for the provider JWT key.
+apns = ["dep:reqwest", "p256/pkcs8", "p256/pem"]

@@ -160,3 +160,15 @@ jobs:
       - name: Build radar
         working-directory: crates/radar
         run: cargo build
+
+  apns:
+    name: cloud apns (feature build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + clippy the real APNs sender
+        run: cargo clippy -p tokenfuse-cloud --all-targets --features apns -- -D warnings

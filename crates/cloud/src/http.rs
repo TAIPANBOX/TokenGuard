@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::devices;
+use crate::devices::{self, Device};
 use crate::keys::Principal;
 use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
 
@@ -41,7 +41,7 @@ use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
     ),
     paths(
         ingest, runs, summary, alerts, series, kill, kills, set_budget, budgets,
-        pair_new, pair,
+        pair_new, pair, register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
@@ -59,12 +59,16 @@ use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
         PairNewResponse,
         PairRequest,
         PairResponse,
+        ApnsBody,
+        ActivityBody,
+        OkResponse,
     )),
     tags(
         (name = "telemetry", description = "Ingest of gateway call records"),
         (name = "reads", description = "Aggregated per-org views"),
         (name = "mutations", description = "Operator actions (admin only)"),
         (name = "pairing", description = "Device pairing + Enclave-signed auth"),
+        (name = "devices", description = "Per-device push registration (signed)"),
     )
 )]
 struct ApiDoc;
@@ -117,36 +121,23 @@ impl AppState {
         }
     }
 
-    /// Authorize a mutation. Two accepted paths:
-    /// 1. an **admin org key** (dashboard/CLI) — no signature; or
-    /// 2. a **paired admin device**: `device_token` + a valid ES256 signature
-    ///    over the canonical string (docs/14 §4.2), fresh timestamp, unseen
-    ///    nonce. Returns the org, or an [`AuthError`].
-    fn authorize_mutation(
+    /// Verify a paired device's ES256 signature over the canonical string
+    /// (docs/14 §4.2): device known, `X-Fuse-Device` matches, `|now-ts| <= 120s`,
+    /// signature valid, and nonce unseen (checked last, so only valid requests
+    /// spend a nonce). Returns the device on success.
+    fn verify_device_signature(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
         headers: &HeaderMap,
-    ) -> Result<String, AuthError> {
+    ) -> Result<Device, AuthError> {
         let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
-
-        // Path 1: org key.
-        if let Some(p) = self.keys.get(token) {
-            if p.role != "admin" {
-                return Err(AuthError::Forbidden);
-            }
-            return Ok(p.org.clone());
-        }
-
-        // Path 2: paired device with an Enclave signature.
         let device = self
             .store
             .device_by_token(token)
             .ok_or(AuthError::Unauthorized)?;
-        if device.role != "admin" {
-            return Err(AuthError::Forbidden);
-        }
+
         let dev_hdr = header_str(headers, "x-fuse-device").ok_or(AuthError::SignatureInvalid)?;
         if dev_hdr != device.device_id {
             return Err(AuthError::SignatureInvalid);
@@ -160,7 +151,6 @@ impl AppState {
             return Err(AuthError::SignatureInvalid);
         }
 
-        // Verify the signature before spending the nonce.
         let canonical = devices::canonical_string(method, path, body, ts, nonce);
         if !devices::verify_signature(&device.pubkey_b64, &canonical, sig) {
             return Err(AuthError::SignatureInvalid);
@@ -168,7 +158,43 @@ impl AppState {
         if !self.store.check_and_record_nonce(&device.device_id, nonce) {
             return Err(AuthError::SignatureInvalid);
         }
+        Ok(device)
+    }
+
+    /// Authorize a mutation. Two accepted paths:
+    /// 1. an **admin org key** (dashboard/CLI) — no signature; or
+    /// 2. a **paired admin device** with a valid Enclave signature.
+    fn authorize_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        headers: &HeaderMap,
+    ) -> Result<String, AuthError> {
+        let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
+        if let Some(p) = self.keys.get(token) {
+            if p.role != "admin" {
+                return Err(AuthError::Forbidden);
+            }
+            return Ok(p.org.clone());
+        }
+        let device = self.verify_device_signature(method, path, body, headers)?;
+        if device.role != "admin" {
+            return Err(AuthError::Forbidden);
+        }
         Ok(device.org)
+    }
+
+    /// Authorize a device managing **its own** state (APNs token, activities):
+    /// a valid Enclave signature from any paired device (no admin requirement).
+    fn authorize_device(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        headers: &HeaderMap,
+    ) -> Result<Device, AuthError> {
+        self.verify_device_signature(method, path, body, headers)
     }
 }
 
@@ -207,6 +233,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/budgets", get(budgets))
         .route("/v1/pair/new", post(pair_new))
         .route("/v1/pair", post(pair))
+        .route("/v1/devices/{id}/apns", post(register_apns))
+        .route("/v1/devices/{id}/activity", post(register_activity))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }
@@ -289,6 +317,25 @@ struct PairResponse {
     org: String,
     role: String,
     device_token: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ApnsBody {
+    /// APNs device token (hex) for push delivery.
+    token: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ActivityBody {
+    /// ActivityKit push-to-update token.
+    activity_token: String,
+    /// The run this Live Activity tracks.
+    run_id: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct OkResponse {
+    ok: bool,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -609,6 +656,78 @@ async fn pair(State(st): State<AppState>, body: Bytes) -> Response {
             .into_response(),
         None => error(StatusCode::BAD_REQUEST, "invalid or expired pairing code"),
     }
+}
+
+/// Register/refresh a device's APNs token (device-signed; `{id}` must be the
+/// signing device).
+#[utoipa::path(
+    post, path = "/v1/devices/{id}/apns",
+    params(("id" = String, Path, description = "device id")),
+    request_body = ApnsBody,
+    responses(
+        (status = 200, description = "token registered", body = OkResponse),
+        (status = 403, description = "signature invalid / not this device", body = ErrorResponse),
+        (status = 404, description = "unknown device", body = ErrorResponse),
+    ),
+    tag = "devices"
+)]
+async fn register_apns(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let device = match st.authorize_device("POST", uri.path(), &body, &headers) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
+    if device.device_id != id {
+        return error(StatusCode::FORBIDDEN, "signature_invalid");
+    }
+    let req: ApnsBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_json(),
+    };
+    if st.store.set_apns_token(&id, &req.token) {
+        (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "unknown device")
+    }
+}
+
+/// Register a Live Activity push token for a run (device-signed).
+#[utoipa::path(
+    post, path = "/v1/devices/{id}/activity",
+    params(("id" = String, Path, description = "device id")),
+    request_body = ActivityBody,
+    responses(
+        (status = 200, description = "activity registered", body = OkResponse),
+        (status = 403, description = "signature invalid / not this device", body = ErrorResponse),
+    ),
+    tag = "devices"
+)]
+async fn register_activity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let device = match st.authorize_device("POST", uri.path(), &body, &headers) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
+    if device.device_id != id {
+        return error(StatusCode::FORBIDDEN, "signature_invalid");
+    }
+    let req: ActivityBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_json(),
+    };
+    st.store
+        .register_activity(&device.org, &req.run_id, &req.activity_token);
+    (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
 }
 
 // ---- helpers --------------------------------------------------------------

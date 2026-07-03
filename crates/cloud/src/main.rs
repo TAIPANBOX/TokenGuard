@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokenfuse_cloud::{app, openapi_spec, parse_keys, AppState, Store};
+use tokenfuse_cloud::{
+    app, openapi_spec, parse_keys, AppState, NullSender, PushPipeline, PushSender, Store,
+};
 
 #[tokio::main]
 async fn main() {
@@ -60,6 +62,11 @@ async fn main() {
         }
     }
 
+    // Push pipeline: turn store change events into APNs pushes + Live Activity
+    // updates. Without APNs configured it uses a no-op sender (fail-open).
+    let sender: Arc<dyn PushSender> = build_push_sender();
+    Arc::new(PushPipeline::new(Arc::clone(&store), sender, alert_pct)).spawn();
+
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct);
 
     let addr = format!("0.0.0.0:{port}");
@@ -70,4 +77,20 @@ async fn main() {
     axum::serve(listener, app(state))
         .await
         .expect("serve control plane");
+}
+
+/// The APNs sender, if the `apns` feature is built and the environment is
+/// configured; otherwise a no-op sender (push disabled, everything else works).
+fn build_push_sender() -> Arc<dyn PushSender> {
+    #[cfg(feature = "apns")]
+    {
+        match tokenfuse_cloud::apns::ApnsSender::from_env() {
+            Some(sender) => {
+                tracing::info!("APNs push enabled");
+                return Arc::new(sender);
+            }
+            None => tracing::info!("APNs env not set — push disabled"),
+        }
+    }
+    Arc::new(NullSender)
 }

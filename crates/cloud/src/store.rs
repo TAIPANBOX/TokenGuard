@@ -158,6 +158,8 @@ struct Inner {
     pairings: HashMap<String, Pairing>,
     /// device_id → recent nonces for replay defense (ephemeral)
     nonces: HashMap<String, VecDeque<String>>,
+    /// org → run → Live Activity push tokens (ephemeral)
+    activities: HashMap<String, HashMap<String, Vec<String>>>,
     /// set on any mutation, cleared by autosave — avoids writing an unchanged file
     dirty: bool,
 }
@@ -517,6 +519,7 @@ impl Store {
             name,
             platform,
             pubkey_b64,
+            apns_token: None,
         };
         inner.dirty = true;
         inner.devices.insert(token, device.clone());
@@ -541,6 +544,70 @@ impl Store {
             seen.pop_front();
         }
         true
+    }
+
+    /// All devices belonging to an org (for fan-out push).
+    pub fn devices_for_org(&self, org: &str) -> Vec<Device> {
+        self.inner
+            .read()
+            .unwrap()
+            .devices
+            .values()
+            .filter(|d| d.org == org)
+            .cloned()
+            .collect()
+    }
+
+    /// Set a device's APNs token (looked up by `device_id`). Returns whether the
+    /// device was found.
+    pub fn set_apns_token(&self, device_id: &str, token: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut found = false;
+        for d in inner.devices.values_mut() {
+            if d.device_id == device_id {
+                d.apns_token = Some(token.to_string());
+                found = true;
+                break;
+            }
+        }
+        if found {
+            inner.dirty = true;
+        }
+        found
+    }
+
+    /// Register a Live Activity push token for a run.
+    pub fn register_activity(&self, org: &str, run: &str, activity_token: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .activities
+            .entry(org.to_string())
+            .or_default()
+            .entry(run.to_string())
+            .or_default()
+            .push(activity_token.to_string());
+    }
+
+    /// The Live Activity push tokens registered for a run.
+    pub fn activities_for_run(&self, org: &str, run: &str) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .activities
+            .get(org)
+            .and_then(|m| m.get(run))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Directly insert a device keyed by token — test helper.
+    #[cfg(test)]
+    pub(crate) fn insert_device_for_test(&self, token: &str, device: Device) {
+        self.inner
+            .write()
+            .unwrap()
+            .devices
+            .insert(token.to_string(), device);
     }
 
     /// Read and clear the dirty flag; an autosave loop saves only when `true`.

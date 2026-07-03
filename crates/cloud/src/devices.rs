@@ -30,6 +30,9 @@ pub struct Device {
     pub platform: String,
     /// Public key, base64 SEC1/X9.63 (as received at pairing).
     pub pubkey_b64: String,
+    /// APNs device token for push, if the device has registered one.
+    #[serde(default)]
+    pub apns_token: Option<String>,
 }
 
 /// A pending one-time pairing code (org/role are fixed by the issuing admin).

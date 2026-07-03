@@ -209,3 +209,62 @@ async fn org_key_admin_still_mutates_without_a_signature() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v["killed"], "r9");
 }
+
+/// A signed POST to `path` with `body` from a paired device.
+fn signed_post(
+    sk: &SigningKey,
+    device_id: &str,
+    token: &str,
+    path: &str,
+    body: &str,
+    ts: i64,
+    nonce: &str,
+) -> Request<Body> {
+    let canonical = canonical_string("POST", path, body.as_bytes(), &ts.to_string(), nonce);
+    let sig: Signature = sk.sign(canonical.as_bytes());
+    Request::post(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-fuse-device", device_id)
+        .header("x-fuse-ts", ts.to_string())
+        .header("x-fuse-nonce", nonce)
+        .header("x-fuse-sig", STANDARD.encode(sig.to_bytes()))
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn device_registers_its_apns_token() {
+    let state = state();
+    let (sk, pubkey) = keypair();
+    let (device_id, token) = pair_device(&state, &pubkey, None).await;
+
+    let body = r#"{"token":"apns-abc"}"#;
+    let path = format!("/v1/devices/{device_id}/apns");
+    let (st, v) = send(
+        &state,
+        signed_post(&sk, &device_id, &token, &path, body, now_unix(), "n-apns"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "apns register failed: {v}");
+
+    let devices = state.store.devices_for_org("acme");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].apns_token.as_deref(), Some("apns-abc"));
+}
+
+#[tokio::test]
+async fn cannot_register_apns_for_a_different_device_id() {
+    let state = state();
+    let (sk, pubkey) = keypair();
+    let (device_id, token) = pair_device(&state, &pubkey, None).await;
+
+    // Sign for the wrong device id in the path; X-Fuse-Device is the real one.
+    let body = r#"{"token":"apns-abc"}"#;
+    let path = "/v1/devices/someone-else/apns";
+    let (st, _) = send(
+        &state,
+        signed_post(&sk, &device_id, &token, path, body, now_unix(), "n-apns2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
