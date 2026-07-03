@@ -1,17 +1,17 @@
 import SwiftUI
 
-/// One run in full: a big instrument readout, the fuse, stats, and a signed
-/// Kill. (Swift Charts burn history joins in B6; the slide-to-arm + Face ID
-/// gate is B5.)
+/// One run in full: a big instrument readout, the fuse, stats, the slide-to-arm
+/// kill breaker (Face ID + signed on-device), and Set budget. (Swift Charts burn
+/// history joins in B6.)
 struct RunDetailView: View {
     let run: RunDisplay
     let account: Account
     var onMutated: () async -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var confirmKill = false
     @State private var busy = false
     @State private var error: String?
+    @State private var showBudget = false
 
     private var heat: Heat { Heat.of(fraction: run.fraction) }
 
@@ -22,7 +22,7 @@ struct RunDetailView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     gauge
                     stats
-                    if !run.killed { killButton }
+                    if !run.killed { actions }
                 }
                 .padding(20)
             }
@@ -34,13 +34,10 @@ struct RunDetailView: View {
                 Text(run.agg.runId).font(.system(.body, design: .monospaced)).foregroundStyle(Palette.dim)
             }
         }
-        .alert("Kill run \(run.agg.runId)?", isPresented: $confirmKill) {
-            Button("Kill", role: .destructive) { kill() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Signed on this iPhone and enforced across every gateway.")
+        .sheet(isPresented: $showBudget) {
+            BudgetSheet(run: run) { usd in setBudget(usd) }
         }
-        .alert("Couldn't kill the run", isPresented: errorBinding) {
+        .alert("Something went wrong", isPresented: errorBinding) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(error ?? "")
@@ -75,30 +72,27 @@ struct RunDetailView: View {
         }
     }
 
-    private var killButton: some View {
-        Button {
-            confirmKill = true
-        } label: {
-            HStack {
-                if busy { ProgressView().tint(.white) }
-                Image(systemName: "bolt.slash.fill")
-                Text(busy ? "Killing…" : "Kill run")
-            }
-            .font(.system(size: 16, weight: .bold))
-            .frame(maxWidth: .infinity).padding(.vertical, 15)
-            .background(
-                LinearGradient(colors: [Color(hex: 0xFF6B60), Color(hex: 0xE23E33)],
-                               startPoint: .top, endPoint: .bottom),
-                in: RoundedRectangle(cornerRadius: 16)
-            )
-            .foregroundStyle(.white)
-        }
-        .disabled(busy)
-        .padding(.top, 6)
-        .overlay(alignment: .bottom) {
-            Text("Signed by this device")
+    private var actions: some View {
+        VStack(spacing: 16) {
+            BreakerView { armAndKill() }
+                .padding(.top, 4)
+            Text("Kill is signed by this device · Face ID")
                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.faint)
-                .offset(y: 22)
+
+            Button {
+                showBudget = true
+            } label: {
+                HStack {
+                    Image(systemName: "dial.min")
+                    Text("Set budget")
+                }
+                .font(.system(size: 15, weight: .semibold))
+                .frame(maxWidth: .infinity).padding(.vertical, 13)
+                .foregroundStyle(Palette.iris)
+                .background(Palette.panel, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.line))
+            }
+            .disabled(busy)
         }
     }
 
@@ -106,11 +100,27 @@ struct RunDetailView: View {
         Binding(get: { error != nil }, set: { if !$0 { error = nil } })
     }
 
-    private func kill() {
-        busy = true
+    private func armAndKill() {
         Task {
+            guard await Biometrics.confirm(reason: "Kill run \(run.agg.runId)") else { return }
+            busy = true
             do {
                 try await account.kill(run: run.agg.runId)
+                await onMutated()
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+                busy = false
+            }
+        }
+    }
+
+    private func setBudget(_ usd: Double) {
+        Task {
+            guard await Biometrics.confirm(reason: "Set budget for \(run.agg.runId)") else { return }
+            busy = true
+            do {
+                try await account.setBudget(run: run.agg.runId, usd: usd)
                 await onMutated()
                 dismiss()
             } catch {
@@ -136,5 +146,55 @@ struct StatTile: View {
         .padding(12)
         .background(Color(hex: 0x0C1117), in: RoundedRectangle(cornerRadius: 13))
         .overlay(RoundedRectangle(cornerRadius: 13).stroke(Palette.line))
+    }
+}
+
+/// Enter a central budget (USD) for a run.
+struct BudgetSheet: View {
+    let run: RunDisplay
+    var onSet: (Double) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+
+    private var amount: Double? { Double(text.trimmingCharacters(in: .whitespaces)) }
+
+    var body: some View {
+        ZStack {
+            Palette.ink.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Set budget")
+                    .font(.instrument(26))
+                Text("Cap for run \(run.agg.runId), enforced across every gateway.")
+                    .font(.mono).foregroundStyle(Palette.dim)
+
+                HStack(spacing: 8) {
+                    Text("$").font(.instrument(34)).foregroundStyle(Palette.amber)
+                    TextField("0.00", text: $text)
+                        .font(.instrument(34)).monospacedDigit()
+                        .keyboardType(.decimalPad)
+                }
+                .padding(14)
+                .background(Palette.panel, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.line))
+
+                Button {
+                    if let amount { dismiss(); onSet(amount) }
+                } label: {
+                    Text("Set · Face ID")
+                        .font(.system(size: 16, weight: .bold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 14)
+                        .background(Palette.iris, in: RoundedRectangle(cornerRadius: 14))
+                        .foregroundStyle(.white)
+                }
+                .disabled(amount == nil)
+                .opacity(amount == nil ? 0.5 : 1)
+                Spacer()
+            }
+            .padding(22)
+        }
+        .foregroundStyle(Palette.fg)
+        .presentationDetents([.medium])
+        .presentationBackground(Palette.ink)
     }
 }

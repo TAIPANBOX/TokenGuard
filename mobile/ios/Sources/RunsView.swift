@@ -87,6 +87,7 @@ struct RunsView: View {
 
     private func kill(_ run: RunDisplay) {
         Task {
+            guard await Biometrics.confirm(reason: "Kill run \(run.id)") else { return }
             do {
                 try await account.kill(run: run.id)
                 await reload()
