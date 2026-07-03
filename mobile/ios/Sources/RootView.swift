@@ -21,6 +21,11 @@ struct RootView: View {
                 account = Account(session: session, key: key)
             }
         }
+        .onChange(of: Router.shared.apnsToken) { _, token in
+            if let account, let token {
+                Task { await account.registerAPNs(token: token) }
+            }
+        }
     }
 
     private func unpair() {

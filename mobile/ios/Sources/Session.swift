@@ -113,6 +113,17 @@ final class Account {
         try await send(request)
     }
 
+    /// Register this device's APNs token (signed, best-effort — no-op if remote
+    /// registration never succeeds, e.g. without the aps entitlement).
+    func registerAPNs(token: Data) async {
+        let hex = token.map { String(format: "%02x", $0) }.joined()
+        guard
+            let body = try? JSONSerialization.data(withJSONObject: ["token": hex]),
+            let request = try? signedRequest(method: "POST", path: "/v1/devices/\(session.deviceId)/apns", body: body)
+        else { return }
+        try? await send(request)
+    }
+
     /// Build an Enclave-signed request (docs/14 §4.2). Signing happens here,
     /// synchronously, so the key never crosses an await boundary.
     private func signedRequest(method: String, path: String, body: Data) throws -> URLRequest {

@@ -49,7 +49,12 @@ struct RunsView: View {
                 RunDetailView(run: run, account: account, onMutated: reload)
             }
             .toolbar(.hidden, for: .navigationBar)
-            .task { await reload(); openRunIfRequested() }
+            .task {
+                await reload()
+                openRunIfRequested()
+                await Notifications.requestIfNeeded()
+            }
+            .onChange(of: Router.shared.openRun) { _, _ in openRunIfRequested() }
             .refreshable { await reload() }
             .alert("Kill run \(killTarget?.id ?? "")?", isPresented: killAlertBinding, presenting: killTarget) { run in
                 Button("Kill", role: .destructive) { kill(run) }
@@ -72,9 +77,11 @@ struct RunsView: View {
     }
 
     private func openRunIfRequested() {
-        if path.isEmpty, let id = LaunchArgs.value("-openRun"),
+        let requested = Router.shared.openRun ?? LaunchArgs.value("-openRun")
+        if path.isEmpty, let id = requested,
            let run = store.runs.first(where: { $0.id == id }) {
             path = [run]
+            Router.shared.openRun = nil
         }
     }
 
