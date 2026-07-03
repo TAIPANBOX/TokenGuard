@@ -14,7 +14,7 @@
 ![core](https://img.shields.io/badge/core-Rust-orange)
 ![control%20plane](https://img.shields.io/badge/control%20plane-Rust-DEA584)
 ![dashboard](https://img.shields.io/badge/dashboard-Next.js-black)
-![mobile](https://img.shields.io/badge/mobile-iOS%20·%20SwiftUI-1a1a1a?logo=apple)
+![mobile](https://img.shields.io/badge/mobile-iOS%20·%20watchOS-1a1a1a?logo=apple)
 
 </div>
 
@@ -32,7 +32,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The hosted Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
 
 </div>
 
@@ -45,7 +45,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 - [How it works](#-how-it-works)
 - [How TokenFuse compares](#-how-tokenfuse-compares) ← vs. observability, gateways, guardrails
 - [What's inside](#-whats-inside)
-- [TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch) ← the fleet on your phone
+- [TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch) ← the fleet on your phone & wrist
 - [Architecture](#-architecture)
 - [Project status](#-project-status)
 - [The bigger picture](#-the-bigger-picture-a-runtime-firewall)
@@ -257,7 +257,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 **Ops & platform**
 - 🧬 **HA raft cluster**: replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
-- 📱 **[TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
+- 📱 **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
 - 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images.
 
@@ -313,7 +313,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-Since v0.3.0, **[TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity: one look across the browser and the phone.
+Since v0.3.0, **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity: one look across the browser and the phone.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
@@ -392,7 +392,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | [08 · Security extensions](docs/08-security-extensions.md) | MCP broker, RAG scanning, agent identity |
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
-| [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iOS app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
+| [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
 
 ---
 
