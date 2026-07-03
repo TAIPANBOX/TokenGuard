@@ -76,11 +76,18 @@ export default function Page() {
   const [armed, setArmed] = useState<string | null>(null);
 
   useEffect(() => {
-    const b = localStorage.getItem("tf_base") || "http://localhost:8080";
-    const k = localStorage.getItem("tf_key") || "";
+    // URL params (?base=&key=) let you connect via a shareable link; they take
+    // precedence over the last-used values persisted in localStorage.
+    const q = new URLSearchParams(window.location.search);
+    const b = q.get("base") || localStorage.getItem("tf_base") || "http://localhost:8080";
+    const k = q.get("key") || localStorage.getItem("tf_key") || "";
     setBase(b);
     setKey(k);
-    if (k) setConnected(true);
+    if (k) {
+      localStorage.setItem("tf_base", b);
+      localStorage.setItem("tf_key", k);
+      setConnected(true);
+    }
   }, []);
 
   const api = useCallback(
