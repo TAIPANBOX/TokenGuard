@@ -5,7 +5,7 @@ import Foundation
 // wire's `run_id` / `spent_microusd` map to these camelCase properties. Money
 // is microdollars on the wire; converted to dollars for display.
 
-struct RunAgg: Codable, Identifiable, Sendable {
+struct RunAgg: Codable, Identifiable, Sendable, Hashable {
     let runId: String
     let model: String
     let spentMicrousd: Int64

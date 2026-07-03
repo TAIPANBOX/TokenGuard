@@ -8,53 +8,74 @@ struct RunsView: View {
     let account: Account
     var onUnpair: () -> Void
 
+    @Environment(\.modelContext) private var modelContext
     @State private var store = RunsStore()
+    @State private var path: [RunDisplay] = []
     @State private var killTarget: RunDisplay?
     @State private var actionError: String?
 
     private var client: APIClient { account.reads }
 
     var body: some View {
-        ZStack {
-            Palette.ink.ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    header
-                    if case .failed(let message) = store.phase {
-                        errorCard(message)
-                    }
-                    if let summary = store.summary {
-                        heroCard(summary)
-                    }
-                    ForEach(store.runs) { run in
-                        RunRow(run: run)
-                            .contextMenu {
-                                if !run.killed {
-                                    Button(role: .destructive) { killTarget = run } label: {
-                                        Label("Kill run", systemImage: "bolt.slash")
+        NavigationStack(path: $path) {
+            ZStack {
+                Palette.ink.ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header
+                        if case .failed(let message) = store.phase {
+                            errorCard(message)
+                        }
+                        if let summary = store.summary {
+                            heroCard(summary)
+                        }
+                        ForEach(store.runs) { run in
+                            NavigationLink(value: run) { RunRow(run: run) }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    if !run.killed {
+                                        Button(role: .destructive) { killTarget = run } label: {
+                                            Label("Kill run", systemImage: "bolt.slash")
+                                        }
                                     }
                                 }
-                            }
+                        }
+                        footerState
                     }
-                    footerState
+                    .padding(18)
                 }
-                .padding(18)
+            }
+            .navigationDestination(for: RunDisplay.self) { run in
+                RunDetailView(run: run, account: account, onMutated: reload)
+            }
+            .toolbar(.hidden, for: .navigationBar)
+            .task { await reload(); openRunIfRequested() }
+            .refreshable { await reload() }
+            .alert("Kill run \(killTarget?.id ?? "")?", isPresented: killAlertBinding, presenting: killTarget) { run in
+                Button("Kill", role: .destructive) { kill(run) }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text("Signed on this iPhone and enforced across every gateway.")
+            }
+            .alert("Couldn't kill the run", isPresented: errorAlertBinding) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(actionError ?? "")
             }
         }
-        .task { await store.load(using: client) }
-        .refreshable { await store.load(using: client) }
-        .alert("Kill run \(killTarget?.id ?? "")?", isPresented: killAlertBinding, presenting: killTarget) { run in
-            Button("Kill", role: .destructive) { kill(run) }
-            Button("Cancel", role: .cancel) {}
-        } message: { _ in
-            Text("Signed on this iPhone and enforced across every gateway.")
-        }
-        .alert("Couldn't kill the run", isPresented: errorAlertBinding) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(actionError ?? "")
-        }
+        .tint(Palette.iris)
         .foregroundStyle(Palette.fg)
+    }
+
+    private func reload() async {
+        await store.load(using: client, org: account.session.org, context: modelContext)
+    }
+
+    private func openRunIfRequested() {
+        if path.isEmpty, let id = LaunchArgs.value("-openRun"),
+           let run = store.runs.first(where: { $0.id == id }) {
+            path = [run]
+        }
     }
 
     private var killAlertBinding: Binding<Bool> {
@@ -68,7 +89,7 @@ struct RunsView: View {
         Task {
             do {
                 try await account.kill(run: run.id)
-                await store.load(using: client)
+                await reload()
             } catch {
                 actionError = error.localizedDescription
             }
@@ -135,7 +156,7 @@ struct RunsView: View {
             Text("CAN'T REACH THE PLANE").font(.system(size: 10, weight: .semibold)).tracking(1.6)
                 .foregroundStyle(Palette.ember)
             Text(message).font(.mono).foregroundStyle(Palette.dim)
-            Button("Retry") { Task { await store.load(using: client) } }
+            Button("Retry") { Task { await reload() } }
                 .font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.iris)
         }
         .padding(14)
