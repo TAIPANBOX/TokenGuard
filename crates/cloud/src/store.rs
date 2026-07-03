@@ -4,12 +4,24 @@
 //! (`Load`/`Save`/autosave) is added in a follow-up — see
 //! docs/14-mobile-companion.md, PR A3.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use utoipa::ToSchema;
+
+/// How many recent samples to keep per org for the burn-rate series (in-memory,
+/// not persisted — historical analytics live in the gateway's Parquet sink).
+const SERIES_CAP: usize = 100_000;
+
+/// Whether a call record represents a blocked decision. Gateways currently only
+/// ingest settled calls (`allow`/`cache_hit`); anything else is reserved for
+/// future block telemetry.
+fn is_blocked(decision: &str) -> bool {
+    !matches!(decision, "allow" | "cache_hit")
+}
 
 /// One settled call, pushed by a gateway's `CloudSink`. The wire shape matches
 /// `crates/gateway/src/sink.rs::CallRecord` (kept in sync by hand, exactly as
@@ -66,6 +78,65 @@ pub struct Alert {
     pub killed: bool,
 }
 
+/// One time bucket of the burn-rate series.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SeriesBucket {
+    /// Bucket start, epoch millis.
+    pub t: i64,
+    pub cost_microusd: i64,
+    pub calls: u64,
+    pub blocked: u64,
+}
+
+/// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
+/// to the right subscriber and is not sent in the payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    RunUpdate {
+        #[serde(skip)]
+        org: String,
+        run: RunAgg,
+    },
+    Kill {
+        #[serde(skip)]
+        org: String,
+        run: String,
+    },
+    Budget {
+        #[serde(skip)]
+        org: String,
+        run: String,
+        budget_micros: i64,
+    },
+}
+
+impl StreamEvent {
+    /// The org this event belongs to (used to filter per-subscriber).
+    pub(crate) fn org(&self) -> &str {
+        match self {
+            Self::RunUpdate { org, .. } | Self::Kill { org, .. } | Self::Budget { org, .. } => org,
+        }
+    }
+
+    /// The SSE event name.
+    pub(crate) fn event_name(&self) -> &'static str {
+        match self {
+            Self::RunUpdate { .. } => "run_update",
+            Self::Kill { .. } => "kill",
+            Self::Budget { .. } => "budget",
+        }
+    }
+}
+
+/// One recorded call, kept for the burn-rate series.
+struct Sample {
+    ts_millis: i64,
+    run_id: String,
+    cost_microusd: i64,
+    blocked: bool,
+}
+
 #[derive(Default)]
 struct Inner {
     /// org → run → aggregate
@@ -74,6 +145,8 @@ struct Inner {
     killed: HashMap<String, HashMap<String, bool>>,
     /// org → run → central budget (microdollars)
     budgets: HashMap<String, HashMap<String, i64>>,
+    /// org → bounded log of recent samples for the burn-rate series
+    series: HashMap<String, VecDeque<Sample>>,
     /// set on any mutation, cleared by autosave — avoids writing an unchanged file
     dirty: bool,
 }
@@ -100,41 +173,137 @@ struct SnapshotOwned {
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
 /// (Postgres/ClickHouse) for scale + retention is a drop-in follow-up behind
 /// the same methods.
-#[derive(Default)]
 pub struct Store {
     inner: RwLock<Inner>,
+    /// Live change bus for `/v1/stream` subscribers.
+    events: broadcast::Sender<StreamEvent>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Store {
     pub fn new() -> Self {
-        Self::default()
+        let (events, _) = broadcast::channel(1024);
+        Self {
+            inner: RwLock::new(Inner::default()),
+            events,
+        }
     }
 
-    /// Fold a batch of records into an org's aggregates.
+    /// Subscribe to live change events (per-org filtering is the caller's job).
+    pub fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
+        self.events.subscribe()
+    }
+
+    /// Fold a batch of records into an org's aggregates, append them to the
+    /// burn-rate series, and broadcast a `run_update` per affected run.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
-        let mut inner = self.inner.write().unwrap();
-        inner.dirty = true;
-        let runs = inner.orgs.entry(org.to_string()).or_default();
-        for r in records {
-            let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
-                run_id: r.run_id.clone(),
-                ..Default::default()
-            });
-            agg.spent_microusd += r.cost_microusd;
-            agg.calls += 1;
-            if r.decision == "cache_hit" {
-                agg.cache_hits += 1;
+        let mut updated: Vec<RunAgg> = Vec::new();
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.dirty = true;
+            {
+                let runs = inner.orgs.entry(org.to_string()).or_default();
+                for r in records {
+                    let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
+                        run_id: r.run_id.clone(),
+                        ..Default::default()
+                    });
+                    agg.spent_microusd += r.cost_microusd;
+                    agg.calls += 1;
+                    if r.decision == "cache_hit" {
+                        agg.cache_hits += 1;
+                    }
+                    if !r.model.is_empty() {
+                        agg.model = r.model.clone();
+                    }
+                    if r.step > agg.steps {
+                        agg.steps = r.step;
+                    }
+                    if r.ts_millis > agg.last_seen {
+                        agg.last_seen = r.ts_millis;
+                    }
+                }
             }
-            if !r.model.is_empty() {
-                agg.model = r.model.clone();
+            {
+                let log = inner.series.entry(org.to_string()).or_default();
+                for r in records {
+                    log.push_back(Sample {
+                        ts_millis: r.ts_millis,
+                        run_id: r.run_id.clone(),
+                        cost_microusd: r.cost_microusd,
+                        blocked: is_blocked(&r.decision),
+                    });
+                }
+                while log.len() > SERIES_CAP {
+                    log.pop_front();
+                }
             }
-            if r.step > agg.steps {
-                agg.steps = r.step;
-            }
-            if r.ts_millis > agg.last_seen {
-                agg.last_seen = r.ts_millis;
+            // Snapshot each affected run's new aggregate for the stream.
+            if let Some(runs) = inner.orgs.get(org) {
+                let mut seen = HashSet::new();
+                for r in records {
+                    if seen.insert(r.run_id.as_str()) {
+                        if let Some(a) = runs.get(&r.run_id) {
+                            updated.push(a.clone());
+                        }
+                    }
+                }
             }
         }
+        for run in updated {
+            let _ = self.events.send(StreamEvent::RunUpdate {
+                org: org.to_string(),
+                run,
+            });
+        }
+    }
+
+    /// Burn-rate buckets for a scope (whole org, or one `run`) over `window_ms`,
+    /// `step_ms` wide, ending at `now_ms`.
+    pub fn series(
+        &self,
+        org: &str,
+        run: Option<&str>,
+        window_ms: i64,
+        step_ms: i64,
+        now_ms: i64,
+    ) -> Vec<SeriesBucket> {
+        let step = step_ms.max(1);
+        let window = window_ms.max(step);
+        let start = now_ms - window;
+        let n = (window / step).max(1) as usize;
+        let mut buckets: Vec<SeriesBucket> = (0..n)
+            .map(|i| SeriesBucket {
+                t: start + i as i64 * step,
+                cost_microusd: 0,
+                calls: 0,
+                blocked: 0,
+            })
+            .collect();
+        let inner = self.inner.read().unwrap();
+        if let Some(log) = inner.series.get(org) {
+            for s in log {
+                if s.ts_millis < start || s.ts_millis > now_ms {
+                    continue;
+                }
+                if run.is_some_and(|rid| s.run_id != rid) {
+                    continue;
+                }
+                let idx = (((s.ts_millis - start) / step) as usize).min(n - 1);
+                let b = &mut buckets[idx];
+                b.cost_microusd += s.cost_microusd;
+                b.calls += 1;
+                if s.blocked {
+                    b.blocked += 1;
+                }
+            }
+        }
+        buckets
     }
 
     /// An org's run aggregates (order unspecified; the client sorts). The
@@ -172,13 +341,19 @@ impl Store {
 
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
-        let mut inner = self.inner.write().unwrap();
-        inner.dirty = true;
-        inner
-            .killed
-            .entry(org.to_string())
-            .or_default()
-            .insert(run.to_string(), true);
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.dirty = true;
+            inner
+                .killed
+                .entry(org.to_string())
+                .or_default()
+                .insert(run.to_string(), true);
+        }
+        let _ = self.events.send(StreamEvent::Kill {
+            org: org.to_string(),
+            run: run.to_string(),
+        });
     }
 
     /// The run ids an org has killed.
@@ -199,13 +374,20 @@ impl Store {
     /// Set a centrally-managed budget (microdollars) for a run; gateways poll
     /// this and apply it over the client-supplied budget.
     pub fn set_budget(&self, org: &str, run: &str, micros: i64) {
-        let mut inner = self.inner.write().unwrap();
-        inner.dirty = true;
-        inner
-            .budgets
-            .entry(org.to_string())
-            .or_default()
-            .insert(run.to_string(), micros);
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.dirty = true;
+            inner
+                .budgets
+                .entry(org.to_string())
+                .or_default()
+                .insert(run.to_string(), micros);
+        }
+        let _ = self.events.send(StreamEvent::Budget {
+            org: org.to_string(),
+            run: run.to_string(),
+            budget_micros: micros,
+        });
     }
 
     /// An org's run → budget-micros overrides.
@@ -452,5 +634,77 @@ mod tests {
         s.ingest("acme", &[rec("r1", 1)]);
         assert!(s.take_dirty(), "ingest marks dirty");
         assert!(!s.take_dirty(), "take clears the flag");
+    }
+
+    fn rec_at(run: &str, cost: i64, ts: i64) -> CallRecord {
+        CallRecord {
+            run_id: run.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn series_buckets_sum_to_totals() {
+        let s = Store::new();
+        let now = 10_000;
+        s.ingest(
+            "acme",
+            &[
+                rec_at("r1", 100, now - 500),
+                rec_at("r1", 200, now - 100),
+                rec_at("r2", 50, now - 50),
+            ],
+        );
+        let buckets = s.series("acme", None, 1000, 100, now);
+        let cost: i64 = buckets.iter().map(|b| b.cost_microusd).sum();
+        let calls: u64 = buckets.iter().map(|b| b.calls).sum();
+        // Sum over the window equals the org total.
+        assert_eq!(cost, 350);
+        assert_eq!(calls, 3);
+        assert_eq!(cost, s.summary("acme").spent_microusd);
+
+        // Scoped to one run.
+        let r1: i64 = s
+            .series("acme", Some("r1"), 1000, 100, now)
+            .iter()
+            .map(|b| b.cost_microusd)
+            .sum();
+        assert_eq!(r1, 300);
+
+        // Samples outside the window are excluded.
+        let none: i64 = s
+            .series("acme", None, 100, 50, now + 100_000)
+            .iter()
+            .map(|b| b.cost_microusd)
+            .sum();
+        assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn stream_emits_run_update_on_ingest() {
+        let s = Store::new();
+        let mut rx = s.subscribe();
+        s.ingest("acme", &[rec("r1", 5)]);
+        match rx.try_recv() {
+            Ok(StreamEvent::RunUpdate { org, run }) => {
+                assert_eq!(org, "acme");
+                assert_eq!(run.run_id, "r1");
+                assert_eq!(run.spent_microusd, 5);
+            }
+            other => panic!("expected run_update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_emits_kill() {
+        let s = Store::new();
+        let mut rx = s.subscribe();
+        s.kill("acme", "r1");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamEvent::Kill { org, run }) if org == "acme" && run == "r1"
+        ));
     }
 }

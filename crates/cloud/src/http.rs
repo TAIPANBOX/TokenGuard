@@ -6,22 +6,28 @@
 //! from. See docs/14-mobile-companion.md.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::keys::Principal;
-use crate::store::{Alert, CallRecord, RunAgg, Store, Summary};
+use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
 /// and dumped by `tokenfuse-cloud --openapi`; downstream clients (Swift, the
@@ -32,12 +38,13 @@ use crate::store::{Alert, CallRecord, RunAgg, Store, Summary};
         title = "TokenFuse Cloud",
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
-    paths(ingest, runs, summary, alerts, kill, kills, set_budget, budgets),
+    paths(ingest, runs, summary, alerts, series, kill, kills, set_budget, budgets),
     components(schemas(
         CallRecord,
         RunAgg,
         Summary,
         Alert,
+        SeriesBucket,
         IngestBody,
         IngestResponse,
         BudgetBody,
@@ -128,6 +135,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runs", get(runs))
         .route("/v1/summary", get(summary))
         .route("/v1/alerts", get(alerts))
+        .route("/v1/series", get(series))
+        .route("/v1/stream", get(stream))
         .route("/v1/runs/{run}/kill", post(kill))
         .route("/v1/kills", get(kills))
         .route("/v1/runs/{run}/budget", post(set_budget))
@@ -274,6 +283,67 @@ async fn alerts(
     (StatusCode::OK, Json(st.store.alerts(&org, pct))).into_response()
 }
 
+#[derive(Deserialize, IntoParams)]
+struct SeriesQuery {
+    /// Scope to a single run; omit for the whole org.
+    run: Option<String>,
+    /// Time span back from now, e.g. `1h`, `24h`, `30m` (default `1h`).
+    window: Option<String>,
+    /// Bucket width, e.g. `60s`, `5m` (default `60s`).
+    step: Option<String>,
+}
+
+/// Burn-rate buckets over a time window — feeds the chart and the Dynamic Island.
+#[utoipa::path(
+    get, path = "/v1/series",
+    params(SeriesQuery),
+    responses(
+        (status = 200, description = "time buckets, oldest first", body = Vec<SeriesBucket>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn series(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SeriesQuery>,
+) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    let window = parse_duration_ms(q.window.as_deref()).unwrap_or(3_600_000);
+    let step = parse_duration_ms(q.step.as_deref()).unwrap_or(60_000);
+    let buckets = st
+        .store
+        .series(&org, q.run.as_deref(), window, step, now_millis());
+    (StatusCode::OK, Json(buckets)).into_response()
+}
+
+/// `GET /v1/stream` — Server-Sent Events of live changes for the caller's org
+/// (`run_update`, `kill`, `budget`), with a 25 s keep-alive. Not in the OpenAPI
+/// document (SSE). Replaces client polling.
+async fn stream(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    let events = BroadcastStream::new(st.store.subscribe()).filter_map(move |ev| match ev {
+        Ok(e) if e.org() == org => Some(Ok::<Event, Infallible>(
+            Event::default()
+                .event(e.event_name())
+                .json_data(&e)
+                .unwrap_or_default(),
+        )),
+        _ => None,
+    });
+    Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(25))
+                .text("ping"),
+        )
+        .into_response()
+}
+
 /// Mark a run killed (admin only). Gateways poll `/v1/kills` and hard-stop it.
 #[utoipa::path(
     post, path = "/v1/runs/{run}/kill",
@@ -363,6 +433,39 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
+}
+
+// ---- helpers --------------------------------------------------------------
+
+/// Parse a duration like `1h`, `30m`, `60s`, `500ms`; a bare number is seconds.
+fn parse_duration_ms(s: Option<&str>) -> Option<i64> {
+    let s = s?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1000)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000)
+    } else {
+        (s, 1000)
+    };
+    num.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .map(|n| n * mult)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---- shared responses -----------------------------------------------------
