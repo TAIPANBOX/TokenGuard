@@ -109,6 +109,12 @@ String to sign (LF-joined, exactly):
 {METHOD}\n{PATH}\n{sha256(body) hex, empty body → sha256("")}\n{X-Fuse-TS}\n{X-Fuse-Nonce}
 ```
 
+Encoding (fixed in A8): the signature is base64 of the **raw 64-byte `r||s`**
+(IEEE P1363) form — exactly CryptoKit's `ECDSASignature.rawRepresentation`. The
+public key submitted at pairing is base64 of the **SEC1/X9.63** bytes —
+CryptoKit's `publicKey.x963Representation`. `{PATH}` is the request path only
+(no query string).
+
 Server verification: device exists ∧ role=admin ∧ |now−ts| ≤ 120 s ∧ nonce
 unseen (LRU per device, cap 4096) ∧ ES256 signature valid against the stored
 pubkey. Failure → `403 signature_invalid` (new error type, same envelope as

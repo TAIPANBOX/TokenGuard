@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::devices;
 use crate::keys::Principal;
 use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
 
@@ -38,7 +39,10 @@ use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
         title = "TokenFuse Cloud",
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
-    paths(ingest, runs, summary, alerts, series, kill, kills, set_budget, budgets),
+    paths(
+        ingest, runs, summary, alerts, series, kill, kills, set_budget, budgets,
+        pair_new, pair,
+    ),
     components(schemas(
         CallRecord,
         RunAgg,
@@ -51,11 +55,16 @@ use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
         BudgetResponse,
         KillResponse,
         ErrorResponse,
+        PairNewBody,
+        PairNewResponse,
+        PairRequest,
+        PairResponse,
     )),
     tags(
         (name = "telemetry", description = "Ingest of gateway call records"),
         (name = "reads", description = "Aggregated per-org views"),
         (name = "mutations", description = "Operator actions (admin only)"),
+        (name = "pairing", description = "Device pairing + Enclave-signed auth"),
     )
 )]
 struct ApiDoc;
@@ -83,30 +92,83 @@ impl AppState {
         }
     }
 
-    /// Resolve the bearer token to its principal. Accepts the token with or
-    /// without the `Bearer ` prefix, matching the Go plane.
+    /// Resolve the bearer token to an org-key principal (org keys only).
     fn principal_for(&self, headers: &HeaderMap) -> Option<&Principal> {
-        let raw = headers.get("authorization")?.to_str().ok()?;
-        let token = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
-        if token.is_empty() {
-            return None;
-        }
-        self.keys.get(token)
+        self.keys.get(bearer(headers)?)
     }
 
-    /// Resolve the bearer token to an org (any role), or `None` if unauthorized.
+    /// Resolve the bearer token to an org (any role) — an org key **or** a paired
+    /// device token. Used by the read endpoints; `None` if unauthorized.
     fn org_for(&self, headers: &HeaderMap) -> Option<String> {
-        self.principal_for(headers).map(|p| p.org.clone())
+        let token = bearer(headers)?;
+        if let Some(p) = self.keys.get(token) {
+            return Some(p.org.clone());
+        }
+        self.store.device_by_token(token).map(|d| d.org)
     }
 
-    /// Authorize a mutation: the org for an `admin` principal, otherwise an
-    /// [`AuthError`] — `401` for an unknown key, `403` for a non-admin.
-    fn admin_org(&self, headers: &HeaderMap) -> Result<String, AuthError> {
+    /// Authorize an admin action by **org key only** (used for pairing, which is
+    /// a dashboard/CLI action). `401` unknown key, `403` non-admin.
+    fn admin_org_key(&self, headers: &HeaderMap) -> Result<String, AuthError> {
         match self.principal_for(headers) {
             None => Err(AuthError::Unauthorized),
             Some(p) if p.role != "admin" => Err(AuthError::Forbidden),
             Some(p) => Ok(p.org.clone()),
         }
+    }
+
+    /// Authorize a mutation. Two accepted paths:
+    /// 1. an **admin org key** (dashboard/CLI) — no signature; or
+    /// 2. a **paired admin device**: `device_token` + a valid ES256 signature
+    ///    over the canonical string (docs/14 §4.2), fresh timestamp, unseen
+    ///    nonce. Returns the org, or an [`AuthError`].
+    fn authorize_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        headers: &HeaderMap,
+    ) -> Result<String, AuthError> {
+        let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
+
+        // Path 1: org key.
+        if let Some(p) = self.keys.get(token) {
+            if p.role != "admin" {
+                return Err(AuthError::Forbidden);
+            }
+            return Ok(p.org.clone());
+        }
+
+        // Path 2: paired device with an Enclave signature.
+        let device = self
+            .store
+            .device_by_token(token)
+            .ok_or(AuthError::Unauthorized)?;
+        if device.role != "admin" {
+            return Err(AuthError::Forbidden);
+        }
+        let dev_hdr = header_str(headers, "x-fuse-device").ok_or(AuthError::SignatureInvalid)?;
+        if dev_hdr != device.device_id {
+            return Err(AuthError::SignatureInvalid);
+        }
+        let ts = header_str(headers, "x-fuse-ts").ok_or(AuthError::SignatureInvalid)?;
+        let nonce = header_str(headers, "x-fuse-nonce").ok_or(AuthError::SignatureInvalid)?;
+        let sig = header_str(headers, "x-fuse-sig").ok_or(AuthError::SignatureInvalid)?;
+
+        let ts_num: i64 = ts.parse().map_err(|_| AuthError::SignatureInvalid)?;
+        if (now_unix() - ts_num).abs() > 120 {
+            return Err(AuthError::SignatureInvalid);
+        }
+
+        // Verify the signature before spending the nonce.
+        let canonical = devices::canonical_string(method, path, body, ts, nonce);
+        if !devices::verify_signature(&device.pubkey_b64, &canonical, sig) {
+            return Err(AuthError::SignatureInvalid);
+        }
+        if !self.store.check_and_record_nonce(&device.device_id, nonce) {
+            return Err(AuthError::SignatureInvalid);
+        }
+        Ok(device.org)
     }
 }
 
@@ -114,6 +176,7 @@ impl AppState {
 enum AuthError {
     Unauthorized,
     Forbidden,
+    SignatureInvalid,
 }
 
 impl IntoResponse for AuthError {
@@ -121,6 +184,7 @@ impl IntoResponse for AuthError {
         match self {
             AuthError::Unauthorized => unauthorized(),
             AuthError::Forbidden => forbidden(),
+            AuthError::SignatureInvalid => error(StatusCode::FORBIDDEN, "signature_invalid"),
         }
     }
 }
@@ -141,6 +205,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/kills", get(kills))
         .route("/v1/runs/{run}/budget", post(set_budget))
         .route("/v1/budgets", get(budgets))
+        .route("/v1/pair/new", post(pair_new))
+        .route("/v1/pair", post(pair))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }
@@ -192,6 +258,37 @@ struct KillResponse {
 #[derive(Serialize, ToSchema)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct PairNewBody {
+    /// Role the paired device will have (`admin` | `viewer`); default `admin`.
+    role: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PairNewResponse {
+    code: String,
+    expires_unix: i64,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct PairRequest {
+    code: String,
+    /// Device public key, base64 SEC1/X9.63.
+    pubkey_b64: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PairResponse {
+    device_id: String,
+    org: String,
+    role: String,
+    device_token: String,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -355,8 +452,13 @@ async fn stream(State(st): State<AppState>, headers: HeaderMap) -> Response {
     ),
     tag = "mutations"
 )]
-async fn kill(State(st): State<AppState>, headers: HeaderMap, Path(run): Path<String>) -> Response {
-    let org = match st.admin_org(&headers) {
+async fn kill(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(run): Path<String>,
+) -> Response {
+    let org = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
@@ -396,10 +498,11 @@ async fn kills(State(st): State<AppState>, headers: HeaderMap) -> Response {
 async fn set_budget(
     State(st): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path(run): Path<String>,
     body: Bytes,
 ) -> Response {
-    let org = match st.admin_org(&headers) {
+    let org = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
@@ -435,7 +538,99 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
 }
 
+/// Issue a one-time pairing code (admin org key). The dashboard renders it as a
+/// QR the app scans.
+#[utoipa::path(
+    post, path = "/v1/pair/new",
+    request_body = PairNewBody,
+    responses(
+        (status = 200, description = "pairing code (valid 10 min)", body = PairNewResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
+    ),
+    tag = "pairing"
+)]
+async fn pair_new(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let org = match st.admin_org_key(&headers) {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    // Role is optional; default admin, only admin/viewer allowed.
+    let role = match serde_json::from_slice::<PairNewBody>(&body) {
+        Ok(b) => b.role.unwrap_or_else(|| "admin".to_string()),
+        Err(_) if body.is_empty() => "admin".to_string(),
+        Err(_) => return bad_json(),
+    };
+    if role != "admin" && role != "viewer" {
+        return error(StatusCode::BAD_REQUEST, "role must be admin or viewer");
+    }
+    let code = devices::pairing_code();
+    let expires_unix = now_unix() + 600;
+    st.store.create_pairing(&code, &org, &role, expires_unix);
+    (StatusCode::OK, Json(PairNewResponse { code, expires_unix })).into_response()
+}
+
+/// Redeem a pairing code with a device public key. No bearer auth — the code is
+/// the credential. Returns the device's identity and its read token.
+#[utoipa::path(
+    post, path = "/v1/pair",
+    request_body = PairRequest,
+    responses(
+        (status = 200, description = "device registered", body = PairResponse),
+        (status = 400, description = "invalid or expired code / bad json", body = ErrorResponse),
+    ),
+    tag = "pairing"
+)]
+async fn pair(State(st): State<AppState>, body: Bytes) -> Response {
+    let req: PairRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return bad_json(),
+    };
+    let device_id = devices::random_hex(16);
+    let device_token = devices::random_hex(32);
+    match st.store.redeem_pairing(
+        &req.code,
+        now_unix(),
+        device_id,
+        device_token.clone(),
+        req.pubkey_b64,
+        req.name,
+        req.platform,
+    ) {
+        Some(dev) => (
+            StatusCode::OK,
+            Json(PairResponse {
+                device_id: dev.device_id,
+                org: dev.org,
+                role: dev.role,
+                device_token,
+            }),
+        )
+            .into_response(),
+        None => error(StatusCode::BAD_REQUEST, "invalid or expired pairing code"),
+    }
+}
+
 // ---- helpers --------------------------------------------------------------
+
+/// The bearer token from the `Authorization` header (with or without `Bearer `).
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get("authorization")?.to_str().ok()?;
+    let token = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// A request header value as a `&str`, if present and valid UTF-8.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Parse a duration like `1h`, `30m`, `60s`, `500ms`; a bare number is seconds.
 fn parse_duration_ms(s: Option<&str>) -> Option<i64> {
@@ -470,34 +665,27 @@ fn now_millis() -> i64 {
 
 // ---- shared responses -----------------------------------------------------
 
-fn unauthorized() -> Response {
+/// A JSON error envelope `{ "error": … }` with the given status.
+fn error(status: StatusCode, message: &str) -> Response {
     (
-        StatusCode::UNAUTHORIZED,
+        status,
         Json(ErrorResponse {
-            error: "invalid api key".into(),
+            error: message.to_string(),
         }),
     )
         .into_response()
+}
+
+fn unauthorized() -> Response {
+    error(StatusCode::UNAUTHORIZED, "invalid api key")
 }
 
 fn forbidden() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorResponse {
-            error: "admin role required".into(),
-        }),
-    )
-        .into_response()
+    error(StatusCode::FORBIDDEN, "admin role required")
 }
 
 fn bad_json() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "bad json".into(),
-        }),
-    )
-        .into_response()
+    error(StatusCode::BAD_REQUEST, "bad json")
 }
 
 /// Allow the standalone (Next.js) dashboard, served from another origin, to call

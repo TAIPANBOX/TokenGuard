@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
+use crate::devices::{Device, Pairing};
+
+/// Anti-replay nonce ring size, per device (docs/14 §4.2).
+const NONCE_CAP: usize = 4096;
+
 /// How many recent samples to keep per org for the burn-rate series (in-memory,
 /// not persisted — historical analytics live in the gateway's Parquet sink).
 const SERIES_CAP: usize = 100_000;
@@ -147,6 +152,12 @@ struct Inner {
     budgets: HashMap<String, HashMap<String, i64>>,
     /// org → bounded log of recent samples for the burn-rate series
     series: HashMap<String, VecDeque<Sample>>,
+    /// device_token → paired device (persisted)
+    devices: HashMap<String, Device>,
+    /// one-time pairing code → pending pairing (ephemeral)
+    pairings: HashMap<String, Pairing>,
+    /// device_id → recent nonces for replay defense (ephemeral)
+    nonces: HashMap<String, VecDeque<String>>,
     /// set on any mutation, cleared by autosave — avoids writing an unchanged file
     dirty: bool,
 }
@@ -158,6 +169,7 @@ struct SnapshotRef<'a> {
     orgs: &'a HashMap<String, HashMap<String, RunAgg>>,
     killed: &'a HashMap<String, HashMap<String, bool>>,
     budgets: &'a HashMap<String, HashMap<String, i64>>,
+    devices: &'a HashMap<String, Device>,
 }
 
 #[derive(Default, Deserialize)]
@@ -168,6 +180,8 @@ struct SnapshotOwned {
     killed: HashMap<String, HashMap<String, bool>>,
     #[serde(default)]
     budgets: HashMap<String, HashMap<String, i64>>,
+    #[serde(default)]
+    devices: HashMap<String, Device>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -436,6 +450,7 @@ impl Store {
                 orgs: &inner.orgs,
                 killed: &inner.killed,
                 budgets: &inner.budgets,
+                devices: &inner.devices,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -459,7 +474,73 @@ impl Store {
         inner.orgs = snap.orgs;
         inner.killed = snap.killed;
         inner.budgets = snap.budgets;
+        inner.devices = snap.devices;
         Ok(())
+    }
+
+    /// Register a pending one-time pairing code (fixing the device's org/role).
+    pub fn create_pairing(&self, code: &str, org: &str, role: &str, expires_unix: i64) {
+        let mut inner = self.inner.write().unwrap();
+        inner.pairings.insert(
+            code.to_string(),
+            Pairing {
+                org: org.to_string(),
+                role: role.to_string(),
+                expires_unix,
+            },
+        );
+    }
+
+    /// Redeem a pairing code (one-time): if it exists and is unexpired, register
+    /// a device keyed by `token` and return it. `None` for an unknown/expired
+    /// code — the code is consumed either way if present.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redeem_pairing(
+        &self,
+        code: &str,
+        now_unix: i64,
+        device_id: String,
+        token: String,
+        pubkey_b64: String,
+        name: String,
+        platform: String,
+    ) -> Option<Device> {
+        let mut inner = self.inner.write().unwrap();
+        let pairing = inner.pairings.remove(code)?;
+        if pairing.expires_unix < now_unix {
+            return None;
+        }
+        let device = Device {
+            device_id,
+            org: pairing.org,
+            role: pairing.role,
+            name,
+            platform,
+            pubkey_b64,
+        };
+        inner.dirty = true;
+        inner.devices.insert(token, device.clone());
+        Some(device)
+    }
+
+    /// The device a bearer `token` maps to, if any.
+    pub fn device_by_token(&self, token: &str) -> Option<Device> {
+        self.inner.read().unwrap().devices.get(token).cloned()
+    }
+
+    /// Record a nonce for a device; returns `false` if it was already seen
+    /// (replay). Keeps the most recent [`NONCE_CAP`] per device.
+    pub fn check_and_record_nonce(&self, device_id: &str, nonce: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let seen = inner.nonces.entry(device_id.to_string()).or_default();
+        if seen.iter().any(|n| n == nonce) {
+            return false;
+        }
+        seen.push_back(nonce.to_string());
+        while seen.len() > NONCE_CAP {
+            seen.pop_front();
+        }
+        true
     }
 
     /// Read and clear the dirty flag; an autosave loop saves only when `true`.
