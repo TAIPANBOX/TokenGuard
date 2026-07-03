@@ -32,7 +32,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard — fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity — <i>the fuse</i> — shared with the <a href="#-tokenfuse-for-ios">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The hosted Cloud dashboard — fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. One visual identity — <i>the fuse</i> — shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iOS app</a>. <code>cd cloud && docker compose up</code>.</sub>
 
 </div>
 
@@ -45,7 +45,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 - [How it works](#-how-it-works)
 - [How TokenFuse compares](#-how-tokenfuse-compares) ← vs. observability, gateways, guardrails
 - [What's inside](#-whats-inside)
-- [TokenFuse for iOS](#-tokenfuse-for-ios) ← the fleet on your phone
+- [TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch) ← the fleet on your phone
 - [Architecture](#-architecture)
 - [Project status](#-project-status)
 - [The bigger picture](#-the-bigger-picture-a-runtime-firewall)
@@ -257,36 +257,23 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 **Ops & platform**
 - 🧬 **HA raft cluster** — replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud** — Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
-- 📱 **[TokenFuse for iOS](#-tokenfuse-for-ios)** — pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
+- 📱 **[TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch)** — pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
 - 🗄️ **Zero-DB analytics** — telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images.
 
 ---
 
-## 📱 TokenFuse for iOS
+## 📱 TokenFuse for iPhone & Apple Watch
 
 <img align="right" width="88" src="docs/assets/logo.png" alt="TokenFuse app icon">
 
-A native **iOS** command deck for your fleet. Pair a device once, then watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** — the kill is *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Per-run budgets from your phone behind **Face ID**, live burn charts, and the burn rate in the **Dynamic Island** and on the Lock Screen.
+A native **iPhone & Apple Watch** command deck for your fleet: pair a device once, watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** — *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Face-ID budgets, live burn charts, and the burn rate in the **Dynamic Island** — with the same on your **Apple Watch**, including a two-tap wrist kill and a face complication. It shares one visual language — *the fuse* — with the [web dashboard](cloud/dashboard).
 
-Built in **SwiftUI**, it shares one visual language — *the fuse* (mint → amber → ember) — with the [web dashboard](cloud/dashboard), and its API layer is generated from the same [`openapi.json`](mobile/ios/openapi.json) as the control plane. Runs on the simulator or a device with a free Apple ID — no paid account needed to try it.
+The app has its own repository, with screenshots, a full feature tour, and build instructions:
 
-<table>
-<tr>
-<td width="25%"><img src="mobile/screenshots/pair.png" alt="Pair this iPhone — a signing key is generated on-device"></td>
-<td width="25%"><img src="mobile/screenshots/runs.png" alt="Fleet burn rate with live per-run fuses"></td>
-<td width="25%"><img src="mobile/screenshots/detail.png" alt="Run detail: burn chart and slide-to-arm kill breaker"></td>
-<td width="25%"><img src="mobile/screenshots/home-island.png" alt="Live burn rate in the Dynamic Island"></td>
-</tr>
-<tr>
-<td align="center"><sub>Pair once · key in the Enclave</sub></td>
-<td align="center"><sub>Fleet burn rate, live</sub></td>
-<td align="center"><sub>Burn chart · slide-to-arm kill</sub></td>
-<td align="center"><sub>Dynamic Island</sub></td>
-</tr>
-</table>
+### → **[github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile)**
 
-→ [Mobile plan & wire protocol](docs/14-mobile-companion.md) · [Design system](docs/16-design-system.md) · [interactive mockups](mobile/design/)
+Its plan & wire protocol and the shared design system still live here: [docs/14](docs/14-mobile-companion.md) · [docs/16](docs/16-design-system.md).
 
 ---
 
@@ -326,7 +313,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-Since v0.3.0, **[TokenFuse for iOS](#-tokenfuse-for-ios)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity — one look across the browser and the phone.
+Since v0.3.0, **[TokenFuse for iOS](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, and the web dashboard has been restyled to share the app's "fuse" identity — one look across the browser and the phone.
 
 It has **not** yet had a production hardening pass or a security audit — treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 

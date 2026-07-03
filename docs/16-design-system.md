@@ -1,11 +1,15 @@
 # 16 — Design system: TokenFuse
 
+> 🎨 The **iOS / Apple Watch** implementation of this system now lives in the app
+> repo: [github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile).
+> The web dashboard here derives from the same system.
+
 **Status:** approved direction (2026-07-03). The single source of truth for the
 look of every surface — iOS app, Apple Watch, and the web dashboard. SwiftUI
-(`mobile/ios/Sources/DesignSystem.swift`) and the Next.js dashboard both derive
-from the tokens here. Interactive reference mockups live in
-[`mobile/design/`](../mobile/design/) (`iphone.html`, `watch.html`,
-`web-dashboard.html`).
+(`ios/Sources/DesignSystem.swift` in the app repo) and the Next.js dashboard both
+derive from the tokens here. Interactive reference mockups live in the app repo's
+[`design/`](https://github.com/TAIPANBOX/tokenfuse-mobile/tree/main/design)
+(`iphone.html`, `watch.html`, `web-dashboard.html`).
 
 ## Concept — "The Fuse Panel"
 

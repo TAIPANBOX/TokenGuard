@@ -1,6 +1,11 @@
 # 14 — Mobile Companion: TokenFuse (iOS)
 
-**Status:** approved plan, not started · **Written:** 2026-07-03 (architecture session)
+> 📱 **The app now lives in its own repository:
+> [github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile).**
+> This document is the original plan and wire protocol; paths like `mobile/ios/…`
+> below are now `ios/…` in that repo.
+
+**Status:** built — iPhone app + Apple Watch app (see the app repo) · **Written:** 2026-07-03 (architecture session)
 **Supersedes:** the "Go — Cloud control plane" decision in [02-architecture.md](02-architecture.md)
 (see ADR-14.1 below).
 

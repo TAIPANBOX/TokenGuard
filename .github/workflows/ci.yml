@@ -173,42 +173,5 @@ jobs:
       - name: Build + clippy the real APNs sender
         run: cargo clippy -p tokenfuse-cloud --all-targets --features apns -- -D warnings
 
-  ios:
-    name: ios (build + test)
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install XcodeGen
-        run: brew install xcodegen
-      - name: Generate project
-        working-directory: mobile/ios
-        run: xcodegen generate
-      - name: Build (simulator · no signing)
-        working-directory: mobile/ios
-        run: |
-          xcodebuild build \
-            -project TokenFuse.xcodeproj \
-            -scheme TokenFuse \
-            -destination 'generic/platform=iOS Simulator' \
-            -quiet \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-      - name: Test (on an available simulator)
-        working-directory: mobile/ios
-        run: |
-          SIM=$(xcrun simctl list devices available | grep -m1 -oE 'iPhone [0-9]+( Pro)?' || echo 'iPhone 16')
-          echo "Testing on: $SIM"
-          xcodebuild test \
-            -project TokenFuse.xcodeproj \
-            -scheme TokenFuse \
-            -destination "platform=iOS Simulator,name=$SIM" \
-            -quiet \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-      - name: Build watch app (simulator · no signing)
-        working-directory: mobile/ios
-        run: |
-          xcodebuild build \
-            -project TokenFuse.xcodeproj \
-            -scheme TokenFuseWatch \
-            -destination 'generic/platform=watchOS Simulator' \
-            -quiet \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+  # The iPhone & Apple Watch app moved to its own repository, with its own CI:
+  # https://github.com/TAIPANBOX/tokenfuse-mobile
