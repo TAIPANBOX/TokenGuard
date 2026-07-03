@@ -22,12 +22,17 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      - path: Shared
+    dependencies:
+      - target: TokenFuseWidget
     info:
       path: Sources/Info.plist
       properties:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # Live Activities (Dynamic Island / Lock Screen), updated locally.
+        NSSupportsLiveActivities: true
         # Allow cleartext HTTP to localhost / .local — dev planes run over HTTP;
         # production planes use HTTPS. Not arbitrary loads.
         NSAppTransportSecurity:
@@ -36,6 +41,25 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "1,2"
+  TokenFuseWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widget
+      - path: Shared
+      - path: Sources/DesignSystem.swift
+      - path: Sources/Fuse.swift
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: TokenFuse
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket.widget
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "1,2"
   TokenFusePocketTests:
