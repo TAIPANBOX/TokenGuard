@@ -67,40 +67,18 @@ pub enum McpClientError {
 /// `{"jsonrpc":..,"id":2,"result":{"tools":[...]}}` shape), which
 /// `tokenfuse_core::mcp::parse_tools` accepts as-is.
 pub async fn fetch_tools_list(cfg: &McpClientConfig) -> Result<Value, McpClientError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(cfg.connect_timeout)
-        .timeout(cfg.total_timeout)
-        .build()
-        .map_err(|e| McpClientError::Transport(e.to_string()))?;
-
+    let client = build_client(cfg)?;
     let mut session_id: Option<String> = None;
 
     // (a) initialize
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "tokenfuse-mcp-scan",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        },
-    });
-    let (init_resp, sid) = post_rpc(&client, cfg, &init_req, session_id.as_deref()).await?;
+    let (init_resp, sid) = post_rpc(&client, cfg, &initialize_request(), session_id.as_deref()).await?;
     let _ = init_resp; // handshake result body isn't needed beyond a successful round-trip
     if sid.is_some() {
         session_id = sid;
     }
 
     // (b) notifications/initialized — no id, no response body expected.
-    let initialized = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-    });
-    send_notification(&client, cfg, &initialized, session_id.as_deref()).await?;
+    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
 
     // (c) tools/list
     let tools_req = json!({
@@ -114,20 +92,47 @@ pub async fn fetch_tools_list(cfg: &McpClientConfig) -> Result<Value, McpClientE
 }
 
 /// POST one JSON-RPC request expecting a JSON-RPC response, returning the
-/// parsed body and any `Mcp-Session-Id` the server handed back.
+/// parsed body and any `Mcp-Session-Id` the server handed back. Thin wrapper
+/// over [`post_rpc_full`] for callers (like [`fetch_tools_list`]) that don't
+/// need the status/headers.
 async fn post_rpc(
     client: &reqwest::Client,
     cfg: &McpClientConfig,
     req: &Value,
     session_id: Option<&str>,
 ) -> Result<(Value, Option<String>), McpClientError> {
+    let (value, _status, _headers, sid) = post_rpc_full(client, cfg, req, session_id).await?;
+    Ok((value, sid))
+}
+
+/// Like [`post_rpc`], but also returns the HTTP status and response headers
+/// (lower-cased header names) of the final response — needed by the
+/// exposure probe to inspect CORS headers and to distinguish "server
+/// answered without auth" from "server rejected the unauthenticated
+/// request" (an error `Status`/`Transport` variant vs. a 2xx body).
+async fn post_rpc_full(
+    client: &reqwest::Client,
+    cfg: &McpClientConfig,
+    req: &Value,
+    session_id: Option<&str>,
+) -> Result<(Value, u16, Vec<(String, String)>, Option<String>), McpClientError> {
     let resp = send(client, cfg, req, session_id).await?;
     let status = resp.status();
+    let status_u16 = status.as_u16();
     let sid = resp
         .headers()
         .get("Mcp-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
     let content_type = resp
         .headers()
         .get("content-type")
@@ -141,7 +146,7 @@ async fn post_rpc(
 
     if !status.is_success() {
         return Err(McpClientError::Status {
-            status: status.as_u16(),
+            status: status_u16,
             body: String::from_utf8_lossy(&bytes).into_owned(),
         });
     }
@@ -151,7 +156,7 @@ async fn post_rpc(
         let want_id = req.get("id");
         for frame in parse_sse_frames(&text) {
             if frame.get("id") == want_id {
-                return Ok((frame, sid));
+                return Ok((frame, status_u16, headers, sid));
             }
         }
         return Err(McpClientError::Parse(format!(
@@ -168,7 +173,114 @@ async fn post_rpc(
 
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|e| McpClientError::Parse(e.to_string()))?;
-    Ok((value, sid))
+    Ok((value, status_u16, headers, sid))
+}
+
+/// Status, response headers, and parsed JSON-RPC body of a `tools/list`
+/// probe — the pieces [`fetch_tools_list`] discards but the exposure checks
+/// (CORS, "did it answer at all without auth") need.
+pub struct ToolsListProbe {
+    pub status: u16,
+    /// Lower-cased header name -> value.
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+}
+
+/// Run the same `initialize` → `notifications/initialized` → `tools/list`
+/// handshake as [`fetch_tools_list`], but return the final response's
+/// status/headers alongside its body. The exposure probe calls this with a
+/// `cfg` whose `extra_headers` is empty, to test the unauthenticated path
+/// regardless of whatever auth the "normal" scan connection might carry.
+pub async fn fetch_tools_list_probe(cfg: &McpClientConfig) -> Result<ToolsListProbe, McpClientError> {
+    let client = build_client(cfg)?;
+    let mut session_id: Option<String> = None;
+
+    let (_, sid) = post_rpc(&client, cfg, &initialize_request(), session_id.as_deref()).await?;
+    if sid.is_some() {
+        session_id = sid;
+    }
+    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
+
+    let tools_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {},
+    });
+    let (body, status, headers, _) =
+        post_rpc_full(&client, cfg, &tools_req, session_id.as_deref()).await?;
+    Ok(ToolsListProbe {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Status and parsed JSON-RPC body of a `tools/call` probe.
+pub struct ToolCallProbe {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// Attempt a `tools/call` for `tool_name` with `arguments`, after the same
+/// handshake as [`fetch_tools_list`]. Used only by the opt-in
+/// `--attempt-call` exposure check — invoking a tool is inherently
+/// side-effecting, so this must never run unless the operator explicitly
+/// asked for it (see `mcpexposure_probe::run_exposure_probe`).
+pub async fn probe_tools_call(
+    cfg: &McpClientConfig,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<ToolCallProbe, McpClientError> {
+    let client = build_client(cfg)?;
+    let mut session_id: Option<String> = None;
+
+    let (_, sid) = post_rpc(&client, cfg, &initialize_request(), session_id.as_deref()).await?;
+    if sid.is_some() {
+        session_id = sid;
+    }
+    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
+
+    let call_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": tool_name, "arguments": arguments },
+    });
+    let (body, status, _headers, _) =
+        post_rpc_full(&client, cfg, &call_req, session_id.as_deref()).await?;
+    Ok(ToolCallProbe { status, body })
+}
+
+fn build_client(cfg: &McpClientConfig) -> Result<reqwest::Client, McpClientError> {
+    reqwest::Client::builder()
+        .connect_timeout(cfg.connect_timeout)
+        .timeout(cfg.total_timeout)
+        .build()
+        .map_err(|e| McpClientError::Transport(e.to_string()))
+}
+
+fn initialize_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "tokenfuse-mcp-scan",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        },
+    })
+}
+
+fn initialized_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
 }
 
 /// Parse an SSE body into the JSON-RPC frames carried in its `data:` fields.

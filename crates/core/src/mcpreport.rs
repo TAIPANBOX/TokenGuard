@@ -86,6 +86,17 @@ impl ScanReport {
         self.findings.iter().map(|f| f.severity).max()
     }
 
+    /// Merge additional findings (e.g. the live-scan exposure checks) into
+    /// this report, updating `summary` to match rather than requiring the
+    /// caller to duplicate the counting logic. `tool_count` is left as-is —
+    /// exposure findings don't change how many tools were scanned.
+    pub fn push_findings(&mut self, extra: Vec<Finding>) {
+        for f in extra {
+            *self.summary.entry(f.severity.as_str().to_string()).or_insert(0) += 1;
+            self.findings.push(f);
+        }
+    }
+
     /// Build a report from a scanned tool set: injection findings (tool
     /// poisoning) and lock drift (rug pulls / added / removed tools).
     ///
@@ -289,6 +300,33 @@ mod tests {
         let report = ScanReport::from_scan(&tools, &[], &drift);
         assert_eq!(report.summary.get("medium"), Some(&1));
         assert!(!report.summary.contains_key("critical"));
+    }
+
+    #[test]
+    fn push_findings_merges_and_updates_summary() {
+        let tools = parse_tools(&json!({"tools":[{"name":"a","description":"d"}]}));
+        let mut report = ScanReport::from_scan(&tools, &[], &[]);
+        assert!(report.findings.is_empty());
+
+        report.push_findings(vec![
+            Finding {
+                kind: "exposure_unauth_list".into(),
+                severity: Severity::High,
+                tool: None,
+                message: "x".into(),
+            },
+            Finding {
+                kind: "exposure_cors_wildcard".into(),
+                severity: Severity::Medium,
+                tool: None,
+                message: "y".into(),
+            },
+        ]);
+
+        assert_eq!(report.findings.len(), 2);
+        assert_eq!(report.summary.get("high"), Some(&1));
+        assert_eq!(report.summary.get("medium"), Some(&1));
+        assert_eq!(report.max_severity(), Some(Severity::High));
     }
 
     #[test]

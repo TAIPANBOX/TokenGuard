@@ -84,6 +84,21 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
   speaks newline-delimited JSON-RPC on stdin/stdout for MCP clients that launch a
   server as a subprocess; logs go to stderr. Both transports share `process()`.
 
+## Related: `mcp-scan --url` exposure checks
+
+`tokenfuse mcp-scan --url <endpoint>` (separate from the broker above) adds
+server-exposure checks on top of the poisoning/rug-pull scan: unauthenticated
+`tools/list`/`tools/call` reachability, plaintext transport, wildcard CORS,
+and SSRF-capable tool detection (`tokenfuse-core::mcpexposure`). **This
+scanner is CLI-first** — built to run against a server you own, from your own
+machine. If a hosted "paste a URL, we'll scan it" service is ever built on
+top of it, the scanner becomes an SSRF oracle and MUST add resolve-then-pin
+IP validation (deny-list loopback/RFC1918/link-local/cloud-metadata
+addresses), no cross-boundary redirect following, and per-tenant egress
+sandboxing — none of which is implemented today because CLI self-scan has no
+SSRF elevation. See the doc comment at the top of
+`crates/core/src/mcpexposure.rs` for the full writeup.
+
 ## Not yet (follow-ups)
 
 - Spawning a **child stdio MCP server** (today the broker forwards to an HTTP

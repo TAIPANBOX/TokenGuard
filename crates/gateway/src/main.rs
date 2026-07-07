@@ -52,6 +52,7 @@ async fn main() {
         //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
         // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`
         //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
+        //     `[--skip-exposure] [--attempt-call]`
         Some("mcp-scan") => {
             let rest: Vec<String> = args.collect();
             let url_idx = rest.iter().position(|a| a == "--url");
@@ -63,6 +64,14 @@ async fn main() {
             let json_out = json_out_idx.and_then(|i| rest.get(i + 1).cloned());
             let fail_on_idx = rest.iter().position(|a| a == "--fail-on");
             let fail_on_raw = fail_on_idx.and_then(|i| rest.get(i + 1).cloned());
+            // Live-scan-only: exposure checks (unauth tools/list, plaintext
+            // transport, wildcard CORS, SSRF-capable tools) run by default
+            // against `--url` targets; `--skip-exposure` turns them off.
+            // `--attempt-call` opts into the one invasive check (an
+            // unauthenticated `tools/call`) — off by default because
+            // invoking a stranger's tool is itself side-effecting.
+            let skip_exposure = rest.iter().any(|a| a == "--skip-exposure");
+            let attempt_call = rest.iter().any(|a| a == "--attempt-call");
             let mode = if rest.iter().any(|a| a == "--json") {
                 tokenfuse_gateway::mcpcli::OutputMode::Json
             } else {
@@ -109,6 +118,8 @@ async fn main() {
                         write_lock,
                         mode,
                         json_out.as_deref(),
+                        skip_exposure,
+                        attempt_call,
                     )
                     .await
                     {
@@ -120,6 +131,16 @@ async fn main() {
                     }
                 }
                 (Some(p), None) => {
+                    // Exposure checks only make sense against a live server
+                    // (`--url`); file mode has nothing to probe. Rather than
+                    // silently ignoring a flag the caller took the trouble
+                    // to pass, say so — a misused flag in a CI script should
+                    // be visible, not a silent no-op.
+                    if skip_exposure || attempt_call {
+                        eprintln!(
+                            "mcp-scan: note: --skip-exposure/--attempt-call only apply to --url (live) scans; ignoring for file mode"
+                        );
+                    }
                     match tokenfuse_gateway::mcpcli::run(
                         &p,
                         lock_path.as_deref(),
@@ -136,7 +157,7 @@ async fn main() {
                 }
                 (None, None) => {
                     eprintln!(
-                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none]"
+                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call]"
                     );
                     None
                 }

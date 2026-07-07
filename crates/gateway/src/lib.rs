@@ -11,6 +11,7 @@ pub mod ledger_backend;
 pub mod mcpbroker;
 pub mod mcpcli;
 pub mod mcpclient;
+pub mod mcpexposure_probe;
 pub mod obs;
 pub mod otel;
 pub mod provider;

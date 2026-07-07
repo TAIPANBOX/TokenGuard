@@ -9,6 +9,7 @@ pub mod dlp;
 pub mod ledger;
 pub mod loops;
 pub mod mcp;
+pub mod mcpexposure;
 pub mod mcpreport;
 pub mod money;
 pub mod policy;

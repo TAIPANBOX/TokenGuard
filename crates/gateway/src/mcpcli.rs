@@ -9,9 +9,11 @@
 
 use std::fs;
 use tokenfuse_core::mcp::{diff, parse_tools, scan_injection, Drift, Lock, McpTool};
+use tokenfuse_core::mcpexposure::{exposure_findings, ssrf_capable_findings};
 use tokenfuse_core::mcpreport::ScanReport;
 
 use crate::mcpclient::{fetch_tools_list, McpClientConfig};
+use crate::mcpexposure_probe::run_exposure_probe;
 
 /// How to render the scan results. `Human` preserves the existing tree
 /// output exactly (default, behavior-preserving); `Json` prints the
@@ -41,18 +43,27 @@ pub fn run(
     if mode == OutputMode::Human {
         println!("MCP scan — {} tool(s) in {tools_path}", tools.len());
     }
-    scan_and_report(&tools, lock_path, write_lock, mode, json_out)
+    let report = build_scan_report(&tools, lock_path, write_lock, mode)?;
+    emit_report(&report, mode, json_out)?;
+    Ok(report)
 }
 
 /// Scan a live MCP server at `url` over Streamable HTTP. Twin of [`run`]: same
 /// injection scan / lock-diff / print / report logic, fed by a live
-/// `tools/list` fetch instead of a file on disk.
+/// `tools/list` fetch instead of a file on disk. Additionally, unless
+/// `skip_exposure` is set, runs the server-exposure checks (unauthenticated
+/// `tools/list`, plaintext transport, wildcard CORS, SSRF-capable tools, and
+/// — opt-in via `attempt_call` — an unauthenticated `tools/call`) and merges
+/// their findings into the same report. File-mode scans ([`run`]) have no
+/// live server to probe, so exposure checks only run here.
 pub async fn run_live(
     url: &str,
     lock_path: Option<&str>,
     write_lock: bool,
     mode: OutputMode,
     json_out: Option<&str>,
+    skip_exposure: bool,
+    attempt_call: bool,
 ) -> Result<ScanReport, String> {
     let cfg = McpClientConfig::new(url);
     let value = fetch_tools_list(&cfg).await.map_err(|e| e.to_string())?;
@@ -60,17 +71,43 @@ pub async fn run_live(
     if mode == OutputMode::Human {
         println!("MCP scan — {} tool(s) live from {url}", tools.len());
     }
-    scan_and_report(&tools, lock_path, write_lock, mode, json_out)
+    let mut report = build_scan_report(&tools, lock_path, write_lock, mode)?;
+
+    if !skip_exposure {
+        let outcome = run_exposure_probe(url, &tools, attempt_call).await;
+        let mut extra = exposure_findings(&outcome);
+        extra.extend(ssrf_capable_findings(&tools));
+        if mode == OutputMode::Human {
+            if extra.is_empty() {
+                println!("  exposure scan: clean");
+            } else {
+                println!("  exposure scan: {} issue(s)", extra.len());
+                for f in &extra {
+                    match &f.tool {
+                        Some(tool) => println!("    ⚠ [{}] {}: {}", f.kind, tool, f.message),
+                        None => println!("    ⚠ [{}] {}", f.kind, f.message),
+                    }
+                }
+            }
+        }
+        report.push_findings(extra);
+    } else if mode == OutputMode::Human {
+        println!("  exposure scan: skipped (--skip-exposure)");
+    }
+
+    emit_report(&report, mode, json_out)?;
+    Ok(report)
 }
 
 /// Shared post-parse logic for [`run`] and [`run_live`]: injection scan, plus
-/// optional lock write/diff, then build and emit the report.
-fn scan_and_report(
+/// optional lock write/diff, then build (but don't yet emit) the report —
+/// [`run_live`] needs to merge exposure findings in before printing/writing
+/// JSON, so emission is split out into [`emit_report`].
+fn build_scan_report(
     tools: &[McpTool],
     lock_path: Option<&str>,
     write_lock: bool,
     mode: OutputMode,
-    json_out: Option<&str>,
 ) -> Result<ScanReport, String> {
     let findings = scan_injection(tools);
     if mode == OutputMode::Human {
@@ -122,17 +159,23 @@ fn scan_and_report(
         }
     }
 
-    let report = ScanReport::from_scan(tools, &findings, &drifts);
+    Ok(ScanReport::from_scan(tools, &findings, &drifts))
+}
 
+/// Print `report` as JSON (if `mode` is [`OutputMode::Json`]) and/or write it
+/// to `json_out`, if given. Split out of [`build_scan_report`] so
+/// [`run_live`] can merge exposure findings into the report before either
+/// happens.
+fn emit_report(report: &ScanReport, mode: OutputMode, json_out: Option<&str>) -> Result<(), String> {
     if mode == OutputMode::Json {
-        let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
         println!("{json}");
     }
 
     if let Some(path) = json_out {
-        let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| format!("write {path}: {e}"))?;
     }
 
-    Ok(report)
+    Ok(())
 }
