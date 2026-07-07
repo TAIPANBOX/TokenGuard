@@ -23,6 +23,8 @@ pub struct SettleGuard {
     usage: UsageSlot,
     fallback: Microusd,
     reservation: Option<Reservation>,
+    /// Request-scoped attribution carried into the settled `CallRecord`.
+    agent_id: String,
 }
 
 impl SettleGuard {
@@ -35,6 +37,7 @@ impl SettleGuard {
         usage: UsageSlot,
         fallback: Microusd,
         reservation: Reservation,
+        agent_id: String,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -44,6 +47,7 @@ impl SettleGuard {
             usage,
             fallback,
             reservation: Some(reservation),
+            agent_id,
         }
     }
 
@@ -68,6 +72,9 @@ impl SettleGuard {
             output_tokens: usage.output_tokens,
             cost_microusd: actual.0,
             step: reservation.step,
+            agent_id: self.agent_id.clone(),
+            // Streaming allows never serve from cache — no savings to record.
+            saved_microusd: 0,
         });
     }
 
@@ -118,6 +125,7 @@ mod tests {
             usage,
             Microusd::from_usd(1.0),
             reservation,
+            String::new(),
         );
         guard.complete();
 
@@ -140,6 +148,7 @@ mod tests {
                 usage,
                 fallback,
                 reservation,
+                String::new(),
             );
             // dropped here without complete()
         }

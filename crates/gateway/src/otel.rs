@@ -126,6 +126,8 @@ mod tests {
             output_tokens: 500,
             cost_microusd: 10_500,
             step: 2,
+            agent_id: String::new(),
+            saved_microusd: 0,
         }
     }
 

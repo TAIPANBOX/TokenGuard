@@ -24,6 +24,9 @@ pub struct Call {
     /// `cache_hit`, `budget_exceeded`, `dlp_blocked`).
     pub decision: String,
     pub cost_microusd: i64,
+    /// Dollars a semantic-cache hit avoided (microdollars). Non-zero only on
+    /// `cache_hit` rows; `0` everywhere else (see `gateway::sink::CallRecord`).
+    pub saved_microusd: i64,
 }
 
 /// Block decisions that represent FinOps *dollar* savings — runaway spend that
@@ -60,6 +63,11 @@ pub struct SavingsReport {
     pub blocked_calls: usize,
     /// Blocked spend broken down by decision reason (budget-protection only).
     pub by_reason_microusd: BTreeMap<String, i64>,
+    /// Dollars the semantic cache avoided (microdollars), summed from the
+    /// `saved_microusd` column across the trace. This is a *different* kind of
+    /// ROI from `blocked_spend_microusd` (spend that was served for free vs.
+    /// runaway spend that was stopped), so it is reported as its own line.
+    pub cache_saved_microusd: i64,
 }
 
 /// Aggregate the budget-protection block rows in `calls` into a [`SavingsReport`].
@@ -71,8 +79,13 @@ pub fn compute_savings(calls: &[Call]) -> SavingsReport {
     let mut blocked_calls = 0usize;
     let mut breaks: BTreeSet<&str> = BTreeSet::new();
     let mut by_reason_microusd: BTreeMap<String, i64> = BTreeMap::new();
+    let mut cache_saved_microusd = 0i64;
 
     for c in calls {
+        // Cache savings are recorded per-row and are 0 on every non-cache-hit
+        // decision, so an unconditional sum is both correct and simplest — no
+        // need to special-case the `cache_hit` string.
+        cache_saved_microusd += c.saved_microusd;
         if is_budget_protection(&c.decision) {
             blocked_spend_microusd += c.cost_microusd;
             blocked_calls += 1;
@@ -86,6 +99,7 @@ pub fn compute_savings(calls: &[Call]) -> SavingsReport {
         budget_breaks_prevented: breaks.len(),
         blocked_calls,
         by_reason_microusd,
+        cache_saved_microusd,
     }
 }
 
@@ -98,6 +112,17 @@ mod tests {
             run_id: run.into(),
             decision: decision.into(),
             cost_microusd: cost,
+            saved_microusd: 0,
+        }
+    }
+
+    /// A cache-hit row: cost 0, but `saved` records the avoided spend.
+    fn cache_hit(run: &str, saved: i64) -> Call {
+        Call {
+            run_id: run.into(),
+            decision: "cache_hit".into(),
+            cost_microusd: 0,
+            saved_microusd: saved,
         }
     }
 
@@ -164,12 +189,32 @@ mod tests {
     }
 
     #[test]
-    fn cache_hits_and_allows_are_excluded() {
-        let calls = vec![call("r", "cache_hit", 250_000), call("r", "allow", 500_000)];
+    fn cache_hits_and_allows_are_excluded_from_blocked_spend() {
+        // Cache hits and allows never count as budget-protection blocks...
+        let calls = vec![cache_hit("r", 250_000), call("r", "allow", 500_000)];
         let report = compute_savings(&calls);
         assert_eq!(report.blocked_spend_microusd, 0);
         assert_eq!(report.blocked_calls, 0);
         assert_eq!(report.budget_breaks_prevented, 0);
+        // ...but the cache hit's avoided spend is captured on its own line.
+        assert_eq!(report.cache_saved_microusd, 250_000);
+    }
+
+    #[test]
+    fn cache_saved_sums_across_hits_and_ignores_other_rows() {
+        // Two cache hits contribute their savings; the allow and the block do
+        // not (their `saved_microusd` is 0), while the block still counts as a
+        // budget break. The two ROI figures are independent.
+        let calls = vec![
+            cache_hit("a", 100_000),
+            call("a", "allow", 500_000),
+            cache_hit("b", 400_000),
+            call("b", "budget_exceeded", 2_000_000),
+        ];
+        let report = compute_savings(&calls);
+        assert_eq!(report.cache_saved_microusd, 500_000);
+        assert_eq!(report.blocked_spend_microusd, 2_000_000);
+        assert_eq!(report.blocked_calls, 1);
     }
 
     #[test]

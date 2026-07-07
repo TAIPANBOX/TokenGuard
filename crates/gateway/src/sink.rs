@@ -18,6 +18,12 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 
 /// One settled call, the unit of the trace.
+///
+/// Schema evolution note (P2): `agent_id` and `saved_microusd` were appended
+/// after the first files were written. New fields go at the END and the Parquet
+/// schema keeps a stable order (see [`ParquetSink::schema`]); old files simply
+/// lack the trailing columns and read back as defaults (see `sqlq`). Never
+/// reorder or remove a field — that breaks backward-compatible reads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
     pub ts_millis: i64,
@@ -28,6 +34,13 @@ pub struct CallRecord {
     pub output_tokens: u64,
     pub cost_microusd: i64,
     pub step: u32,
+    /// Attribution: which logical agent/sub-agent made the call (from the
+    /// `X-Fuse-Agent-Id` request header). `""` when unset. Request-scoped
+    /// metadata only — not part of ledger/budget accounting.
+    pub agent_id: String,
+    /// Dollars a semantic-cache hit avoided (microdollars). Non-zero only on
+    /// `cache_hit` rows; `0` on every other record.
+    pub saved_microusd: i64,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -99,6 +112,40 @@ impl ParquetSink {
             Field::new("output_tokens", DataType::UInt64, false),
             Field::new("cost_microusd", DataType::Int64, false),
             Field::new("step", DataType::UInt32, false),
+            // Appended P2 columns. Keep these LAST and in this order so files
+            // written before/after the change stay mutually readable.
+            Field::new("agent_id", DataType::Utf8, false),
+            Field::new("saved_microusd", DataType::Int64, false),
+        ]))
+    }
+
+    /// The unified schema used to *read* the whole trace directory.
+    ///
+    /// Why this differs from [`schema`](Self::schema) (the write schema): the
+    /// trace is append-only across a schema change, so one directory holds both
+    /// OLD files (8 columns, written before P2) and NEW files (10 columns).
+    /// DataFusion unions the per-file schemas, but when it null-fills the
+    /// appended columns for an old file it enforces the merged column's declared
+    /// nullability — a `non-nullable` column that must hold NULLs is an Arrow
+    /// validation error ("declared as non-nullable but contains null values").
+    /// So the appended columns are declared NULLABLE here and this schema is
+    /// handed to the reader explicitly, which (a) makes null-fill of old files
+    /// legal and (b) guarantees the columns exist in the table schema even when
+    /// the directory contains ONLY old files. Queries then `COALESCE` the NULLs
+    /// to the documented defaults (`''` / `0`). Writers never emit NULLs, so the
+    /// stricter write schema stays correct for what we produce.
+    pub fn read_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("ts_millis", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("decision", DataType::Utf8, false),
+            Field::new("input_tokens", DataType::UInt64, false),
+            Field::new("output_tokens", DataType::UInt64, false),
+            Field::new("cost_microusd", DataType::Int64, false),
+            Field::new("step", DataType::UInt32, false),
+            Field::new("agent_id", DataType::Utf8, true),
+            Field::new("saved_microusd", DataType::Int64, true),
         ]))
     }
 
@@ -136,6 +183,15 @@ impl ParquetSink {
                 )),
                 Arc::new(UInt32Array::from(
                     records.iter().map(|r| r.step).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.agent_id.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    records.iter().map(|r| r.saved_microusd).collect::<Vec<_>>(),
                 )),
             ],
         )?;
@@ -197,6 +253,8 @@ mod tests {
             output_tokens: 50,
             cost_microusd: cost,
             step: 1,
+            agent_id: String::new(),
+            saved_microusd: 0,
         }
     }
 

@@ -63,6 +63,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     let parent = header_str(&headers, "x-fuse-parent-run-id");
     st.ledger.open_run(&run_id, budget, parent.as_deref()).await;
 
+    // Attribution only: which logical agent made this call. Request-scoped like
+    // `model` — it rides along into every CallRecord and never touches the
+    // ledger/budget. Defaults to "" when the header is absent.
+    let agent_id = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
         let snap = st.ledger.snapshot(&run_id).await;
@@ -82,6 +87,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             output_tokens: 0,
             cost_microusd: estimate.0,
             step,
+            agent_id: agent_id.clone(),
+            saved_microusd: 0,
         });
         return budget_error(
             "killed",
@@ -117,6 +124,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         output_tokens: 0,
                         cost_microusd: 0,
                         step,
+                        agent_id: agent_id.clone(),
+                        saved_microusd: 0,
                     });
                     return dlp_block(&run_id, &summary);
                 }
@@ -162,6 +171,10 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         output_tokens: 0,
                         cost_microusd: 0,
                         step,
+                        agent_id: agent_id.clone(),
+                        // The only non-zero `saved_microusd` site: a served cache
+                        // hit avoided this much real spend.
+                        saved_microusd: hit.saved_microusd,
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -207,6 +220,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 output_tokens: 0,
                 cost_microusd: estimate.0,
                 step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
             });
             return budget_error(
                 "policy_violation",
@@ -227,6 +242,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 output_tokens: 0,
                 cost_microusd: estimate.0,
                 step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
             });
             return budget_error(
                 "loop_detected",
@@ -266,6 +283,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 output_tokens: 0,
                 cost_microusd: estimate.0,
                 step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
             });
             return budget_error(
                 "wasm_policy",
@@ -306,6 +325,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     output_tokens: 0,
                     cost_microusd: estimate.0,
                     step: snapshot.steps + 1,
+                    agent_id: agent_id.clone(),
+                    saved_microusd: 0,
                 });
                 return budget_error(
                     "budget_exceeded",
@@ -347,7 +368,15 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     };
 
     if parsed.stream {
-        stream_managed(resp, reservation, would_block, dlp_note, &parsed.model, &st)
+        stream_managed(
+            resp,
+            reservation,
+            would_block,
+            dlp_note,
+            &parsed.model,
+            &st,
+            agent_id,
+        )
     } else {
         buffered_managed(
             resp,
@@ -359,6 +388,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             cache_ctx,
             cache_note,
             firewall_labels,
+            &agent_id,
         )
         .await
     }
@@ -367,6 +397,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
 /// Streaming managed response: pass chunks through and settle at end-of-stream.
 /// Cost headers are omitted because headers are sent before the body — the
 /// settled figures go to the ledger (and, later, the event sink).
+#[allow(clippy::too_many_arguments)]
 fn stream_managed(
     resp: ProviderResponse,
     reservation: Reservation,
@@ -374,6 +405,7 @@ fn stream_managed(
     dlp_note: Option<String>,
     model: &str,
     st: &AppState,
+    agent_id: String,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -387,6 +419,7 @@ fn stream_managed(
         resp.usage.clone(),
         reservation.amount,
         reservation,
+        agent_id,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -441,6 +474,7 @@ async fn buffered_managed(
     cache_ctx: Option<CacheCtx>,
     cache_note: Option<String>,
     firewall_labels: Labels,
+    agent_id: &str,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -479,6 +513,8 @@ async fn buffered_managed(
         output_tokens: u.output_tokens,
         cost_microusd: actual.0,
         step: reservation.step,
+        agent_id: agent_id.to_string(),
+        saved_microusd: 0,
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -504,6 +540,8 @@ async fn buffered_managed(
                     output_tokens: 0,
                     cost_microusd: 0,
                     step: reservation.step,
+                    agent_id: agent_id.to_string(),
+                    saved_microusd: 0,
                 });
                 return firewall_block(&reservation.run_id, &reason);
             }
@@ -1238,7 +1276,15 @@ mod tests {
             .await
             .unwrap();
 
-        let response = stream_managed(resp, reservation, None, None, "test-model", &st);
+        let response = stream_managed(
+            resp,
+            reservation,
+            None,
+            None,
+            "test-model",
+            &st,
+            String::new(),
+        );
         {
             // Consume a single chunk, then drop the stream (simulated cancel).
             let mut data = response.into_body().into_data_stream();

@@ -50,6 +50,14 @@ pub struct CallRecord {
     pub cost_microusd: i64,
     #[serde(default)]
     pub step: u32,
+    /// Attribution: which logical agent made the call (P2). Accepted for
+    /// forward-compat; aggregation (/v1/agents) lands in a later PR.
+    #[serde(default)]
+    pub agent_id: String,
+    /// Cache-hit savings in microdollars (P2). Accepted for forward-compat;
+    /// aggregation (/v1/savings) lands in a later PR.
+    #[serde(default)]
+    pub saved_microusd: i64,
 }
 
 /// The aggregated state of one run within an organization.

@@ -56,6 +56,12 @@ pub async fn run(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         report.blocked_calls,
         report.budget_breaks_prevented,
     );
+    // Cache savings are a distinct ROI (spend served for free), reported on its
+    // own line rather than folded into the runaway-spend headline.
+    println!(
+        "  cache saved:             {}",
+        money(report.cache_saved_microusd)
+    );
     // Per-reason breakdown, when anything was blocked, so the headline number is
     // attributable (which protection did the saving).
     for (reason, spend) in &report.by_reason_microusd {
@@ -74,8 +80,14 @@ fn print_empty(dir: &str) {
 /// Mirrors [`crate::backtestcli`]'s loader but reads `decision` (not `step`),
 /// since savings keys off the block reason. Both read the same `calls` table.
 async fn load_calls(dir: &str) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
+    // `coalesce(saved_microusd, 0)` makes the read robust across schema
+    // evolution: files written before P2 lack the column entirely, and
+    // DataFusion surfaces it as NULL for their rows (it unions the per-file
+    // schemas and null-fills the gaps — see `sqlq::tests`). Coalesce maps that
+    // to the documented default of 0, so old and new files aggregate together.
     let batches = query(
-        "select run_id, decision, cast(cost_microusd as bigint) as cost from calls",
+        "select run_id, decision, cast(cost_microusd as bigint) as cost, \
+         cast(coalesce(saved_microusd, 0) as bigint) as saved from calls",
         dir,
     )
     .await?;
@@ -86,11 +98,17 @@ async fn load_calls(dir: &str) -> Result<Vec<Call>, Box<dyn std::error::Error>> 
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or("cost column type")?;
+        let saved = b
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("saved column type")?;
         for i in 0..b.num_rows() {
             calls.push(Call {
                 run_id: str_at(b.column(0).as_ref(), i),
                 decision: str_at(b.column(1).as_ref(), i),
                 cost_microusd: cost.value(i),
+                saved_microusd: saved.value(i),
             });
         }
     }
@@ -107,22 +125,31 @@ mod tests {
             run_id: run.into(),
             decision: decision.into(),
             cost_microusd: cost,
+            saved_microusd: 0,
         }
     }
 
     #[test]
     fn computes_savings_over_a_mixed_trace() {
         // The pure path the CLI runs after loading: allows + a security block are
-        // ignored; only the budget-protection blocks are summed.
+        // ignored; only the budget-protection blocks are summed, and cache hits
+        // contribute their avoided spend on the separate cache-saved line.
         let calls = vec![
             call("a", "allow", 500_000),
             call("a", "budget_exceeded", 1_000_000),
             call("b", "killed", 2_000_000),
             call("b", "dlp_blocked", 9_000_000),
+            Call {
+                run_id: "b".into(),
+                decision: "cache_hit".into(),
+                cost_microusd: 0,
+                saved_microusd: 750_000,
+            },
         ];
         let report = compute_savings(&calls);
         assert_eq!(report.blocked_spend_microusd, 3_000_000);
         assert_eq!(report.blocked_calls, 2);
         assert_eq!(report.budget_breaks_prevented, 2);
+        assert_eq!(report.cache_saved_microusd, 750_000);
     }
 }
