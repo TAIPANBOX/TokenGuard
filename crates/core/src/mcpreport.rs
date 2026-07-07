@@ -6,6 +6,7 @@
 //! from `max_severity()` vs a `--fail-on` threshold.
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -60,7 +61,7 @@ impl FromStr for Severity {
 }
 
 /// One machine-readable finding: a poisoning issue, a rug pull, or lock drift.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub kind: String,
     pub severity: Severity,
@@ -70,7 +71,7 @@ pub struct Finding {
 
 /// The full report for one `mcp-scan` run: every finding plus a severity
 /// summary, ready to serialize as JSON for CI consumption.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {
     pub version: String,
     pub tool_count: usize,
@@ -156,6 +157,62 @@ impl ScanReport {
             summary,
         }
     }
+}
+
+/// Map a [`Severity`] to a SARIF `result.level`. SARIF 2.1.0 defines four
+/// levels (`none`/`note`/`warning`/`error`); we fold our five severities onto
+/// the three actionable ones: Critical/High → `error`, Medium → `warning`,
+/// Low/Info → `note`.
+fn sarif_level(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium => "warning",
+        Severity::Low | Severity::Info => "note",
+    }
+}
+
+/// Render a [`ScanReport`] as a minimal, valid **SARIF 2.1.0** document so
+/// `mcp-scan` output can be ingested by code-scanning dashboards (GitHub code
+/// scanning, etc.). One `run` with `tool.driver.name = "tokenfuse-mcp-scan"`,
+/// one `result` per finding: `ruleId` = the finding `kind`, `level` mapped from
+/// severity via [`sarif_level`], the finding message, and a `logicalLocations`
+/// entry naming the offending tool (or the server when the finding isn't
+/// tool-scoped, e.g. an exposure check).
+pub fn to_sarif(report: &ScanReport, tool_version: &str) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = report
+        .findings
+        .iter()
+        .map(|f| {
+            let name = f.tool.clone().unwrap_or_else(|| "mcp-server".to_string());
+            json!({
+                "ruleId": f.kind,
+                "level": sarif_level(f.severity),
+                "message": { "text": f.message },
+                "locations": [{
+                    "logicalLocations": [{
+                        "name": name,
+                        "kind": "resource",
+                    }]
+                }],
+            })
+        })
+        .collect();
+
+    json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "tokenfuse-mcp-scan",
+                    "version": tool_version,
+                    "informationUri": "https://tokenfuse.dev",
+                    "rules": [],
+                }
+            },
+            "results": results,
+        }],
+    })
 }
 
 /// The pure "should CI fail" decision: does the report's worst finding meet
@@ -351,5 +408,75 @@ mod tests {
         assert!(!should_fail(Some(Severity::Medium), Some(Severity::High)));
         assert!(!should_fail(None, Some(Severity::High)));
         assert!(!should_fail(Some(Severity::Critical), None));
+    }
+
+    #[test]
+    fn sarif_levels_map_from_severity() {
+        assert_eq!(sarif_level(Severity::Critical), "error");
+        assert_eq!(sarif_level(Severity::High), "error");
+        assert_eq!(sarif_level(Severity::Medium), "warning");
+        assert_eq!(sarif_level(Severity::Low), "note");
+        assert_eq!(sarif_level(Severity::Info), "note");
+    }
+
+    #[test]
+    fn sarif_doc_is_valid_2_1_0_shape() {
+        let report = ScanReport {
+            version: "1.2.3".into(),
+            tool_count: 2,
+            findings: vec![
+                Finding {
+                    kind: "poisoning".into(),
+                    severity: Severity::High,
+                    tool: Some("evil".into()),
+                    message: "injected instructions".into(),
+                },
+                Finding {
+                    kind: "exposure_cors_wildcard".into(),
+                    severity: Severity::Medium,
+                    tool: None,
+                    message: "wildcard CORS".into(),
+                },
+            ],
+            summary: BTreeMap::new(),
+        };
+        let doc = to_sarif(&report, "1.2.3");
+
+        assert_eq!(doc["version"], "2.1.0");
+        assert!(doc["$schema"].as_str().unwrap().contains("sarif"));
+        assert_eq!(
+            doc["runs"][0]["tool"]["driver"]["name"],
+            "tokenfuse-mcp-scan"
+        );
+        assert_eq!(doc["runs"][0]["tool"]["driver"]["version"], "1.2.3");
+
+        let results = doc["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["ruleId"], "poisoning");
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(
+            results[0]["locations"][0]["logicalLocations"][0]["name"],
+            "evil"
+        );
+        assert_eq!(results[1]["level"], "warning");
+        // A tool-less finding falls back to naming the server.
+        assert_eq!(
+            results[1]["locations"][0]["logicalLocations"][0]["name"],
+            "mcp-server"
+        );
+    }
+
+    #[test]
+    fn scan_report_round_trips_through_json() {
+        // The compliance CLI loads a ScanReport from `--json-out` output, so the
+        // report must deserialize back from its own serialization.
+        let tools = parse_tools(&json!({"tools":[{"name":"a","description":"d"}]}));
+        let drift = vec![Drift::Added("b".to_string())];
+        let report = ScanReport::from_scan(&tools, &[], &drift);
+        let s = serde_json::to_string(&report).unwrap();
+        let back: ScanReport = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.findings.len(), report.findings.len());
+        assert_eq!(back.findings[0].kind, "new_tool");
+        assert_eq!(back.findings[0].severity, Severity::Medium);
     }
 }

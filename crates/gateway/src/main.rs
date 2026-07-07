@@ -56,8 +56,19 @@ async fn main() {
                 eprintln!("savings error: {e}");
             }
         }
+        // `tokenfuse compliance [--since <ms>] [--until <ms>] [--json]`
+        //     `[--markdown] [--scan-report <file>]` projects the control catalog
+        // against the Parquet trace into an auditor-ready evidence pack.
+        Some("compliance") => {
+            let rest: Vec<String> = args.collect();
+            let dir = std::env::var("TOKENFUSE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+            let cargs = tokenfuse_gateway::compliancecli::parse_args(&rest);
+            if let Err(e) = tokenfuse_gateway::compliancecli::run(&dir, cargs).await {
+                eprintln!("compliance error: {e}");
+            }
+        }
         // `tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]`
-        //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
+        //     `[--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]`
         // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`
         //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
         //     `[--skip-exposure] [--attempt-call]`
@@ -70,6 +81,8 @@ async fn main() {
             let write_lock = rest.iter().any(|a| a == "--write-lock");
             let json_out_idx = rest.iter().position(|a| a == "--json-out");
             let json_out = json_out_idx.and_then(|i| rest.get(i + 1).cloned());
+            let sarif_idx = rest.iter().position(|a| a == "--sarif");
+            let sarif_out = sarif_idx.and_then(|i| rest.get(i + 1).cloned());
             let fail_on_idx = rest.iter().position(|a| a == "--fail-on");
             let fail_on_raw = fail_on_idx.and_then(|i| rest.get(i + 1).cloned());
             // Live-scan-only: exposure checks (unauth tools/list, plaintext
@@ -107,6 +120,7 @@ async fn main() {
                 url_idx.map(|i| i + 1),
                 lock_idx.map(|i| i + 1),
                 json_out_idx.map(|i| i + 1),
+                sarif_idx.map(|i| i + 1),
                 fail_on_idx.map(|i| i + 1),
             ];
             let tools_path = rest
@@ -126,6 +140,7 @@ async fn main() {
                         write_lock,
                         mode,
                         json_out.as_deref(),
+                        sarif_out.as_deref(),
                         skip_exposure,
                         attempt_call,
                     )
@@ -155,6 +170,7 @@ async fn main() {
                         write_lock,
                         mode,
                         json_out.as_deref(),
+                        sarif_out.as_deref(),
                     ) {
                         Ok(report) => Some(report),
                         Err(e) => {
@@ -165,7 +181,7 @@ async fn main() {
                 }
                 (None, None) => {
                     eprintln!(
-                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call]"
+                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call]"
                     );
                     None
                 }

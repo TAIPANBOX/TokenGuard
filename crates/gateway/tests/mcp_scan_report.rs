@@ -23,6 +23,7 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
     let tools_path = dir.join("tools.json");
     let lock_path = dir.join("lock.json");
     let json_out_path = dir.join("report.json");
+    let sarif_out_path = dir.join("report.sarif");
 
     // Pin a lock against a clean "search" tool.
     let clean = serde_json::json!({"tools":[
@@ -34,6 +35,7 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
         Some(lock_path.to_str().unwrap()),
         true, // --write-lock
         OutputMode::Human,
+        None,
         None,
     )
     .expect("write-lock run should succeed");
@@ -52,6 +54,7 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
         false, // diff against the lock, don't rewrite it
         OutputMode::Json,
         Some(json_out_path.to_str().unwrap()),
+        Some(sarif_out_path.to_str().unwrap()),
     )
     .expect("json run should succeed");
 
@@ -78,6 +81,26 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
     // and "api_key"), so two separate `poisoning` findings are expected.
     assert_eq!(summary.get("high").and_then(|v| v.as_u64()), Some(2));
 
+    // --sarif wrote a valid SARIF 2.1.0 doc alongside the JSON report, with the
+    // rug pull mapped to error and the poisoning findings present as results.
+    let sarif = fs::read_to_string(&sarif_out_path).expect("sarif file should exist");
+    let sarif: serde_json::Value =
+        serde_json::from_str(&sarif).expect("sarif contents must be valid JSON");
+    assert_eq!(sarif["version"], "2.1.0");
+    assert_eq!(
+        sarif["runs"][0]["tool"]["driver"]["name"],
+        "tokenfuse-mcp-scan"
+    );
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results array");
+    assert!(results
+        .iter()
+        .any(|r| r["ruleId"] == "rug_pull" && r["level"] == "error"));
+    assert!(results
+        .iter()
+        .any(|r| r["ruleId"] == "poisoning" && r["level"] == "error"));
+
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -96,6 +119,7 @@ fn poisoning_only_yields_high_max_severity() {
         None,
         false,
         OutputMode::Json,
+        None,
         None,
     )
     .expect("run should succeed");
@@ -121,6 +145,7 @@ fn clean_server_yields_no_max_severity() {
         None,
         false,
         OutputMode::Human,
+        None,
         None,
     )
     .expect("run should succeed");

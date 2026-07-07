@@ -50,7 +50,12 @@
 //!   stops enforcing rather than stopping all traffic). A green catalog is not
 //!   a certification.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
+
+use crate::mcpreport::Finding;
+use crate::savings;
 
 /// How honestly a control can be claimed. Serialized lowercase
 /// (`"enforced"` / `"partial"` / `"documented"`) for machine consumption.
@@ -362,6 +367,158 @@ pub const CATALOG: &[ControlMapping] = &[
     },
 ];
 
+/// Standing disclaimer emitted with every [`ComplianceReport`]. This is a
+/// **compliance-adjacent evidence pack, not a certification**: the report shows
+/// which controls TokenFuse enforces at runtime and the evidence they emitted,
+/// but a green report does not attest to any framework the way an auditor's
+/// opinion does. It is also honest about the fail-open posture documented in
+/// `docs/13-security-hardening.md`.
+pub const DISCLAIMER: &str = "Controls TokenFuse enforces + evidence for your \
+    audit — not a certification. TokenFuse is fail-open by default; see docs/13.";
+
+/// One control's realized evidence over a concrete trace + scan: the catalog
+/// [`ControlMapping`] projected against actual `decision`/`finding` counts.
+///
+/// `decision_counts` and `finding_counts` are pre-populated with every wire
+/// `decision` / finding `kind` the control *watches* (initialized to `0`), so a
+/// reader can tell "this control watches `budget_exceeded` and saw it 3×" from
+/// "this control watches `budget_exceeded` and saw it 0×" — both are audit
+/// evidence (the second is "the guard was active and nothing tripped it").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControlEvidence {
+    pub control_id: &'static str,
+    pub title: &'static str,
+    pub enforcement: Enforcement,
+    /// Watched wire `decision` string -> times it fired in the trace.
+    pub decision_counts: BTreeMap<String, u64>,
+    /// Watched finding `kind` -> times it appeared in the supplied scan report.
+    pub finding_counts: BTreeMap<String, u64>,
+    /// Cloud incident count for this control. Always `0` on the CLI path
+    /// (incidents live in the cloud store, not the gateway trace); populated by
+    /// the later `/v1/compliance` endpoint. The field is present here so the
+    /// report shape is stable across both paths.
+    pub incident_count: u64,
+    /// Whether this control counts as covered for the audit — see the rule on
+    /// [`compute_compliance`].
+    pub covered: bool,
+    /// Whether *any* concrete evidence (a decision, finding, or incident) was
+    /// actually observed. Distinguishes "active, no events" (`covered` can still
+    /// be true for a preventive guard) from "active, N events".
+    pub evidence_seen: bool,
+}
+
+/// A full compliance evidence pack: the catalog projected against one trace and
+/// (optionally) one scan report, plus the standing disclaimer and the pinned
+/// framework versions the mappings were cited against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComplianceReport {
+    /// The standing [`DISCLAIMER`] — this is evidence, not a certification.
+    pub generated_note: &'static str,
+    /// The frameworks + pinned versions each mapping was cited against
+    /// (mirrors [`FRAMEWORK_VERSIONS`]).
+    pub framework_versions: &'static [(&'static str, &'static str, &'static str)],
+    /// Per-control realized evidence, in catalog order.
+    pub controls: Vec<ControlEvidence>,
+    /// Total decisions considered (rows in the loaded trace slice).
+    pub decisions_total: u64,
+    /// Total findings considered (entries in the supplied scan report).
+    pub findings_total: u64,
+}
+
+/// Project the `catalog` against a concrete `calls` trace and `findings` scan
+/// into a [`ComplianceReport`]. Pure aggregation, mirroring
+/// [`crate::savings::compute_savings`]; `calls` is reused verbatim from savings
+/// so the CLI loader is shared.
+///
+/// # The `covered` rule (documented on purpose)
+///
+/// A control is `covered` when it is [`Enforcement::Enforced`] **and** either:
+///
+/// 1. it observed at least one piece of evidence (`evidence_seen`), or
+/// 2. it is a **preventive** control (one that blocks on the wire — i.e. it has
+///    `evidence_decisions`) even with zero blocks recorded.
+///
+/// Rationale for (2): a preventive guard is wired into *every* call on the wire,
+/// so "the guard was active and nothing tripped it" is a legitimate audit state
+/// — a zero here means nothing bad happened, not that the control was absent.
+///
+/// **Detective** controls (scanners — those with only `evidence_finding_kinds`)
+/// are deliberately NOT covered on zero evidence: on the CLI path the trace does
+/// not record whether a scan ran, so absent findings cannot be read as "scanned
+/// clean" (they usually mean the scanner simply wasn't run for this report). A
+/// detective control is covered only once it has produced findings.
+///
+/// `Partial`/`Documented` controls are never `covered`, regardless of evidence.
+/// `evidence_seen` is reported separately so a reader can always distinguish an
+/// active-but-quiet guard from one with observed events.
+pub fn compute_compliance(
+    catalog: &[ControlMapping],
+    calls: &[savings::Call],
+    findings: &[Finding],
+) -> ComplianceReport {
+    let controls = catalog
+        .iter()
+        .map(|c| {
+            // Seed the maps with every watched key at 0 so the report documents
+            // what each control watches even when nothing fired.
+            let mut decision_counts: BTreeMap<String, u64> = c
+                .evidence_decisions
+                .iter()
+                .map(|d| (d.to_string(), 0))
+                .collect();
+            for call in calls {
+                if let Some(v) = decision_counts.get_mut(&call.decision) {
+                    *v += 1;
+                }
+            }
+
+            let mut finding_counts: BTreeMap<String, u64> = c
+                .evidence_finding_kinds
+                .iter()
+                .map(|k| (k.to_string(), 0))
+                .collect();
+            for f in findings {
+                if let Some(v) = finding_counts.get_mut(&f.kind) {
+                    *v += 1;
+                }
+            }
+
+            // Incidents are not in the gateway trace — the later cloud endpoint
+            // fills this. Left explicit so the field's origin is unambiguous.
+            let incident_count = 0u64;
+
+            let decisions_seen: u64 = decision_counts.values().sum();
+            let findings_seen: u64 = finding_counts.values().sum();
+            let evidence_seen = decisions_seen > 0 || findings_seen > 0 || incident_count > 0;
+
+            // Preventive == blocks on the wire (has decision evidence). Detective
+            // == scanner (finding evidence only). See the fn doc for the rule.
+            let is_preventive = !c.evidence_decisions.is_empty();
+            let covered =
+                c.enforcement == Enforcement::Enforced && (evidence_seen || is_preventive);
+
+            ControlEvidence {
+                control_id: c.control_id,
+                title: c.title,
+                enforcement: c.enforcement,
+                decision_counts,
+                finding_counts,
+                incident_count,
+                covered,
+                evidence_seen,
+            }
+        })
+        .collect();
+
+    ComplianceReport {
+        generated_note: DISCLAIMER,
+        framework_versions: FRAMEWORK_VERSIONS,
+        controls,
+        decisions_total: calls.len() as u64,
+        findings_total: findings.len() as u64,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +750,163 @@ mod tests {
         assert!(json.contains("TF.BUDGET"));
         assert!(json.contains("\"enforced\""));
         assert!(json.contains("\"partial\""));
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::mcpreport::{Finding, Severity};
+    use crate::savings::Call;
+
+    fn call(run: &str, decision: &str) -> Call {
+        Call {
+            run_id: run.into(),
+            decision: decision.into(),
+            cost_microusd: 0,
+            saved_microusd: 0,
+        }
+    }
+
+    fn finding(kind: &str) -> Finding {
+        Finding {
+            kind: kind.into(),
+            severity: Severity::High,
+            tool: Some("t".into()),
+            message: "m".into(),
+        }
+    }
+
+    fn control<'a>(report: &'a ComplianceReport, id: &str) -> &'a ControlEvidence {
+        report
+            .controls
+            .iter()
+            .find(|c| c.control_id == id)
+            .unwrap_or_else(|| panic!("missing control {id}"))
+    }
+
+    #[test]
+    fn decision_counts_are_attributed_to_the_right_control() {
+        // A mixed trace: TF.BUDGET watches `budget_exceeded`, TF.LOOP watches
+        // `loop_detected`; `allow` rows belong to neither.
+        let calls = vec![
+            call("a", "allow"),
+            call("a", "budget_exceeded"),
+            call("b", "budget_exceeded"),
+            call("b", "loop_detected"),
+            call("c", "allow"),
+        ];
+        let report = compute_compliance(CATALOG, &calls, &[]);
+        assert_eq!(report.decisions_total, 5);
+
+        let budget = control(&report, "TF.BUDGET");
+        assert_eq!(
+            budget.decision_counts.get("budget_exceeded").copied(),
+            Some(2)
+        );
+        assert!(budget.evidence_seen);
+
+        let loops = control(&report, "TF.LOOP");
+        assert_eq!(loops.decision_counts.get("loop_detected").copied(), Some(1));
+    }
+
+    #[test]
+    fn watched_keys_are_seeded_to_zero() {
+        // With no matching traffic, a watched decision is still present at 0 so
+        // the report documents what the control watches.
+        let report = compute_compliance(CATALOG, &[], &[]);
+        let budget = control(&report, "TF.BUDGET");
+        assert_eq!(
+            budget.decision_counts.get("budget_exceeded").copied(),
+            Some(0)
+        );
+        assert!(!budget.evidence_seen);
+    }
+
+    #[test]
+    fn finding_counts_attach_to_scanner_controls() {
+        // Two poisoning findings land on TF.MCP.POISON (a detective control).
+        let findings = vec![
+            finding("poisoning"),
+            finding("poisoning"),
+            finding("rug_pull"),
+        ];
+        let report = compute_compliance(CATALOG, &[], &findings);
+        assert_eq!(report.findings_total, 3);
+
+        let poison = control(&report, "TF.MCP.POISON");
+        assert_eq!(poison.finding_counts.get("poisoning").copied(), Some(2));
+        assert!(poison.evidence_seen);
+        // Detective control WITH evidence is covered.
+        assert!(poison.covered);
+
+        let rug = control(&report, "TF.MCP.RUGPULL");
+        assert_eq!(rug.finding_counts.get("rug_pull").copied(), Some(1));
+    }
+
+    #[test]
+    fn detective_control_with_zero_findings_is_not_covered() {
+        // No scan report supplied → a scanner has no evidence it ran, so it is
+        // NOT covered even though it is Enforced.
+        let report = compute_compliance(CATALOG, &[], &[]);
+        let poison = control(&report, "TF.MCP.POISON");
+        assert_eq!(poison.enforcement, Enforcement::Enforced);
+        assert!(!poison.evidence_seen);
+        assert!(!poison.covered);
+    }
+
+    #[test]
+    fn preventive_enforced_control_with_zero_evidence_is_covered() {
+        // TF.KILL is Enforced + preventive (blocks on the wire). With zero
+        // recorded kills it is still covered (guard active, nothing tripped it)
+        // but evidence_seen is false so a reader can tell the difference.
+        let report = compute_compliance(CATALOG, &[], &[]);
+        let kill = control(&report, "TF.KILL");
+        assert_eq!(kill.enforcement, Enforcement::Enforced);
+        assert!(kill.covered);
+        assert!(!kill.evidence_seen);
+    }
+
+    #[test]
+    fn partial_control_is_never_covered_even_with_evidence() {
+        // TF.WASM is Partial and preventive (watches `wasm_policy`). Even with a
+        // matching decision it must not be covered — honesty over evidence.
+        let calls = vec![call("a", "wasm_policy")];
+        let report = compute_compliance(CATALOG, &calls, &[]);
+        let wasm = control(&report, "TF.WASM");
+        assert_eq!(wasm.enforcement, Enforcement::Partial);
+        assert_eq!(wasm.decision_counts.get("wasm_policy").copied(), Some(1));
+        assert!(wasm.evidence_seen);
+        assert!(!wasm.covered);
+    }
+
+    #[test]
+    fn incident_count_is_zero_on_the_cli_path() {
+        // Incidents live in the cloud store, not the trace; the CLI projection
+        // always reports 0 (the field is filled by the later cloud endpoint).
+        let report = compute_compliance(CATALOG, &[call("a", "budget_exceeded")], &[]);
+        assert!(report.controls.iter().all(|c| c.incident_count == 0));
+    }
+
+    #[test]
+    fn report_carries_disclaimer_and_framework_versions() {
+        let report = compute_compliance(CATALOG, &[], &[]);
+        assert_eq!(report.generated_note, DISCLAIMER);
+        assert_eq!(report.framework_versions.len(), FRAMEWORK_VERSIONS.len());
+        assert_eq!(report.controls.len(), CATALOG.len());
+    }
+
+    #[test]
+    fn report_serializes_to_json() {
+        let report = compute_compliance(
+            CATALOG,
+            &[call("a", "budget_exceeded")],
+            &[finding("poisoning")],
+        );
+        let json = serde_json::to_string(&report).expect("compliance report serializes");
+        assert!(json.contains("TF.BUDGET"));
+        assert!(json.contains("generated_note"));
+        assert!(json.contains("\"covered\""));
+        assert!(json.contains("evidence_seen"));
     }
 }

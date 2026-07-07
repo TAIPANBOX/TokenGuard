@@ -150,6 +150,7 @@ async fn main() {
         true, // write_lock: pin the fingerprint
         OutputMode::Human,
         None,
+        None,  // sarif_out
         true,  // skip_exposure: keep this demo focused on the rug-pull story
         false, // attempt_call
     )
@@ -195,6 +196,7 @@ async fn main() {
         false, // write_lock=false: diff against the STEP 1 lock
         OutputMode::Human,
         None,
+        None, // sarif_out
         true,
         false,
     )

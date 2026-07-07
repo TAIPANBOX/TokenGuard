@@ -10,7 +10,7 @@
 use std::fs;
 use tokenfuse_core::mcp::{diff, parse_tools, scan_injection, Drift, Lock, McpTool};
 use tokenfuse_core::mcpexposure::{exposure_findings, ssrf_capable_findings};
-use tokenfuse_core::mcpreport::ScanReport;
+use tokenfuse_core::mcpreport::{to_sarif, ScanReport};
 
 use crate::mcpclient::{fetch_tools_list, McpClientConfig};
 use crate::mcpexposure_probe::run_exposure_probe;
@@ -35,6 +35,7 @@ pub fn run(
     write_lock: bool,
     mode: OutputMode,
     json_out: Option<&str>,
+    sarif_out: Option<&str>,
 ) -> Result<ScanReport, String> {
     let raw = fs::read_to_string(tools_path).map_err(|e| format!("read {tools_path}: {e}"))?;
     let value: serde_json::Value =
@@ -44,7 +45,7 @@ pub fn run(
         println!("MCP scan — {} tool(s) in {tools_path}", tools.len());
     }
     let report = build_scan_report(&tools, lock_path, write_lock, mode)?;
-    emit_report(&report, mode, json_out)?;
+    emit_report(&report, mode, json_out, sarif_out)?;
     Ok(report)
 }
 
@@ -56,12 +57,18 @@ pub fn run(
 /// — opt-in via `attempt_call` — an unauthenticated `tools/call`) and merges
 /// their findings into the same report. File-mode scans ([`run`]) have no
 /// live server to probe, so exposure checks only run here.
+// Each argument is a distinct CLI flag threaded straight through from `main.rs`
+// (url, lock, write-lock, output mode, json-out, sarif-out, and the two live-
+// only toggles); grouping them into a struct would just move the same fields
+// around without adding clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_live(
     url: &str,
     lock_path: Option<&str>,
     write_lock: bool,
     mode: OutputMode,
     json_out: Option<&str>,
+    sarif_out: Option<&str>,
     skip_exposure: bool,
     attempt_call: bool,
 ) -> Result<ScanReport, String> {
@@ -95,7 +102,7 @@ pub async fn run_live(
         println!("  exposure scan: skipped (--skip-exposure)");
     }
 
-    emit_report(&report, mode, json_out)?;
+    emit_report(&report, mode, json_out, sarif_out)?;
     Ok(report)
 }
 
@@ -163,13 +170,14 @@ fn build_scan_report(
 }
 
 /// Print `report` as JSON (if `mode` is [`OutputMode::Json`]) and/or write it
-/// to `json_out`, if given. Split out of [`build_scan_report`] so
-/// [`run_live`] can merge exposure findings into the report before either
-/// happens.
+/// to `json_out` and/or a SARIF 2.1.0 doc to `sarif_out`, if given. Split out of
+/// [`build_scan_report`] so [`run_live`] can merge exposure findings into the
+/// report before either happens.
 fn emit_report(
     report: &ScanReport,
     mode: OutputMode,
     json_out: Option<&str>,
+    sarif_out: Option<&str>,
 ) -> Result<(), String> {
     if mode == OutputMode::Json {
         let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
@@ -179,6 +187,15 @@ fn emit_report(
     if let Some(path) = json_out {
         let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| format!("write {path}: {e}"))?;
+    }
+
+    if let Some(path) = sarif_out {
+        let sarif = to_sarif(report, &report.version);
+        let json = serde_json::to_string_pretty(&sarif).map_err(|e| e.to_string())?;
+        fs::write(path, json).map_err(|e| format!("write {path}: {e}"))?;
+        if mode == OutputMode::Human {
+            println!("  sarif: wrote SARIF 2.1.0 report to {path}");
+        }
     }
 
     Ok(())

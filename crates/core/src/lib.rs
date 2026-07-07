@@ -22,11 +22,14 @@ pub mod taint;
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};
 pub use breaker::{BreakerReason, BreakerVerdict};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
-pub use compliance::{ControlMapping, Enforcement, CATALOG, FRAMEWORK_VERSIONS};
+pub use compliance::{
+    compute_compliance, ComplianceReport, ControlEvidence, ControlMapping, Enforcement, CATALOG,
+    DISCLAIMER, FRAMEWORK_VERSIONS,
+};
 pub use dlp::DlpMode;
 pub use ledger::{BudgetError, Ledger, Reservation, RunSnapshot};
 pub use loops::{AnomalyConfig, Growth, Window};
-pub use mcpreport::{Finding, ScanReport, Severity};
+pub use mcpreport::{to_sarif, Finding, ScanReport, Severity};
 pub use money::Microusd;
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
 pub use pricing::{ModelPrice, PriceBook, Usage};

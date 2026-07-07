@@ -280,9 +280,18 @@ async fn run_live_merges_exposure_findings_and_respects_skip_flag() {
     let url = spawn(StubConfig::default()).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let with_exposure = run_live(&url, None, false, OutputMode::Human, None, false, false)
-        .await
-        .expect("run_live failed");
+    let with_exposure = run_live(
+        &url,
+        None,
+        false,
+        OutputMode::Human,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect("run_live failed");
     assert!(
         with_exposure
             .findings
@@ -292,9 +301,18 @@ async fn run_live_merges_exposure_findings_and_respects_skip_flag() {
         with_exposure.findings
     );
 
-    let without_exposure = run_live(&url, None, false, OutputMode::Human, None, true, false)
-        .await
-        .expect("run_live failed");
+    let without_exposure = run_live(
+        &url,
+        None,
+        false,
+        OutputMode::Human,
+        None,
+        None,
+        true,
+        false,
+    )
+    .await
+    .expect("run_live failed");
     assert!(
         without_exposure
             .findings
