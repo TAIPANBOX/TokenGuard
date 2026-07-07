@@ -225,6 +225,34 @@ pub fn should_fail(max: Option<Severity>, threshold: Option<Severity>) -> bool {
     }
 }
 
+/// The process exit code for an `mcp-scan` run, as a pure function of the
+/// outcome so it can be unit-tested without spawning the binary.
+///
+/// Three distinct codes so CI can tell a real failure from a clean pass:
+/// - **2** — the scan could not run or complete (`Err(_)`: bad args, a
+///   run/parse error, or nothing to scan). A never-run scan must NOT report
+///   green, so this is a config/run error, kept distinct from findings.
+/// - **1** — the scan produced a report whose worst finding meets or exceeds
+///   `threshold` (`should_fail`).
+/// - **0** — clean: a report with no findings at/over the threshold.
+///
+/// `Ok(max)` carries the report's worst severity (`None` = clean report).
+pub fn scan_exit_code<E>(
+    outcome: &Result<Option<Severity>, E>,
+    threshold: Option<Severity>,
+) -> i32 {
+    match outcome {
+        Err(_) => 2,
+        Ok(max) => {
+            if should_fail(*max, threshold) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +436,31 @@ mod tests {
         assert!(!should_fail(Some(Severity::Medium), Some(Severity::High)));
         assert!(!should_fail(None, Some(Severity::High)));
         assert!(!should_fail(Some(Severity::Critical), None));
+    }
+
+    #[test]
+    fn scan_exit_code_maps_outcomes() {
+        // A scan that could not run/parse (or bad args, or nothing to scan) is
+        // a config/run error: exit 2, so CI never sees green from a failed scan.
+        let err: Result<Option<Severity>, String> = Err("boom".into());
+        assert_eq!(scan_exit_code(&err, Some(Severity::High)), 2);
+
+        // Findings at/over the threshold: exit 1.
+        let over: Result<Option<Severity>, String> = Ok(Some(Severity::Critical));
+        assert_eq!(scan_exit_code(&over, Some(Severity::High)), 1);
+        let at: Result<Option<Severity>, String> = Ok(Some(Severity::High));
+        assert_eq!(scan_exit_code(&at, Some(Severity::High)), 1);
+
+        // Below the threshold, or a clean report, or `--fail-on none`: exit 0.
+        let under: Result<Option<Severity>, String> = Ok(Some(Severity::Medium));
+        assert_eq!(scan_exit_code(&under, Some(Severity::High)), 0);
+        let clean: Result<Option<Severity>, String> = Ok(None);
+        assert_eq!(scan_exit_code(&clean, Some(Severity::High)), 0);
+        let fail_disabled: Result<Option<Severity>, String> = Ok(Some(Severity::Critical));
+        assert_eq!(scan_exit_code(&fail_disabled, None), 0);
+        // An error still exits 2 even with failing disabled — a broken scan is
+        // not a clean pass.
+        assert_eq!(scan_exit_code(&err, None), 2);
     }
 
     #[test]

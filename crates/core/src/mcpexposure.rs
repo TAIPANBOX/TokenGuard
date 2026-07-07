@@ -118,16 +118,27 @@ pub fn host_is_local(host: &str) -> bool {
 pub fn parse_url_host_scheme(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.trim().to_lowercase();
-    // Drop userinfo (`user:pass@host`) if present.
-    let authority_and_path = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-    let host = if let Some(after_bracket) = authority_and_path.strip_prefix('[') {
+    // Isolate the AUTHORITY first: everything up to the first '/', '?', or '#'.
+    // Splitting on '@' over the *whole* remainder is wrong — an '@' in the
+    // path/query/fragment (e.g. `…/x?cb=a@b`) would be mistaken for a userinfo
+    // separator and yield a bogus host. Confining the '@' split to the
+    // authority prevents that.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // Drop userinfo (`user:pass@host`) — now only within the authority.
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        // Bracketed IPv6 literal: host is everything inside the brackets.
         let end = after_bracket.find(']')?;
         after_bracket[..end].to_string()
     } else {
-        let end = authority_and_path
-            .find(['/', '?', '#', ':'])
-            .unwrap_or(authority_and_path.len());
-        authority_and_path[..end].to_string()
+        // host[:port] — the authority no longer contains '/', '?' or '#', so
+        // only a ':' port separator can remain to strip.
+        let end = host_port.find(':').unwrap_or(host_port.len());
+        host_port[..end].to_string()
     };
     if host.is_empty() {
         return None;
@@ -380,6 +391,59 @@ mod tests {
         assert_eq!(
             parse_url_host_scheme("http://[::1]:4200/rpc"),
             Some(("http".to_string(), "::1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_url_host_scheme_ignores_at_in_path_query_fragment() {
+        // An '@' anywhere after the authority (path, query, fragment) must not
+        // be treated as a userinfo separator — the host is still the authority.
+        assert_eq!(
+            parse_url_host_scheme("https://mcp.example.com/x?cb=a@b"),
+            Some(("https".to_string(), "mcp.example.com".to_string()))
+        );
+        assert_eq!(
+            parse_url_host_scheme("https://mcp.example.com/path@segment"),
+            Some(("https".to_string(), "mcp.example.com".to_string()))
+        );
+        assert_eq!(
+            parse_url_host_scheme("https://mcp.example.com/#frag@ment"),
+            Some(("https".to_string(), "mcp.example.com".to_string()))
+        );
+        // With a port too, so the port strip still runs after authority isolation.
+        assert_eq!(
+            parse_url_host_scheme("http://mcp.example.com:8443/x?cb=a@b"),
+            Some(("http".to_string(), "mcp.example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_url_host_scheme_strips_userinfo_in_authority() {
+        // Genuine userinfo (`user:pass@host`) is still stripped.
+        assert_eq!(
+            parse_url_host_scheme("https://user:pass@mcp.example.com/rpc"),
+            Some(("https".to_string(), "mcp.example.com".to_string()))
+        );
+        assert_eq!(
+            parse_url_host_scheme("https://user@mcp.example.com:8443/rpc?x=1@2"),
+            Some(("https".to_string(), "mcp.example.com".to_string()))
+        );
+        // Userinfo containing a bracketed IPv6 host with a port.
+        assert_eq!(
+            parse_url_host_scheme("http://user:pass@[fe80::1]:4200/rpc"),
+            Some(("http".to_string(), "fe80::1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_url_host_scheme_ipv6_with_port_and_no_port() {
+        assert_eq!(
+            parse_url_host_scheme("http://[::1]:4200/rpc"),
+            Some(("http".to_string(), "::1".to_string()))
+        );
+        assert_eq!(
+            parse_url_host_scheme("https://[2001:db8::1]/mcp"),
+            Some(("https".to_string(), "2001:db8::1".to_string()))
         );
     }
 

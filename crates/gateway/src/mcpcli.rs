@@ -25,18 +25,39 @@ pub enum OutputMode {
     Json,
 }
 
+/// The pass-through scan flags common to [`run`] and [`run_live`], threaded
+/// from `main.rs`. Grouping them in a named struct (rather than a long
+/// positional argument list) makes the adjacent-`bool` swap
+/// (`skip_exposure`/`attempt_call`) impossible at the call site and removes
+/// the `too_many_arguments` lint. The input source (a file path for [`run`],
+/// a URL for [`run_live`]) stays a separate parameter — it's what
+/// distinguishes the two entry points.
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    /// `--lock <file>`: diff against (or, with `write_lock`, pin to) this lockfile.
+    pub lock_path: Option<String>,
+    /// `--write-lock`: (over)write the lockfile from the current tool set.
+    pub write_lock: bool,
+    /// Output rendering (`--json` selects [`OutputMode::Json`]).
+    pub mode: OutputMode,
+    /// `--json-out <file>`: also write the JSON report here.
+    pub json_out: Option<String>,
+    /// `--sarif <file>`: also write a SARIF 2.1.0 report here.
+    pub sarif_out: Option<String>,
+    /// `--skip-exposure`: skip the live server-exposure checks. Live-only
+    /// ([`run_live`]); ignored by [`run`] (file mode has no server to probe).
+    pub skip_exposure: bool,
+    /// `--attempt-call`: opt into the one invasive exposure check (an
+    /// unauthenticated `tools/call`). Live-only; ignored by [`run`].
+    pub attempt_call: bool,
+}
+
 /// Scan `tools_path` (a saved `tools/list` JSON). Optionally diff against
 /// `lock_path`, and optionally (over)write the lock. Prints per `mode` and
 /// optionally also writes the JSON report to `json_out`. Returns the
 /// [`ScanReport`] so the caller can decide the exit code.
-pub fn run(
-    tools_path: &str,
-    lock_path: Option<&str>,
-    write_lock: bool,
-    mode: OutputMode,
-    json_out: Option<&str>,
-    sarif_out: Option<&str>,
-) -> Result<ScanReport, String> {
+pub fn run(tools_path: &str, opts: &ScanOptions) -> Result<ScanReport, String> {
+    let mode = opts.mode;
     let raw = fs::read_to_string(tools_path).map_err(|e| format!("read {tools_path}: {e}"))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {tools_path}: {e}"))?;
@@ -44,8 +65,13 @@ pub fn run(
     if mode == OutputMode::Human {
         println!("MCP scan — {} tool(s) in {tools_path}", tools.len());
     }
-    let report = build_scan_report(&tools, lock_path, write_lock, mode)?;
-    emit_report(&report, mode, json_out, sarif_out)?;
+    let report = build_scan_report(&tools, opts.lock_path.as_deref(), opts.write_lock, mode)?;
+    emit_report(
+        &report,
+        mode,
+        opts.json_out.as_deref(),
+        opts.sarif_out.as_deref(),
+    )?;
     Ok(report)
 }
 
@@ -57,31 +83,18 @@ pub fn run(
 /// — opt-in via `attempt_call` — an unauthenticated `tools/call`) and merges
 /// their findings into the same report. File-mode scans ([`run`]) have no
 /// live server to probe, so exposure checks only run here.
-// Each argument is a distinct CLI flag threaded straight through from `main.rs`
-// (url, lock, write-lock, output mode, json-out, sarif-out, and the two live-
-// only toggles); grouping them into a struct would just move the same fields
-// around without adding clarity.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_live(
-    url: &str,
-    lock_path: Option<&str>,
-    write_lock: bool,
-    mode: OutputMode,
-    json_out: Option<&str>,
-    sarif_out: Option<&str>,
-    skip_exposure: bool,
-    attempt_call: bool,
-) -> Result<ScanReport, String> {
+pub async fn run_live(url: &str, opts: &ScanOptions) -> Result<ScanReport, String> {
+    let mode = opts.mode;
     let cfg = McpClientConfig::new(url);
     let value = fetch_tools_list(&cfg).await.map_err(|e| e.to_string())?;
     let tools = parse_tools(&value);
     if mode == OutputMode::Human {
         println!("MCP scan — {} tool(s) live from {url}", tools.len());
     }
-    let mut report = build_scan_report(&tools, lock_path, write_lock, mode)?;
+    let mut report = build_scan_report(&tools, opts.lock_path.as_deref(), opts.write_lock, mode)?;
 
-    if !skip_exposure {
-        let outcome = run_exposure_probe(url, &tools, attempt_call).await;
+    if !opts.skip_exposure {
+        let outcome = run_exposure_probe(url, &tools, opts.attempt_call).await;
         let mut extra = exposure_findings(&outcome);
         extra.extend(ssrf_capable_findings(&tools));
         if mode == OutputMode::Human {
@@ -102,7 +115,12 @@ pub async fn run_live(
         println!("  exposure scan: skipped (--skip-exposure)");
     }
 
-    emit_report(&report, mode, json_out, sarif_out)?;
+    emit_report(
+        &report,
+        mode,
+        opts.json_out.as_deref(),
+        opts.sarif_out.as_deref(),
+    )?;
     Ok(report)
 }
 

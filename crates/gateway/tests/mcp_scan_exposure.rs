@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokenfuse_core::mcp::McpTool;
 use tokenfuse_core::mcpexposure::{exposure_findings, CallAttempt};
 use tokenfuse_core::mcpreport::Severity;
-use tokenfuse_gateway::mcpcli::{run_live, OutputMode};
+use tokenfuse_gateway::mcpcli::{run_live, OutputMode, ScanOptions};
 use tokenfuse_gateway::mcpexposure_probe::run_exposure_probe;
 
 /// Stub server config: whether it demands an `authorization` header (401s
@@ -282,13 +282,10 @@ async fn run_live_merges_exposure_findings_and_respects_skip_flag() {
 
     let with_exposure = run_live(
         &url,
-        None,
-        false,
-        OutputMode::Human,
-        None,
-        None,
-        false,
-        false,
+        &ScanOptions {
+            mode: OutputMode::Human,
+            ..Default::default()
+        },
     )
     .await
     .expect("run_live failed");
@@ -303,13 +300,11 @@ async fn run_live_merges_exposure_findings_and_respects_skip_flag() {
 
     let without_exposure = run_live(
         &url,
-        None,
-        false,
-        OutputMode::Human,
-        None,
-        None,
-        true,
-        false,
+        &ScanOptions {
+            mode: OutputMode::Human,
+            skip_exposure: true,
+            ..Default::default()
+        },
     )
     .await
     .expect("run_live failed");

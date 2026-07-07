@@ -6,7 +6,7 @@
 use std::fs;
 
 use tokenfuse_core::Severity;
-use tokenfuse_gateway::mcpcli::{run, OutputMode};
+use tokenfuse_gateway::mcpcli::{run, OutputMode, ScanOptions};
 
 /// A scratch dir unique to this test binary's process, mirroring the
 /// `tf-<thing>-<pid>` convention used by `sink.rs` / `sqlq.rs` tests.
@@ -32,11 +32,12 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
     fs::write(&tools_path, clean.to_string()).unwrap();
     run(
         tools_path.to_str().unwrap(),
-        Some(lock_path.to_str().unwrap()),
-        true, // --write-lock
-        OutputMode::Human,
-        None,
-        None,
+        &ScanOptions {
+            lock_path: Some(lock_path.to_str().unwrap().to_string()),
+            write_lock: true, // --write-lock
+            mode: OutputMode::Human,
+            ..Default::default()
+        },
     )
     .expect("write-lock run should succeed");
 
@@ -50,11 +51,14 @@ fn json_mode_emits_parseable_json_with_findings_summary_and_critical_max() {
 
     let report = run(
         tools_path.to_str().unwrap(),
-        Some(lock_path.to_str().unwrap()),
-        false, // diff against the lock, don't rewrite it
-        OutputMode::Json,
-        Some(json_out_path.to_str().unwrap()),
-        Some(sarif_out_path.to_str().unwrap()),
+        &ScanOptions {
+            lock_path: Some(lock_path.to_str().unwrap().to_string()),
+            write_lock: false, // diff against the lock, don't rewrite it
+            mode: OutputMode::Json,
+            json_out: Some(json_out_path.to_str().unwrap().to_string()),
+            sarif_out: Some(sarif_out_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        },
     )
     .expect("json run should succeed");
 
@@ -116,11 +120,10 @@ fn poisoning_only_yields_high_max_severity() {
 
     let report = run(
         tools_path.to_str().unwrap(),
-        None,
-        false,
-        OutputMode::Json,
-        None,
-        None,
+        &ScanOptions {
+            mode: OutputMode::Json,
+            ..Default::default()
+        },
     )
     .expect("run should succeed");
 
@@ -142,11 +145,10 @@ fn clean_server_yields_no_max_severity() {
 
     let report = run(
         tools_path.to_str().unwrap(),
-        None,
-        false,
-        OutputMode::Human,
-        None,
-        None,
+        &ScanOptions {
+            mode: OutputMode::Human,
+            ..Default::default()
+        },
     )
     .expect("run should succeed");
 

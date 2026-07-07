@@ -1,22 +1,10 @@
 //! `tokenfuse backtest` — replay a candidate policy over the Parquet trace and
 //! print what it would have blocked and saved.
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
+use datafusion::arrow::array::Int64Array;
 use tokenfuse_core::backtest::{backtest, BacktestPolicy, Call};
 
-use crate::sqlq::query;
-
-/// Read a string cell whether the column is `Utf8` or `Utf8View` (DataFusion
-/// picks the view type by default).
-fn str_at(col: &dyn Array, i: usize) -> String {
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return a.value(i).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return a.value(i).to_string();
-    }
-    String::new()
-}
+use crate::sqlq::{query, str_at};
 
 /// Load the trace, run the backtest, and print the report.
 pub async fn run(dir: &str, policy: BacktestPolicy) -> Result<(), Box<dyn std::error::Error>> {

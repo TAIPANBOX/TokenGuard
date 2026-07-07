@@ -1,11 +1,14 @@
 //! Breaker: a facade that unifies TokenFuse's seven existing block reasons
 //! (budget, policy, loop, kill, WASM policy, taint, DLP) behind one type.
 //!
-//! This module is purely additive: it does not change the enforcement path in
-//! `crates/gateway/src/proxy.rs`. It mirrors the wire contract that proxy.rs
-//! already produces (`budget_error`, `dlp_block`, `firewall_block`) so that a
-//! future call site can build a `BreakerVerdict` and get byte-compatible JSON,
-//! but nothing calls this module yet.
+//! Adoption is partial. The 402 budget-family block sites in
+//! `crates/gateway/src/proxy.rs` (budget, policy, loop, kill, WASM policy) now
+//! build a `BreakerVerdict` and render their response through this facade
+//! (`breaker_error_response`). The 403 sites — `dlp_block` and `firewall_block`
+//! (DLP/taint) — do NOT go through it yet; they still build their JSON
+//! directly. The facade mirrors the wire contract proxy.rs produces
+//! (`budget_error`, `dlp_block`, `firewall_block`) so those remaining sites can
+//! migrate later without a wire change.
 
 use serde::Serialize;
 

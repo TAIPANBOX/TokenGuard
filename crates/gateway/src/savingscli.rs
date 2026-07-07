@@ -7,23 +7,10 @@
 //! [`crate::backtestcli`]'s shape — a thin loader over [`crate::sqlq::query`]
 //! plus a human summary.
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
-use tokenfuse_core::savings::{compute_savings, Call};
+use tokenfuse_core::savings::compute_savings;
 use tokenfuse_core::Microusd;
 
-use crate::sqlq::query;
-
-/// Read a string cell whether the column is `Utf8` or `Utf8View` (DataFusion
-/// picks the view type by default).
-fn str_at(col: &dyn Array, i: usize) -> String {
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return a.value(i).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return a.value(i).to_string();
-    }
-    String::new()
-}
+use crate::sqlq::load_calls;
 
 /// Load the trace, aggregate the savings, and print the report.
 ///
@@ -34,7 +21,7 @@ pub async fn run(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // A missing dir (nothing recorded yet) makes DataFusion error on register;
     // treat that the same as an empty trace rather than surfacing a stack of
     // Parquet internals to someone who just hasn't sent traffic yet.
-    let calls = match load_calls(dir).await {
+    let calls = match load_calls(dir, None, None).await {
         Ok(calls) => calls,
         Err(_) => {
             print_empty(dir);
@@ -73,46 +60,6 @@ pub async fn run(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn print_empty(dir: &str) {
     println!("TokenFuse savings — no trace yet at {dir}");
     println!("  set TOKENFUSE_DATA_DIR and run some traffic, then try again.");
-}
-
-/// Load the `run_id`, `decision`, and `cost_microusd` columns from the trace.
-///
-/// Mirrors [`crate::backtestcli`]'s loader but reads `decision` (not `step`),
-/// since savings keys off the block reason. Both read the same `calls` table.
-async fn load_calls(dir: &str) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
-    // `coalesce(saved_microusd, 0)` makes the read robust across schema
-    // evolution: files written before P2 lack the column entirely, and
-    // DataFusion surfaces it as NULL for their rows (it unions the per-file
-    // schemas and null-fills the gaps — see `sqlq::tests`). Coalesce maps that
-    // to the documented default of 0, so old and new files aggregate together.
-    let batches = query(
-        "select run_id, decision, cast(cost_microusd as bigint) as cost, \
-         cast(coalesce(saved_microusd, 0) as bigint) as saved from calls",
-        dir,
-    )
-    .await?;
-    let mut calls = Vec::new();
-    for b in &batches {
-        let cost = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("cost column type")?;
-        let saved = b
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("saved column type")?;
-        for i in 0..b.num_rows() {
-            calls.push(Call {
-                run_id: str_at(b.column(0).as_ref(), i),
-                decision: str_at(b.column(1).as_ref(), i),
-                cost_microusd: cost.value(i),
-                saved_microusd: saved.value(i),
-            });
-        }
-    }
-    Ok(calls)
 }
 
 #[cfg(test)]

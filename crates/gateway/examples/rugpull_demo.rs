@@ -46,7 +46,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use tokenfuse_gateway::mcpcli::{run_live, OutputMode};
+use tokenfuse_gateway::mcpcli::{run_live, OutputMode, ScanOptions};
 
 /// Shared, mutable `tools/list` payload for the in-process stub server. A
 /// real MCP server would read this from wherever it stores tool definitions;
@@ -146,13 +146,13 @@ async fn main() {
     println!("--- STEP 1: pin the approved (benign) tool set ---");
     let pin_report = run_live(
         &url,
-        Some(&lock_path_str),
-        true, // write_lock: pin the fingerprint
-        OutputMode::Human,
-        None,
-        None,  // sarif_out
-        true,  // skip_exposure: keep this demo focused on the rug-pull story
-        false, // attempt_call
+        &ScanOptions {
+            lock_path: Some(lock_path_str.clone()),
+            write_lock: true, // pin the fingerprint
+            mode: OutputMode::Human,
+            skip_exposure: true, // keep this demo focused on the rug-pull story
+            ..Default::default()
+        },
     )
     .await
     .expect("pin scan against the stub server failed");
@@ -192,13 +192,13 @@ async fn main() {
     println!("--- STEP 3: rescan against the pinned lock ---");
     let detect_report = run_live(
         &url,
-        Some(&lock_path_str),
-        false, // write_lock=false: diff against the STEP 1 lock
-        OutputMode::Human,
-        None,
-        None, // sarif_out
-        true,
-        false,
+        &ScanOptions {
+            lock_path: Some(lock_path_str.clone()),
+            write_lock: false, // diff against the STEP 1 lock
+            mode: OutputMode::Human,
+            skip_exposure: true,
+            ..Default::default()
+        },
     )
     .await
     .expect("detect scan against the stub server failed");

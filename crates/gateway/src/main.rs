@@ -128,86 +128,72 @@ async fn main() {
                 .enumerate()
                 .find(|(i, a)| !a.starts_with("--") && !flag_value_idx.contains(&Some(*i)))
                 .map(|(_, a)| a.clone());
-            let report = match (tools_path, url) {
+            let opts = tokenfuse_gateway::mcpcli::ScanOptions {
+                lock_path,
+                write_lock,
+                mode,
+                json_out,
+                sarif_out,
+                skip_exposure,
+                attempt_call,
+            };
+            // Ok(report) on a completed scan; Err(()) when the scan could not
+            // run (bad args, a run/parse error, or nothing to scan). The Err
+            // arms all `eprintln!` the reason so the operator sees it before
+            // the non-zero exit below.
+            let report: Result<tokenfuse_core::mcpreport::ScanReport, ()> = match (tools_path, url)
+            {
                 (Some(_), Some(_)) => {
                     eprintln!("mcp-scan error: pass either <tools.json> or --url, not both");
-                    None
+                    Err(())
                 }
-                (None, Some(url)) => {
-                    match tokenfuse_gateway::mcpcli::run_live(
-                        &url,
-                        lock_path.as_deref(),
-                        write_lock,
-                        mode,
-                        json_out.as_deref(),
-                        sarif_out.as_deref(),
-                        skip_exposure,
-                        attempt_call,
-                    )
+                (None, Some(url)) => tokenfuse_gateway::mcpcli::run_live(&url, &opts)
                     .await
-                    {
-                        Ok(report) => Some(report),
-                        Err(e) => {
-                            eprintln!("mcp-scan error: {e}");
-                            None
-                        }
-                    }
-                }
+                    .map_err(|e| eprintln!("mcp-scan error: {e}")),
                 (Some(p), None) => {
                     // Exposure checks only make sense against a live server
                     // (`--url`); file mode has nothing to probe. Rather than
                     // silently ignoring a flag the caller took the trouble
                     // to pass, say so — a misused flag in a CI script should
                     // be visible, not a silent no-op.
-                    if skip_exposure || attempt_call {
+                    if opts.skip_exposure || opts.attempt_call {
                         eprintln!(
                             "mcp-scan: note: --skip-exposure/--attempt-call only apply to --url (live) scans; ignoring for file mode"
                         );
                     }
-                    match tokenfuse_gateway::mcpcli::run(
-                        &p,
-                        lock_path.as_deref(),
-                        write_lock,
-                        mode,
-                        json_out.as_deref(),
-                        sarif_out.as_deref(),
-                    ) {
-                        Ok(report) => Some(report),
-                        Err(e) => {
-                            eprintln!("mcp-scan error: {e}");
-                            None
-                        }
-                    }
+                    tokenfuse_gateway::mcpcli::run(&p, &opts)
+                        .map_err(|e| eprintln!("mcp-scan error: {e}"))
                 }
                 (None, None) => {
                     eprintln!(
                         "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call]"
                     );
-                    None
+                    Err(())
                 }
             };
 
-            if let Some(report) = report {
-                let max = report.max_severity();
-                let fail = tokenfuse_core::mcpreport::should_fail(max, threshold);
+            // Distinct exit codes so CI can distinguish outcomes: 2 = the scan
+            // errored/never ran (above), 1 = findings ≥ threshold, 0 = clean.
+            // A failed/never-run scan must NOT exit 0 (green) — that's the
+            // whole point of the gate.
+            let outcome = report.as_ref().map(|r| r.max_severity()).map_err(|_| ());
+            let code = tokenfuse_core::mcpreport::scan_exit_code(&outcome, threshold);
+            if let Ok(report) = &report {
                 if mode == tokenfuse_gateway::mcpcli::OutputMode::Human {
                     let count = |s: tokenfuse_core::Severity| {
                         report.summary.get(s.as_str()).copied().unwrap_or(0)
                     };
                     let threshold_str = threshold.map(|t| t.as_str()).unwrap_or("none");
                     println!(
-                        "RESULT: {} critical, {} high, {} medium, {} low — exit {} (fail-on: {threshold_str})",
+                        "RESULT: {} critical, {} high, {} medium, {} low — exit {code} (fail-on: {threshold_str})",
                         count(tokenfuse_core::Severity::Critical),
                         count(tokenfuse_core::Severity::High),
                         count(tokenfuse_core::Severity::Medium),
                         count(tokenfuse_core::Severity::Low),
-                        if fail { 1 } else { 0 },
                     );
                 }
-                if fail {
-                    std::process::exit(1);
-                }
             }
+            std::process::exit(code);
         }
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
         Some("mcp-broker") => mcp_broker().await,

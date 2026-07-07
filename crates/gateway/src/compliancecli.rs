@@ -9,13 +9,11 @@
 //! [`tokenfuse_core::compliance::compute_compliance`]. Nothing here is a
 //! certification — see the disclaimer emitted with every report.
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use tokenfuse_core::compliance::{compute_compliance, ComplianceReport, ControlEvidence};
 use tokenfuse_core::mcpreport::{Finding, ScanReport};
-use tokenfuse_core::savings::Call;
 use tokenfuse_core::{Enforcement, CATALOG};
 
-use crate::sqlq::query;
+use crate::sqlq::load_calls;
 
 /// Parsed `tokenfuse compliance` flags.
 #[derive(Debug, Clone, Default)]
@@ -49,18 +47,6 @@ pub fn parse_args(args: &[String]) -> Args {
         }
     }
     out
-}
-
-/// Read a string cell whether the column is `Utf8` or `Utf8View` (DataFusion
-/// picks the view type by default).
-fn str_at(col: &dyn Array, i: usize) -> String {
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return a.value(i).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return a.value(i).to_string();
-    }
-    String::new()
 }
 
 /// Load the trace, attach any scan-report findings, and emit the report.
@@ -111,58 +97,6 @@ fn load_findings(path: &str) -> Result<Vec<Finding>, Box<dyn std::error::Error>>
     let report: ScanReport =
         serde_json::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))?;
     Ok(report.findings)
-}
-
-/// Load `run_id`, `decision`, `cost_microusd`, `saved_microusd` from the trace,
-/// optionally filtered to a `[since, until]` `ts_millis` window. Mirrors
-/// [`crate::savingscli`]'s loader (same `Call` rows) plus the time filter.
-async fn load_calls(
-    dir: &str,
-    since: Option<i64>,
-    until: Option<i64>,
-) -> Result<Vec<Call>, Box<dyn std::error::Error>> {
-    // `coalesce(saved_microusd, 0)` keeps the read robust across schema
-    // evolution (pre-P2 files lack the column). `since`/`until` are parsed i64
-    // literals, so inlining them into the WHERE clause is injection-safe.
-    let mut sql = String::from(
-        "select run_id, decision, cast(cost_microusd as bigint) as cost, \
-         cast(coalesce(saved_microusd, 0) as bigint) as saved from calls",
-    );
-    let mut conds: Vec<String> = Vec::new();
-    if let Some(s) = since {
-        conds.push(format!("ts_millis >= {s}"));
-    }
-    if let Some(u) = until {
-        conds.push(format!("ts_millis <= {u}"));
-    }
-    if !conds.is_empty() {
-        sql.push_str(" where ");
-        sql.push_str(&conds.join(" and "));
-    }
-
-    let batches = query(&sql, dir).await?;
-    let mut calls = Vec::new();
-    for b in &batches {
-        let cost = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("cost column type")?;
-        let saved = b
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("saved column type")?;
-        for i in 0..b.num_rows() {
-            calls.push(Call {
-                run_id: str_at(b.column(0).as_ref(), i),
-                decision: str_at(b.column(1).as_ref(), i),
-                cost_microusd: cost.value(i),
-                saved_microusd: saved.value(i),
-            });
-        }
-    }
-    Ok(calls)
 }
 
 /// The enforcement label used in both human and Markdown output.

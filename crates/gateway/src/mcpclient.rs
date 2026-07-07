@@ -13,7 +13,15 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use serde_json::{json, Value};
+
+/// Default cap on a single response body the scanner will buffer, in bytes
+/// (8 MiB). `total_timeout` bounds how *long* a fetch runs but not how *much*
+/// it reads: a hostile/misbehaving MCP server can stream gigabytes within the
+/// window and OOM the (CI-runner) scanning host. This caps the size too.
+/// Overridable via `TOKENFUSE_MCP_SCAN_MAX_BODY_BYTES`.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Config for a single live `tools/list` fetch.
 pub struct McpClientConfig {
@@ -23,6 +31,10 @@ pub struct McpClientConfig {
     /// Extra headers to send on every request (e.g. auth for the target MCP
     /// server). Sent as-is, in addition to `content-type` and `accept`.
     pub extra_headers: Vec<(String, String)>,
+    /// Maximum response body (bytes) to buffer per request; reads beyond this
+    /// abort with [`McpClientError::BodyTooLarge`] instead of growing the
+    /// buffer unboundedly. See [`DEFAULT_MAX_BODY_BYTES`].
+    pub max_body_bytes: usize,
 }
 
 impl McpClientConfig {
@@ -38,11 +50,16 @@ impl McpClientConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(15);
+        let max_body_bytes = std::env::var("TOKENFUSE_MCP_SCAN_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_BODY_BYTES);
         McpClientConfig {
             url: url.into(),
             connect_timeout: Duration::from_secs(connect_secs),
             total_timeout: Duration::from_secs(total_secs),
             extra_headers: Vec::new(),
+            max_body_bytes,
         }
     }
 }
@@ -59,6 +76,32 @@ pub enum McpClientError {
     /// (neither `application/json` nor `text/event-stream`).
     #[error("{0}")]
     UnsupportedTransport(String),
+    /// The response body exceeded the configured size cap
+    /// ([`McpClientConfig::max_body_bytes`]) — aborted before buffering it all,
+    /// so a hostile/oversized body can't OOM the scanning host.
+    #[error("response body exceeded the {limit}-byte scan cap (set TOKENFUSE_MCP_SCAN_MAX_BODY_BYTES to change)")]
+    BodyTooLarge { limit: usize },
+}
+
+/// Buffer a response body, aborting once it exceeds `max_bytes`. Streams the
+/// body in chunks (rather than `resp.bytes()`, which buffers the whole thing
+/// unconditionally) so an oversized/hostile body fails fast with
+/// [`McpClientError::BodyTooLarge`] instead of growing the buffer without
+/// bound. Applies to both the JSON and SSE response paths.
+async fn read_body_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, McpClientError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| McpClientError::Transport(e.to_string()))?;
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(McpClientError::BodyTooLarge { limit: max_bytes });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Fetch a live `tools/list` snapshot over Streamable HTTP: `initialize`,
@@ -146,10 +189,7 @@ async fn post_rpc_full(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| McpClientError::Transport(e.to_string()))?;
+    let bytes = read_body_capped(resp, cfg.max_body_bytes).await?;
 
     if !status.is_success() {
         return Err(McpClientError::Status {
@@ -361,7 +401,10 @@ async fn send_notification(
     let resp = send(client, cfg, req, session_id).await?;
     let status = resp.status();
     if !status.is_success() {
-        let bytes = resp.bytes().await.unwrap_or_default();
+        // Cap the error body too — a hostile server could stream a huge one.
+        let bytes = read_body_capped(resp, cfg.max_body_bytes)
+            .await
+            .unwrap_or_default();
         return Err(McpClientError::Status {
             status: status.as_u16(),
             body: String::from_utf8_lossy(&bytes).into_owned(),
