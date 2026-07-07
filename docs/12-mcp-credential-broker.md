@@ -122,6 +122,13 @@ CLI itself is self-scan-only (see above). See
 `.github/workflows/mcp-scan-example.yml` in this repo for a full,
 copy-pasteable `workflow_dispatch` template.
 
+## Demo: see a rug pull caught live
+
+[docs/17 · Rug-pull demo](17-rugpull-demo.md) — `cargo run --example
+rugpull_demo -p tokenfuse-gateway` runs the pin-then-diff rug-pull check
+above against a self-contained in-process stub server, end to end, printing
+the `⛔ RUG PULL` / `Critical` output described in this doc.
+
 ## Not yet (follow-ups)
 
 - Spawning a **child stdio MCP server** (today the broker forwards to an HTTP

@@ -397,6 +397,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
 | [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
+| [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` — a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
 
 ---
 
