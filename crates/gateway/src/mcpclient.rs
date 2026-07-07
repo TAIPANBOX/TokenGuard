@@ -3,11 +3,13 @@
 //! (`initialize` → `notifications/initialized` → `tools/list`) as single POSTs
 //! against one endpoint, per the MCP Streamable HTTP transport spec.
 //!
-//! SSE responses (the server choosing to stream its reply over
-//! `text/event-stream`) are detected but not parsed — that's a follow-up
-//! (`McpClientError::UnsupportedTransport`). This client is a bounded,
-//! one-shot RPC: it exists to fetch a `tools/list` snapshot for scanning, not
-//! to hold a long-lived session.
+//! A server may reply to any of those POSTs with either a single JSON object
+//! (`content-type: application/json`) or an SSE stream
+//! (`content-type: text/event-stream`) carrying the JSON-RPC response inside
+//! one of its `data:` events. This client is a bounded, one-shot RPC — it
+//! buffers the SSE body in full within `total_timeout` rather than parsing it
+//! incrementally — and exists to fetch a `tools/list` snapshot for scanning,
+//! not to hold a long-lived session.
 
 use std::time::Duration;
 
@@ -53,8 +55,8 @@ pub enum McpClientError {
     Status { status: u16, body: String },
     #[error("could not parse server response: {0}")]
     Parse(String),
-    /// The server chose to stream its response as SSE (`text/event-stream`).
-    /// Parsing that stream is a follow-up; PR1 only speaks single-shot JSON.
+    /// The server responded with a `content-type` this client doesn't speak
+    /// (neither `application/json` nor `text/event-stream`).
     #[error("{0}")]
     UnsupportedTransport(String),
 }
@@ -145,14 +147,74 @@ async fn post_rpc(
     }
 
     if content_type.starts_with("text/event-stream") {
-        return Err(McpClientError::UnsupportedTransport(
-            "server responded with SSE; streamable-SSE support lands in a follow-up".to_string(),
-        ));
+        let text = String::from_utf8_lossy(&bytes);
+        let want_id = req.get("id");
+        for frame in parse_sse_frames(&text) {
+            if frame.get("id") == want_id {
+                return Ok((frame, sid));
+            }
+        }
+        return Err(McpClientError::Parse(format!(
+            "SSE stream ended without a response matching request id {:?}",
+            want_id.unwrap_or(&Value::Null)
+        )));
+    }
+
+    if !content_type.starts_with("application/json") {
+        return Err(McpClientError::UnsupportedTransport(format!(
+            "server responded with unsupported content-type {content_type:?}"
+        )));
     }
 
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|e| McpClientError::Parse(e.to_string()))?;
     Ok((value, sid))
+}
+
+/// Parse an SSE body into the JSON-RPC frames carried in its `data:` fields.
+///
+/// Mirrors the `data:`-line handling in `provider::UsageParser::finish`, but
+/// honors the SSE spec's multi-line `data:` continuation: consecutive `data:`
+/// lines within one event are joined with `\n` before parsing, and a blank
+/// line ends the event. Non-`data:` fields (`event:`, `id:`, `retry:`,
+/// comments) are ignored — this client only needs the JSON-RPC payload.
+fn parse_sse_frames(text: &str) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut data_lines: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_sse_event(&mut data_lines, &mut frames);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            // Per the SSE spec, a single leading space after the colon is
+            // stripped; the rest of the line is taken verbatim.
+            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+        // Other fields (event:, id:, retry:, ": comment") don't carry the
+        // JSON-RPC payload and are ignored.
+    }
+    // The body may end without a trailing blank line; flush whatever's left.
+    flush_sse_event(&mut data_lines, &mut frames);
+
+    frames
+}
+
+/// Join the buffered `data:` lines of one SSE event, parse them as a single
+/// JSON value, and push the result. Malformed events (bytes that aren't
+/// valid JSON — e.g. a keep-alive comment) are dropped rather than failing
+/// the whole stream.
+fn flush_sse_event(data_lines: &mut Vec<&str>, frames: &mut Vec<Value>) {
+    if data_lines.is_empty() {
+        return;
+    }
+    let data = data_lines.join("\n");
+    data_lines.clear();
+    if let Ok(v) = serde_json::from_str::<Value>(&data) {
+        frames.push(v);
+    }
 }
 
 /// Send a JSON-RPC notification (no `id`); the server may reply with an empty
