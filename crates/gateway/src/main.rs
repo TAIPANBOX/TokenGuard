@@ -49,7 +49,9 @@ async fn main() {
             }
         }
         // `tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]`
+        //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
         // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`
+        //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
         Some("mcp-scan") => {
             let rest: Vec<String> = args.collect();
             let url_idx = rest.iter().position(|a| a == "--url");
@@ -57,36 +59,109 @@ async fn main() {
             let lock_idx = rest.iter().position(|a| a == "--lock");
             let lock_path = lock_idx.and_then(|i| rest.get(i + 1).cloned());
             let write_lock = rest.iter().any(|a| a == "--write-lock");
+            let json_out_idx = rest.iter().position(|a| a == "--json-out");
+            let json_out = json_out_idx.and_then(|i| rest.get(i + 1).cloned());
+            let fail_on_idx = rest.iter().position(|a| a == "--fail-on");
+            let fail_on_raw = fail_on_idx.and_then(|i| rest.get(i + 1).cloned());
+            let mode = if rest.iter().any(|a| a == "--json") {
+                tokenfuse_gateway::mcpcli::OutputMode::Json
+            } else {
+                tokenfuse_gateway::mcpcli::OutputMode::Human
+            };
+            // `--fail-on` defaults to `high`; `none` disables failing.
+            let threshold: Option<tokenfuse_core::Severity> = match fail_on_raw.as_deref() {
+                None => Some(tokenfuse_core::Severity::High),
+                Some("none") => None,
+                Some(other) => match other.parse() {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // A bad --fail-on is a config error: exit non-zero (2,
+                        // distinct from 1 = findings) so a misconfigured CI
+                        // pipeline fails loudly instead of silently passing.
+                        eprintln!("mcp-scan error: {e}");
+                        std::process::exit(2);
+                    }
+                },
+            };
             // The bare positional tools-path arg: skip flags and the values
-            // that belong to `--url`/`--lock` so those don't get mistaken for it.
-            let flag_value_idx = [url_idx.map(|i| i + 1), lock_idx.map(|i| i + 1)];
+            // that belong to flags taking a value, so those don't get
+            // mistaken for it.
+            let flag_value_idx = [
+                url_idx.map(|i| i + 1),
+                lock_idx.map(|i| i + 1),
+                json_out_idx.map(|i| i + 1),
+                fail_on_idx.map(|i| i + 1),
+            ];
             let tools_path = rest
                 .iter()
                 .enumerate()
                 .find(|(i, a)| !a.starts_with("--") && !flag_value_idx.contains(&Some(*i)))
                 .map(|(_, a)| a.clone());
-            match (tools_path, url) {
+            let report = match (tools_path, url) {
                 (Some(_), Some(_)) => {
-                    eprintln!("mcp-scan error: pass either <tools.json> or --url, not both")
+                    eprintln!("mcp-scan error: pass either <tools.json> or --url, not both");
+                    None
                 }
                 (None, Some(url)) => {
-                    if let Err(e) =
-                        tokenfuse_gateway::mcpcli::run_live(&url, lock_path.as_deref(), write_lock)
-                            .await
+                    match tokenfuse_gateway::mcpcli::run_live(
+                        &url,
+                        lock_path.as_deref(),
+                        write_lock,
+                        mode,
+                        json_out.as_deref(),
+                    )
+                    .await
                     {
-                        eprintln!("mcp-scan error: {e}");
+                        Ok(report) => Some(report),
+                        Err(e) => {
+                            eprintln!("mcp-scan error: {e}");
+                            None
+                        }
                     }
                 }
                 (Some(p), None) => {
-                    if let Err(e) =
-                        tokenfuse_gateway::mcpcli::run(&p, lock_path.as_deref(), write_lock)
-                    {
-                        eprintln!("mcp-scan error: {e}");
+                    match tokenfuse_gateway::mcpcli::run(
+                        &p,
+                        lock_path.as_deref(),
+                        write_lock,
+                        mode,
+                        json_out.as_deref(),
+                    ) {
+                        Ok(report) => Some(report),
+                        Err(e) => {
+                            eprintln!("mcp-scan error: {e}");
+                            None
+                        }
                     }
                 }
-                (None, None) => eprintln!(
-                    "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]"
-                ),
+                (None, None) => {
+                    eprintln!(
+                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--fail-on <severity>|none]"
+                    );
+                    None
+                }
+            };
+
+            if let Some(report) = report {
+                let max = report.max_severity();
+                let fail = tokenfuse_core::mcpreport::should_fail(max, threshold);
+                if mode == tokenfuse_gateway::mcpcli::OutputMode::Human {
+                    let count = |s: tokenfuse_core::Severity| {
+                        report.summary.get(s.as_str()).copied().unwrap_or(0)
+                    };
+                    let threshold_str = threshold.map(|t| t.as_str()).unwrap_or("none");
+                    println!(
+                        "RESULT: {} critical, {} high, {} medium, {} low — exit {} (fail-on: {threshold_str})",
+                        count(tokenfuse_core::Severity::Critical),
+                        count(tokenfuse_core::Severity::High),
+                        count(tokenfuse_core::Severity::Medium),
+                        count(tokenfuse_core::Severity::Low),
+                        if fail { 1 } else { 0 },
+                    );
+                }
+                if fail {
+                    std::process::exit(1);
+                }
             }
         }
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
