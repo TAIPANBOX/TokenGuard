@@ -15,7 +15,7 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use tower::ServiceExt;
 
 use tokenfuse_cloud::devices::canonical_string;
-use tokenfuse_cloud::{app, AppState, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
@@ -24,6 +24,7 @@ fn state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            plan: Plan::Paid,
         },
     );
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)

@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
 
 fn state_with(store: Arc<Store>) -> AppState {
     let mut keys = HashMap::new();
@@ -19,6 +19,7 @@ fn state_with(store: Arc<Store>) -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            plan: Plan::Paid,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)

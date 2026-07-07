@@ -94,6 +94,11 @@ impl EventSink for CloudSink {
 /// Poll the control plane's per-run budget overrides and hand them to `apply`
 /// (run id → µUSD), so an operator can set/tighten budgets centrally and every
 /// gateway of the org enforces them. Best-effort; runs until the process exits.
+///
+/// Resilient to the P2 entitlements gate: a Free/lapsed org gets `402` here.
+/// A non-2xx is treated as "no data this tick" (no crash, no apply); a `402` is
+/// logged **once** at info as a plan hint and then skipped silently, so it never
+/// spams the log every 3 s. Paid (`200`) behavior is unchanged.
 pub fn spawn_budget_poller<F>(base: String, key: String, apply: F)
 where
     F: Fn(std::collections::HashMap<String, i64>) + Send + Sync + 'static,
@@ -102,6 +107,7 @@ where
     let client = reqwest::Client::new();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut plan_warned = false;
         loop {
             tick.tick().await;
             let resp = match client.get(&url).bearer_auth(&key).send().await {
@@ -111,6 +117,19 @@ where
                     continue;
                 }
             };
+            if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+                if !plan_warned {
+                    tracing::info!(
+                        "cloud central-budget sync needs a paid plan; skipping (upgrade the org, or drop the `:free` plan on TOKENFUSE_CLOUD_KEYS)"
+                    );
+                    plan_warned = true;
+                }
+                continue;
+            }
+            if !resp.status().is_success() {
+                tracing::debug!("cloud budget poll: unexpected status {}", resp.status());
+                continue;
+            }
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -128,6 +147,11 @@ where
 /// operator's "Kill" in the Cloud dashboard propagates to every gateway of the
 /// org (which then hard-stops that run — `402 killed`). Best-effort; runs until
 /// the process exits.
+///
+/// Resilient to the P2 entitlements gate: a Free/lapsed org gets `402` here.
+/// A non-2xx is treated as "no data this tick" (no crash, no apply); a `402` is
+/// logged **once** at info as a plan hint and then skipped silently, so it never
+/// spams the log every 3 s. Paid (`200`) behavior is unchanged.
 pub fn spawn_kill_poller<F>(base: String, key: String, apply: F)
 where
     F: Fn(&str) + Send + Sync + 'static,
@@ -136,6 +160,7 @@ where
     let client = reqwest::Client::new();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut plan_warned = false;
         loop {
             tick.tick().await;
             let resp = match client.get(&url).bearer_auth(&key).send().await {
@@ -145,6 +170,19 @@ where
                     continue;
                 }
             };
+            if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+                if !plan_warned {
+                    tracing::info!(
+                        "cloud kill-switch sync needs a paid plan; skipping (upgrade the org, or drop the `:free` plan on TOKENFUSE_CLOUD_KEYS)"
+                    );
+                    plan_warned = true;
+                }
+                continue;
+            }
+            if !resp.status().is_success() {
+                tracing::debug!("cloud kill poll: unexpected status {}", resp.status());
+                continue;
+            }
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(_) => continue,

@@ -6,12 +6,14 @@
 #[cfg(feature = "apns")]
 pub mod apns;
 pub mod devices;
+pub mod entitlements;
 pub mod http;
 pub mod keys;
 pub mod push;
 pub mod store;
 
+pub use entitlements::{gate, Denied, Feature};
 pub use http::{app, openapi_spec, AppState};
-pub use keys::{parse_keys, Principal};
+pub use keys::{parse_keys, Plan, Principal};
 pub use push::{NullSender, PushPipeline, PushSender};
 pub use store::{CallRecord, Incident, IncidentConfig, Store};

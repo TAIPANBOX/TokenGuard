@@ -27,7 +27,8 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::devices::{self, Device};
-use crate::keys::Principal;
+use crate::entitlements::{gate, Feature};
+use crate::keys::{Plan, Principal};
 use crate::store::{
     AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
 };
@@ -115,6 +116,24 @@ impl AppState {
             return Some(p.org.clone());
         }
         self.store.device_by_token(token).map(|d| d.org)
+    }
+
+    /// The [`Plan`] governing an org, used by the entitlements gate. An org is
+    /// `Free` iff at least one of its configured org keys is stamped `:free`
+    /// (the hosted SaaS downgrades a free-tier org by stamping its key);
+    /// otherwise `Paid`. Paired device tokens inherit their org's plan. Existing
+    /// deployments carry no `:free` keys, so every org resolves to `Paid` and is
+    /// never gated — preserving today's behavior.
+    fn plan_for_org(&self, org: &str) -> Plan {
+        if self
+            .keys
+            .values()
+            .any(|p| p.org == org && p.plan == Plan::Free)
+        {
+            Plan::Free
+        } else {
+            Plan::Paid
+        }
     }
 
     /// Authorize an admin action by **org key only** (used for pairing, which is
@@ -303,6 +322,27 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Envelope for a `402 plan_required` denial from the entitlements gate. The
+/// error is an object (not the flat string of [`ErrorResponse`]) so clients can
+/// key an upgrade CTA off `feature`/`upgrade_url`.
+#[derive(Serialize, ToSchema)]
+struct PlanRequiredResponse {
+    error: PlanRequiredError,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PlanRequiredError {
+    /// Always `"plan_required"`.
+    #[serde(rename = "type")]
+    kind: &'static str,
+    /// The gated feature (see `entitlements::Feature::as_str`).
+    feature: String,
+    /// The org that needs an upgrade.
+    org: String,
+    /// Where to upgrade.
+    upgrade_url: &'static str,
+}
+
 #[derive(Deserialize, ToSchema)]
 struct PairNewBody {
     /// Role the paired device will have (`admin` | `viewer`); default `admin`.
@@ -398,6 +438,9 @@ async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.runs(&org))).into_response()
 }
 
@@ -415,6 +458,9 @@ async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Agents) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.agents(&org))).into_response()
 }
 
@@ -432,6 +478,9 @@ async fn savings(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Savings) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.savings(&org))).into_response()
 }
 
@@ -448,6 +497,9 @@ async fn summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.summary(&org))).into_response()
 }
 
@@ -469,6 +521,9 @@ async fn alerts(
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+        return plan_required(&org, d.feature);
+    }
     let pct = q
         .pct
         .filter(|p| *p > 0.0 && *p <= 1.0)
@@ -504,6 +559,9 @@ async fn series(
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+        return plan_required(&org, d.feature);
+    }
     let window = parse_duration_ms(q.window.as_deref()).unwrap_or(3_600_000);
     let step = parse_duration_ms(q.step.as_deref()).unwrap_or(60_000);
     let buckets = st
@@ -519,6 +577,9 @@ async fn stream(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+        return plan_required(&org, d.feature);
+    }
     let events = BroadcastStream::new(st.store.subscribe()).filter_map(move |ev| match ev {
         Ok(e) if e.org() == org => Some(Ok::<Event, Infallible>(
             Event::default()
@@ -558,6 +619,9 @@ async fn kill(
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::CrossFleetKill) {
+        return plan_required(&org, d.feature);
+    }
     st.store.kill(&org, &run);
     (StatusCode::OK, Json(KillResponse { killed: run })).into_response()
 }
@@ -575,6 +639,9 @@ async fn kills(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::CrossFleetKill) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.kills(&org))).into_response()
 }
 
@@ -602,6 +669,9 @@ async fn set_budget(
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::CentralBudgets) {
+        return plan_required(&org, d.feature);
+    }
     let parsed: BudgetBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(_) => return bad_json(),
@@ -631,6 +701,9 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::CentralBudgets) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
 }
 
@@ -648,6 +721,9 @@ async fn incidents(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Incidents) {
+        return plan_required(&org, d.feature);
+    }
     (StatusCode::OK, Json(st.store.incidents(&org))).into_response()
 }
 
@@ -673,6 +749,9 @@ async fn ack_incident(
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Incidents) {
+        return plan_required(&org, d.feature);
+    }
     if st.store.ack_incident(&org, &id) {
         (StatusCode::OK, Json(AckResponse { acknowledged: id })).into_response()
     } else {
@@ -697,6 +776,9 @@ async fn pair_new(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::DevicePush) {
+        return plan_required(&org, d.feature);
+    }
     // Role is optional; default admin, only admin/viewer allowed.
     let role = match serde_json::from_slice::<PairNewBody>(&body) {
         Ok(b) => b.role.unwrap_or_else(|| "admin".to_string()),
@@ -777,6 +859,9 @@ async fn register_apns(
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&device.org), Feature::DevicePush) {
+        return plan_required(&device.org, d.feature);
+    }
     if device.device_id != id {
         return error(StatusCode::FORBIDDEN, "signature_invalid");
     }
@@ -813,6 +898,9 @@ async fn register_activity(
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
+    if let Err(d) = gate(st.plan_for_org(&device.org), Feature::DevicePush) {
+        return plan_required(&device.org, d.feature);
+    }
     if device.device_id != id {
         return error(StatusCode::FORBIDDEN, "signature_invalid");
     }
@@ -885,6 +973,24 @@ fn error(status: StatusCode, message: &str) -> Response {
         status,
         Json(ErrorResponse {
             error: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// A `402 plan_required` denial for `org` on `feature`, the P2 entitlements
+/// contract. Uses a dedicated nested-object envelope (the flat `error()` helper
+/// can't express it).
+fn plan_required(org: &str, feature: &str) -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(PlanRequiredResponse {
+            error: PlanRequiredError {
+                kind: "plan_required",
+                feature: feature.to_string(),
+                org: org.to_string(),
+                upgrade_url: "https://tokenfuse.dev/pricing",
+            },
         }),
     )
         .into_response()
