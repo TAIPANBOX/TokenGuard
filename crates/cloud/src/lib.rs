@@ -9,11 +9,13 @@ pub mod devices;
 pub mod entitlements;
 pub mod http;
 pub mod keys;
+pub mod oidc;
 pub mod push;
 pub mod store;
 
 pub use entitlements::{gate, Denied, Feature};
 pub use http::{app, openapi_spec, AppState};
 pub use keys::{parse_keys, Plan, Principal};
+pub use oidc::{verify_id_token, OidcConfig};
 pub use push::{NullSender, PushPipeline, PushSender};
 pub use store::{CallRecord, Incident, IncidentConfig, Store};

@@ -61,6 +61,40 @@ an authentication provider. The two honest framings:
 | **Secrets kept out of context** | MCP broker + DLP | `{{secret:NAME}}` handles injected only on the wire; raw-secret DLP on args; response redaction. See [12](12-mcp-credential-broker.md). |
 | **Dependency audit** | CI `security` job | `cargo audit` on every push/PR, for both the workspace and `crates/cluster`. |
 
+## OIDC bearer authentication (optional, offline)
+
+The Cloud control plane authenticates every request at a single chokepoint. The
+default credential is an API key (`TOKENFUSE_CLOUD_KEYS`, `key:org[:role][:plan]`).
+Enterprises that already run an IdP can additionally accept an **OIDC ID-token /
+JWT** as a bearer alternative, so their existing identities work without minting
+TokenFuse keys. This is implemented in `crates/cloud/src/oidc.rs`.
+
+- **Default OFF.** OIDC is enabled only when `TOKENFUSE_CLOUD_OIDC_ISSUER`,
+  `TOKENFUSE_CLOUD_OIDC_AUDIENCE` and `TOKENFUSE_CLOUD_OIDC_JWKS` are all set.
+  When unconfigured the auth path is **byte-for-byte identical** to a keys-only
+  deployment — the JWT branch is never consulted.
+- **Keys win.** The API-key map is tried first; a JWT is only checked when no key
+  matched. A valid API key always takes precedence.
+- **Offline JWKS only.** `TOKENFUSE_CLOUD_OIDC_JWKS` holds the JWKS JSON inline or
+  a path to a static file. There is **no** network fetch of the issuer's
+  `.well-known` document or its keys — key rotation is an ops action (update the
+  env/file and restart), not a runtime HTTP call.
+- **Conservative validation.** A token is accepted only if: it is a well-formed
+  JWS with a `kid`; the `kid` matches a key in the configured JWKS; the signature
+  verifies; `exp` is present and not past; `iss` equals the configured issuer; and
+  `aud` equals the configured audience. Allowed algorithms are derived from the
+  **JWK key type** (RSA ⇒ RS256/384/512, EC ⇒ ES256/384), never from the
+  attacker-controlled token header — closing the RS256→HS256 "alg confusion"
+  downgrade. Any failure rejects the token (`401`).
+- **Least privilege.** A verified token maps to `viewer` unless the roles claim
+  (`TOKENFUSE_CLOUD_OIDC_ROLES_CLAIM`, default `roles`) contains the admin role
+  (`TOKENFUSE_CLOUD_OIDC_ADMIN_ROLE`, default `admin`). A missing/empty org claim
+  (`TOKENFUSE_CLOUD_OIDC_ORG_CLAIM`, default `org`) is rejected — no org, no
+  access. Mutations by an OIDC admin are attributed in the audit trail as
+  `oidc:<sub>` (a stable, non-secret id), never the raw token.
+- **Deferred (not built here):** live/networked JWKS fetch, SAML, SCIM, and
+  session cookies. Those are explicitly out of scope for this pass.
+
 ## Deliberate design choices with security consequences
 
 These are **intentional**, documented, and configurable — not oversights.

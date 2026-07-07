@@ -30,6 +30,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::devices::{self, Device};
 use crate::entitlements::{gate, Feature};
 use crate::keys::{Plan, Principal};
+use crate::oidc::{self, OidcConfig};
 use crate::store::{
     AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
 };
@@ -98,6 +99,11 @@ pub struct AppState {
     pub keys: Arc<HashMap<String, Principal>>,
     /// Budget fraction at which a run is flagged by `/v1/alerts` (default 0.8).
     pub alert_pct: f64,
+    /// Optional, offline OIDC/JWT bearer config (WS4). `None` when unconfigured —
+    /// in which case the auth chokepoints never consult it and behavior is
+    /// byte-for-byte identical to a keys-only deployment. Parsed once at
+    /// construction so no env/file I/O happens per request.
+    pub oidc: Option<Arc<OidcConfig>>,
 }
 
 impl AppState {
@@ -106,7 +112,23 @@ impl AppState {
             store,
             keys,
             alert_pct,
+            oidc: None,
         }
+    }
+
+    /// Attach an optional OIDC config (from [`OidcConfig::from_env`]). Kept off
+    /// the `new` signature so every existing call site — and every existing test
+    /// — is unchanged; a keys-only deployment simply never calls this.
+    pub fn with_oidc(mut self, oidc: Option<OidcConfig>) -> Self {
+        self.oidc = oidc.map(Arc::new);
+        self
+    }
+
+    /// Try to resolve the bearer as an OIDC token — `None` if OIDC is
+    /// unconfigured, there is no bearer, or the token fails validation.
+    fn oidc_principal(&self, headers: &HeaderMap) -> Option<Principal> {
+        let cfg = self.oidc.as_ref()?;
+        oidc::verify_id_token(cfg, bearer(headers)?)
     }
 
     /// Resolve the bearer token to an org-key principal (org keys only).
@@ -114,14 +136,19 @@ impl AppState {
         self.keys.get(bearer(headers)?)
     }
 
-    /// Resolve the bearer token to an org (any role) — an org key **or** a paired
-    /// device token. Used by the read endpoints; `None` if unauthorized.
+    /// Resolve the bearer token to an org (any role) — an org key, a paired
+    /// device token, or (when configured) a valid OIDC token. Used by the read
+    /// endpoints; `None` if unauthorized. Keys and devices take precedence; OIDC
+    /// is only tried when neither matched, so keys-only behavior is unchanged.
     fn org_for(&self, headers: &HeaderMap) -> Option<String> {
         let token = bearer(headers)?;
         if let Some(p) = self.keys.get(token) {
             return Some(p.org.clone());
         }
-        self.store.device_by_token(token).map(|d| d.org)
+        if let Some(d) = self.store.device_by_token(token) {
+            return Some(d.org);
+        }
+        self.oidc_principal(headers).map(|p| p.org)
     }
 
     /// The [`Plan`] governing an org, used by the entitlements gate. An org is
@@ -215,6 +242,21 @@ impl AppState {
                 org: p.org.clone(),
                 actor: key_actor(token),
             });
+        }
+        // OIDC bearer (when configured). Only a *valid* token that maps to a
+        // principal short-circuits here; an invalid/absent JWT falls through to
+        // the device-signature path exactly as before. A verified but non-admin
+        // token is `403` (matching a viewer org key), not a fall-through.
+        if let Some(cfg) = self.oidc.as_ref() {
+            if let Some(v) = oidc::verify(cfg, token) {
+                if v.principal.role != "admin" {
+                    return Err(AuthError::Forbidden);
+                }
+                return Ok(Mutator {
+                    org: v.principal.org,
+                    actor: v.actor,
+                });
+            }
         }
         let device = self.verify_device_signature(method, path, body, headers)?;
         if device.role != "admin" {

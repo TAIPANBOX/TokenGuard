@@ -25,6 +25,10 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+# Offline OIDC / JWT bearer auth (WS4): RS256/ES256 signature + claim validation
+# against a static JWKS. No network — the JWKS is supplied from env. Cloud-only;
+# never pulled into tokenfuse-core.
+jsonwebtoken = "9"
 # APNs push (real sender) — only pulled in with `--features apns`.
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
     "json",

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokenfuse_cloud::{
-    app, openapi_spec, parse_keys, AppState, IncidentConfig, NullSender, PushPipeline, PushSender,
-    Store,
+    app, openapi_spec, parse_keys, AppState, IncidentConfig, NullSender, OidcConfig, PushPipeline,
+    PushSender, Store,
 };
 
 #[tokio::main]
@@ -91,7 +91,13 @@ async fn main() {
     let sender: Arc<dyn PushSender> = build_push_sender();
     Arc::new(PushPipeline::new(Arc::clone(&store), sender, alert_pct)).spawn();
 
-    let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct);
+    // Optional offline OIDC/JWT bearer auth (WS4). Unconfigured ⇒ `None`, and
+    // the auth chokepoints behave exactly as a keys-only deployment.
+    let oidc = OidcConfig::from_env();
+    if oidc.is_some() {
+        tracing::info!("OIDC bearer auth enabled (offline JWKS)");
+    }
+    let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct).with_oidc(oidc);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
