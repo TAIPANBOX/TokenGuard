@@ -260,6 +260,36 @@ async fn savings_sum_blocked_cache_and_breaks() {
 }
 
 #[tokio::test]
+async fn incidents_endpoint_lists_for_viewer_and_rejects_unauth() {
+    let (state, store) = test_state();
+    // Three budget-protection blocks on one run trip a `budget_exhausted`
+    // incident (default threshold is 3).
+    let block = || CallRecord {
+        run_id: "r1".into(),
+        decision: "budget_exceeded".into(),
+        cost_microusd: 1000,
+        ..Default::default()
+    };
+    store.ingest("acme", &[block(), block(), block()]);
+
+    // A viewer may read incidents.
+    let (status, v) = get(&state, "/v1/incidents", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let incs = v.as_array().expect("incidents is an array");
+    assert_eq!(incs.len(), 1);
+    assert_eq!(incs[0]["kind"], "budget_exhausted");
+    assert_eq!(incs[0]["severity"], "high");
+    assert_eq!(incs[0]["run_id"], "r1");
+    assert_eq!(incs[0]["acknowledged"], false);
+
+    // Gated like the other reads.
+    let (no_key, _) = get(&state, "/v1/incidents", None).await;
+    assert_eq!(no_key, StatusCode::UNAUTHORIZED);
+    let (wrong_key, _) = get(&state, "/v1/incidents", Some("nope")).await;
+    assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn reads_require_a_valid_key() {
     let (state, _) = test_state();
     let (no_key, _) = get(&state, "/v1/runs", None).await;

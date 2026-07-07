@@ -29,7 +29,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::devices::{self, Device};
 use crate::keys::Principal;
 use crate::store::{
-    AgentAgg, Alert, CallRecord, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
+    AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -43,7 +43,7 @@ use crate::store::{
     ),
     paths(
         ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        pair_new, pair, register_apns, register_activity,
+        incidents, ack_incident, pair_new, pair, register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
@@ -53,11 +53,13 @@ use crate::store::{
         Summary,
         Alert,
         SeriesBucket,
+        Incident,
         IngestBody,
         IngestResponse,
         BudgetBody,
         BudgetResponse,
         KillResponse,
+        AckResponse,
         ErrorResponse,
         PairNewBody,
         PairNewResponse,
@@ -237,6 +239,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/kills", get(kills))
         .route("/v1/runs/{run}/budget", post(set_budget))
         .route("/v1/budgets", get(budgets))
+        .route("/v1/incidents", get(incidents))
+        .route("/v1/incidents/{id}/ack", post(ack_incident))
         .route("/v1/pair/new", post(pair_new))
         .route("/v1/pair", post(pair))
         .route("/v1/devices/{id}/apns", post(register_apns))
@@ -287,6 +291,11 @@ struct BudgetResponse {
 #[derive(Serialize, ToSchema)]
 struct KillResponse {
     killed: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AckResponse {
+    acknowledged: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -623,6 +632,52 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
+}
+
+/// The caller org's open incidents, most-recently-seen first. Readable by any
+/// role (viewer or admin), like the other read endpoints.
+#[utoipa::path(
+    get, path = "/v1/incidents",
+    responses(
+        (status = 200, description = "open incidents, newest first", body = Vec<Incident>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn incidents(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.incidents(&org))).into_response()
+}
+
+/// Acknowledge an incident (admin only). Sets `acknowledged = true`.
+#[utoipa::path(
+    post, path = "/v1/incidents/{id}/ack",
+    params(("id" = String, Path, description = "incident id")),
+    responses(
+        (status = 200, description = "incident acknowledged", body = AckResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
+        (status = 404, description = "unknown incident", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
+async fn ack_incident(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Response {
+    let org = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if st.store.ack_incident(&org, &id) {
+        (StatusCode::OK, Json(AckResponse { acknowledged: id })).into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "unknown incident")
+    }
 }
 
 /// Issue a one-time pairing code (admin org key). The dashboard renders it as a

@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Principal, Store};
+use tokenfuse_cloud::{app, AppState, CallRecord, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
@@ -79,4 +79,60 @@ async fn series_sums_match_the_summary() {
     assert_eq!(cost, summary["spent_microusd"].as_i64().unwrap());
     assert_eq!(cost, 1500);
     assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn stream_emits_incident_event() {
+    use http_body_util::BodyExt;
+
+    let store = Arc::new(Store::new());
+    let mut keys = HashMap::new();
+    keys.insert(
+        "k".into(),
+        Principal {
+            org: "acme".into(),
+            role: "admin".into(),
+        },
+    );
+    let state = AppState::new(Arc::clone(&store), Arc::new(keys), 0.8);
+
+    // Open the SSE stream first so the subscriber is registered before ingest.
+    let resp = app(state.clone())
+        .oneshot(
+            Request::get("/v1/stream")
+                .header("authorization", "Bearer k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+
+    // Trip a `budget_exhausted` incident: three budget-protection blocks.
+    let block = || CallRecord {
+        run_id: "r1".into(),
+        decision: "budget_exceeded".into(),
+        cost_microusd: 1000,
+        ..Default::default()
+    };
+    store.ingest("acme", &[block(), block(), block()]);
+
+    // Drain SSE frames until the incident event arrives (or we time out).
+    let mut acc = String::new();
+    for _ in 0..20 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), body.frame()).await {
+            Ok(Some(Ok(f))) => {
+                if let Ok(data) = f.into_data() {
+                    acc.push_str(&String::from_utf8_lossy(&data));
+                    if acc.contains("\"type\":\"incident\"") {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(acc.contains("\"type\":\"incident\""), "sse stream:\n{acc}");
+    assert!(acc.contains("budget_exhausted:r1"), "sse stream:\n{acc}");
 }

@@ -149,6 +149,74 @@ pub struct SeriesBucket {
     pub blocked: u64,
 }
 
+/// An aggregated, first-class anomaly for an org (P2 incidents). Repeated or
+/// severe detections are folded into one `Incident` keyed by a STABLE
+/// [`incident_id`] (`"{kind}:{run_or_agent}"`) so later triggers bump
+/// `occurrences`/`last_seen_millis` in place rather than piling up duplicates.
+/// Persisted in the snapshot so open incidents — and the push-dedup clock
+/// (`last_notified_millis`) — survive a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Incident {
+    /// Stable dedup id, `"{kind}:{run_or_agent}"`.
+    pub id: String,
+    pub org: String,
+    /// The run this incident is scoped to, if run-scoped (`spend_spike` is
+    /// org-scoped and leaves this `None`).
+    pub run_id: Option<String>,
+    /// The agent attributed at trip time, when the gateway tagged the run.
+    pub agent_id: Option<String>,
+    /// Detector kind: `budget_exhausted` | `sustained_loop` | `spend_spike`.
+    pub kind: String,
+    /// Reused from `tokenfuse_core` — rendered as a lowercase string in JSON.
+    #[schema(value_type = String, example = "high")]
+    pub severity: tokenfuse_core::Severity,
+    pub first_seen_millis: i64,
+    pub last_seen_millis: i64,
+    /// How many times this incident's threshold has tripped.
+    pub occurrences: u64,
+    pub acknowledged: bool,
+    /// Epoch millis of the last push fired for this incident — the SINGLE
+    /// source of truth for push dedup (see `push.rs`). `0` until first notified.
+    pub last_notified_millis: i64,
+}
+
+/// Thresholds for the incident detectors, mirroring the `alert_pct` env
+/// precedent. Read from the environment at the composition root (see
+/// `main::main`); [`Default`] carries the documented fallbacks.
+#[derive(Debug, Clone)]
+pub struct IncidentConfig {
+    /// `budget_exhausted` trips at ≥ this many budget-protection blocks per run
+    /// (`TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS`).
+    pub budget_blocks: u64,
+    /// `sustained_loop` trips at ≥ this many `loop_detected` decisions for a run
+    /// within `loop_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS`).
+    pub loop_repeats: u64,
+    /// Window for the `sustained_loop` repeat count.
+    pub loop_window_ms: i64,
+    /// `spend_spike` trips when an org's last-minute burn reaches this rate
+    /// (`TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`, stored as microdollars).
+    pub spend_per_min_micros: i64,
+}
+
+impl Default for IncidentConfig {
+    fn default() -> Self {
+        Self {
+            budget_blocks: 3,
+            loop_repeats: 3,
+            loop_window_ms: 600_000,
+            spend_per_min_micros: 5_000_000,
+        }
+    }
+}
+
+/// Rolling window used to compute the `spend_spike` burn rate (matches the
+/// per-minute framing of `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`).
+const SPIKE_WINDOW_MS: i64 = 60_000;
+
+/// Cap on each per-(org,key) occurrence tracker deque, so a hot run can't grow
+/// the tracker without bound (the incident itself is the durable record).
+const INCIDENT_TRACKER_CAP: usize = 256;
+
 /// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
 /// to the right subscriber and is not sent in the payload.
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +238,9 @@ pub enum StreamEvent {
         run: String,
         budget_micros: i64,
     },
+    /// A newly-tripped or re-tripped incident. Serialized flat (the internal
+    /// `type` tag plus the incident's own fields, incl. its `org`).
+    Incident(Incident),
 }
 
 impl StreamEvent {
@@ -177,6 +248,7 @@ impl StreamEvent {
     pub(crate) fn org(&self) -> &str {
         match self {
             Self::RunUpdate { org, .. } | Self::Kill { org, .. } | Self::Budget { org, .. } => org,
+            Self::Incident(inc) => &inc.org,
         }
     }
 
@@ -186,6 +258,7 @@ impl StreamEvent {
             Self::RunUpdate { .. } => "run_update",
             Self::Kill { .. } => "kill",
             Self::Budget { .. } => "budget",
+            Self::Incident(_) => "incident",
         }
     }
 }
@@ -210,6 +283,12 @@ struct Inner {
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
     savings: HashMap<String, SavingsAcc>,
+    /// org → incident id → aggregated incident (persisted)
+    incidents: HashMap<String, HashMap<String, Incident>>,
+    /// (org, "{kind}:{run_or_agent}") → recent trigger timestamps, bounded to
+    /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
+    /// threshold against (ephemeral — the `Incident` is the durable record).
+    incident_tracker: HashMap<(String, String), VecDeque<i64>>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -231,6 +310,7 @@ struct SnapshotRef<'a> {
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
+    incidents: &'a HashMap<String, HashMap<String, Incident>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -247,6 +327,10 @@ struct SnapshotOwned {
     /// `savings()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
     savings: HashMap<String, SavingsAcc>,
+    /// Missing on pre-incident snapshots — `default` loads to no open
+    /// incidents (incl. their `last_notified_millis` push-dedup clock).
+    #[serde(default)]
+    incidents: HashMap<String, HashMap<String, Incident>>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -256,6 +340,8 @@ pub struct Store {
     inner: RwLock<Inner>,
     /// Live change bus for `/v1/stream` subscribers.
     events: broadcast::Sender<StreamEvent>,
+    /// Incident-detector thresholds (env-configured at the composition root).
+    incident_cfg: IncidentConfig,
 }
 
 impl Default for Store {
@@ -266,10 +352,17 @@ impl Default for Store {
 
 impl Store {
     pub fn new() -> Self {
+        Self::with_incident_config(IncidentConfig::default())
+    }
+
+    /// Build with explicit incident thresholds (used by `main` after reading the
+    /// environment, and by unit tests that pin a threshold).
+    pub fn with_incident_config(incident_cfg: IncidentConfig) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: RwLock::new(Inner::default()),
             events,
+            incident_cfg,
         }
     }
 
@@ -279,9 +372,18 @@ impl Store {
     }
 
     /// Fold a batch of records into an org's aggregates, append them to the
-    /// burn-rate series, and broadcast a `run_update` per affected run.
+    /// burn-rate series, run incident detection, and broadcast a `run_update`
+    /// per affected run plus an `incident` per tripped detector. Uses the store's
+    /// own wall clock; see [`Store::ingest_at`] for the testable inner form.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
+        self.ingest_at(org, records, now_millis());
+    }
+
+    /// [`Store::ingest`] with an explicit `now_ms` (the same "now" `series`
+    /// takes), so incident windows are deterministic in tests.
+    pub(crate) fn ingest_at(&self, org: &str, records: &[CallRecord], now_ms: i64) {
         let mut updated: Vec<RunAgg> = Vec::new();
+        let mut fired: HashMap<String, Incident> = HashMap::new();
         {
             let mut guard = self.inner.write().unwrap();
             guard.dirty = true;
@@ -355,12 +457,92 @@ impl Store {
                     }
                 }
             }
+
+            // --- Incident detection (same pass, on the just-updated state) ---
+            let cfg = &self.incident_cfg;
+            for r in records {
+                // Effective event time: the record's own stamp, or `now` when
+                // the gateway didn't set one (keeps loop windows sane in tests).
+                let ts = if r.ts_millis > 0 { r.ts_millis } else { now_ms };
+                let agent = (!r.agent_id.is_empty()).then(|| r.agent_id.clone());
+
+                // budget_exhausted (High): ≥ N budget-protection blocks per run.
+                if tokenfuse_core::savings::is_budget_protection(&r.decision) {
+                    let n = bump_tracker(
+                        &mut inner.incident_tracker,
+                        org,
+                        "budget_exhausted",
+                        &r.run_id,
+                        ts,
+                        None,
+                    );
+                    if n >= cfg.budget_blocks {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "budget_exhausted",
+                            tokenfuse_core::Severity::High,
+                            Some(r.run_id.clone()),
+                            agent.clone(),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+
+                // sustained_loop (Medium): ≥ N loop_detected for a run in-window.
+                if r.decision == "loop_detected" {
+                    let n = bump_tracker(
+                        &mut inner.incident_tracker,
+                        org,
+                        "sustained_loop",
+                        &r.run_id,
+                        ts,
+                        Some((now_ms, cfg.loop_window_ms)),
+                    );
+                    if n >= cfg.loop_repeats {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "sustained_loop",
+                            tokenfuse_core::Severity::Medium,
+                            Some(r.run_id.clone()),
+                            agent.clone(),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+            }
+
+            // spend_spike (High): org burn over the last minute, summed from the
+            // SAME sample log `series()` buckets — not a second time-series.
+            let burn = inner
+                .series
+                .get(org)
+                .map(|log| burn_since(log, now_ms - SPIKE_WINDOW_MS, now_ms))
+                .unwrap_or(0);
+            if burn >= cfg.spend_per_min_micros {
+                let inc = upsert_incident(
+                    &mut inner.incidents,
+                    org,
+                    "spend_spike",
+                    tokenfuse_core::Severity::High,
+                    None,
+                    None,
+                    now_ms,
+                );
+                fired.insert(inc.id.clone(), inc);
+            }
         }
         for run in updated {
             let _ = self.events.send(StreamEvent::RunUpdate {
                 org: org.to_string(),
                 run,
             });
+        }
+        for (_, inc) in fired {
+            let _ = self.events.send(StreamEvent::Incident(inc));
         }
     }
 
@@ -484,6 +666,51 @@ impl Store {
         }
     }
 
+    /// An org's open incidents, most-recently-seen first.
+    pub fn incidents(&self, org: &str) -> Vec<Incident> {
+        let inner = self.inner.read().unwrap();
+        let mut out: Vec<Incident> = inner
+            .incidents
+            .get(org)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        out.sort_by_key(|i| std::cmp::Reverse(i.last_seen_millis));
+        out
+    }
+
+    /// Acknowledge an incident (admin action). Returns whether it existed.
+    pub fn ack_incident(&self, org: &str, id: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut found = false;
+        if let Some(inc) = inner.incidents.get_mut(org).and_then(|m| m.get_mut(id)) {
+            inc.acknowledged = true;
+            found = true;
+        }
+        if found {
+            inner.dirty = true;
+        }
+        found
+    }
+
+    /// Atomically decide whether to push for an incident and, if so, stamp its
+    /// `last_notified_millis`. This makes that field the SINGLE source of truth
+    /// for push dedup (see `push.rs`): returns `true` only when more than
+    /// `window_ms` has passed since the last push (and then records `now_ms`).
+    pub fn mark_incident_notified(&self, org: &str, id: &str, now_ms: i64, window_ms: i64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut notify = false;
+        if let Some(inc) = inner.incidents.get_mut(org).and_then(|m| m.get_mut(id)) {
+            if now_ms - inc.last_notified_millis > window_ms {
+                inc.last_notified_millis = now_ms;
+                notify = true;
+            }
+        }
+        if notify {
+            inner.dirty = true;
+        }
+        notify
+    }
+
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
         {
@@ -583,6 +810,7 @@ impl Store {
                 budgets: &inner.budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
+                incidents: &inner.incidents,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -608,6 +836,7 @@ impl Store {
         inner.budgets = snap.budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
+        inner.incidents = snap.incidents;
         Ok(())
     }
 
@@ -748,6 +977,98 @@ impl Store {
         inner.dirty = false;
         d
     }
+}
+
+/// The store's wall clock in epoch millis — the "now" `ingest` feeds detection
+/// (mirrors the `now_ms` `series` is called with by the HTTP layer).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The stable incident id / dedup key, `"{kind}:{run_or_agent}"`. Org-scoped
+/// detectors (e.g. `spend_spike`) pass an empty scope.
+fn incident_id(kind: &str, scope: &str) -> String {
+    format!("{kind}:{scope}")
+}
+
+/// Push `ts` onto the per-(org,key) occurrence tracker, bound it, and — when a
+/// `(now, window_ms)` is given — drop timestamps older than the window. Returns
+/// the current count the detector thresholds against.
+fn bump_tracker(
+    tracker: &mut HashMap<(String, String), VecDeque<i64>>,
+    org: &str,
+    kind: &str,
+    scope: &str,
+    ts: i64,
+    window: Option<(i64, i64)>,
+) -> u64 {
+    let dq = tracker
+        .entry((org.to_string(), incident_id(kind, scope)))
+        .or_default();
+    dq.push_back(ts);
+    while dq.len() > INCIDENT_TRACKER_CAP {
+        dq.pop_front();
+    }
+    if let Some((now, window_ms)) = window {
+        let cutoff = now - window_ms;
+        while dq.front().is_some_and(|&t| t < cutoff) {
+            dq.pop_front();
+        }
+    }
+    dq.len() as u64
+}
+
+/// Upsert the incident for `(org, kind, scope)`: create it on first trip, else
+/// bump `occurrences`/`last_seen_millis` in place. Returns the current state.
+#[allow(clippy::too_many_arguments)]
+fn upsert_incident(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    kind: &str,
+    severity: tokenfuse_core::Severity,
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    ts: i64,
+) -> Incident {
+    let scope = run_id.as_deref().unwrap_or("");
+    let id = incident_id(kind, scope);
+    let per_org = incidents.entry(org.to_string()).or_default();
+    let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {
+        id: id.clone(),
+        org: org.to_string(),
+        run_id: run_id.clone(),
+        agent_id: agent_id.clone(),
+        kind: kind.to_string(),
+        severity,
+        first_seen_millis: ts,
+        last_seen_millis: ts,
+        occurrences: 0,
+        acknowledged: false,
+        last_notified_millis: 0,
+    });
+    inc.occurrences += 1;
+    if ts > inc.last_seen_millis {
+        inc.last_seen_millis = ts;
+    }
+    // Keep the attributed agent fresh if a later trigger carries one.
+    if inc.agent_id.is_none() {
+        if let Some(a) = agent_id {
+            inc.agent_id = Some(a);
+        }
+    }
+    inc.clone()
+}
+
+/// Sum sample cost over `[start, now]` for the org's burn series (the same
+/// accumulation `series()` does within one bucket) — the `spend_spike` rate.
+fn burn_since(log: &VecDeque<Sample>, start: i64, now: i64) -> i64 {
+    log.iter()
+        .filter(|s| s.ts_millis >= start && s.ts_millis <= now)
+        .map(|s| s.cost_microusd)
+        .sum()
 }
 
 /// Write `data` to `path` with owner-only permissions on unix (the snapshot can
@@ -1184,5 +1505,221 @@ mod tests {
             rx.try_recv(),
             Ok(StreamEvent::Kill { org, run }) if org == "acme" && run == "r1"
         ));
+    }
+
+    // ---- incidents ----------------------------------------------------------
+
+    fn block_at(run: &str, decision: &str, cost: i64, ts: i64) -> CallRecord {
+        CallRecord {
+            run_id: run.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn budget_exhausted_fires_at_threshold_not_under() {
+        let s = Store::new(); // default budget_blocks = 3
+        let now = 1_000_000;
+        // Two budget-protection blocks: under threshold → nothing yet.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+            ],
+            now,
+        );
+        assert!(s.incidents("acme").is_empty(), "under threshold");
+
+        // The third block trips it.
+        s.ingest_at("acme", &[block_at("r1", "budget_exceeded", 1000, now)], now);
+        let incs = s.incidents("acme");
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].id, "budget_exhausted:r1");
+        assert_eq!(incs[0].kind, "budget_exhausted");
+        assert_eq!(incs[0].severity, tokenfuse_core::Severity::High);
+        assert_eq!(incs[0].run_id.as_deref(), Some("r1"));
+        assert_eq!(incs[0].occurrences, 1);
+        assert_eq!(incs[0].first_seen_millis, now);
+
+        // A further block upserts in place (bumps occurrences, no duplicate).
+        s.ingest_at(
+            "acme",
+            &[block_at("r1", "budget_exceeded", 1000, now + 5)],
+            now + 5,
+        );
+        let incs = s.incidents("acme");
+        assert_eq!(incs.len(), 1, "same incident, not a duplicate");
+        assert_eq!(incs[0].occurrences, 2);
+        assert_eq!(incs[0].last_seen_millis, now + 5);
+    }
+
+    #[test]
+    fn sustained_loop_fires_within_window() {
+        let s = Store::new(); // default loop_repeats = 3, window 10 min
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "loop_detected", 0, now - 2),
+                block_at("r1", "loop_detected", 0, now - 1),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "sustained_loop"),
+            "under threshold"
+        );
+
+        s.ingest_at("acme", &[block_at("r1", "loop_detected", 0, now)], now);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "sustained_loop")
+            .expect("sustained_loop incident");
+        assert_eq!(inc.id, "sustained_loop:r1");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Medium);
+        assert_eq!(inc.run_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn sustained_loop_window_prunes_stale_repeats() {
+        let s = Store::new();
+        let now = 10_000_000;
+        // Two loops far outside the 10-minute window, one now → count prunes to 1.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "loop_detected", 0, now - 5_000_000),
+                block_at("r1", "loop_detected", 0, now - 4_000_000),
+                block_at("r1", "loop_detected", 0, now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "sustained_loop"),
+            "stale repeats pruned, under threshold"
+        );
+    }
+
+    #[test]
+    fn spend_spike_fires_over_burn_rate() {
+        let s = Store::new(); // default 5 USD/min = 5_000_000 micros
+        let now = 1_000_000;
+        // 4 USD in the last minute — under the rate.
+        s.ingest_at("acme", &[block_at("r1", "allow", 4_000_000, now)], now);
+        assert!(s.incidents("acme").iter().all(|i| i.kind != "spend_spike"));
+
+        // Another $2 tips the minute's burn over 5 USD.
+        s.ingest_at(
+            "acme",
+            &[block_at("r1", "allow", 2_000_000, now + 1)],
+            now + 1,
+        );
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "spend_spike")
+            .expect("spend_spike incident");
+        assert_eq!(inc.id, "spend_spike:", "org-scoped, empty run scope");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::High);
+        assert!(inc.run_id.is_none());
+    }
+
+    #[test]
+    fn stream_emits_incident_on_trip() {
+        let s = Store::new();
+        let mut rx = s.subscribe();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        let mut saw = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Incident(inc) = ev {
+                assert_eq!(inc.id, "budget_exhausted:r1");
+                saw = true;
+            }
+        }
+        assert!(saw, "expected an incident event on the bus");
+    }
+
+    #[test]
+    fn incidents_persist_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-incidents.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        // Stamp a notify time so we can prove it survives the round-trip.
+        assert!(s.mark_incident_notified("acme", "budget_exhausted:r1", now, 600_000));
+        s.save(&path).expect("save");
+
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let incs = s2.incidents("acme");
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].id, "budget_exhausted:r1");
+        assert_eq!(incs[0].occurrences, 1);
+        assert_eq!(incs[0].last_notified_millis, now, "dedup clock persists");
+        // The persisted clock still dedups after a restart.
+        assert!(!s2.mark_incident_notified("acme", "budget_exhausted:r1", now + 1000, 600_000));
+
+        // An old snapshot with no `incidents` field loads to empty, not an error.
+        let old = dir.join(format!("tf-cloud-{}-oldinc.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.incidents("acme").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn ack_marks_incident_acknowledged() {
+        let s = Store::new();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        assert!(!s.incidents("acme")[0].acknowledged);
+        assert!(s.ack_incident("acme", "budget_exhausted:r1"));
+        assert!(s.incidents("acme")[0].acknowledged);
+        // Unknown id → false.
+        assert!(!s.ack_incident("acme", "nope"));
     }
 }

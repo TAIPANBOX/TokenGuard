@@ -5,7 +5,7 @@
 //! prints it (as a human tree or as JSON), and decides the process exit code
 //! from `max_severity()` vs a `--fail-on` threshold.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -14,7 +14,7 @@ use crate::mcp::{Drift, McpTool, ScanFinding};
 /// How serious a finding is. Order matters: variants are declared low-to-high
 /// so the derived `Ord`/`PartialOrd` gives `Info < Low < Medium < High <
 /// Critical`, which `ScanReport::max_severity` and `--fail-on` rely on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,

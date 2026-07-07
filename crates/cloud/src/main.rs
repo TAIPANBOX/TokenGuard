@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokenfuse_cloud::{
-    app, openapi_spec, parse_keys, AppState, NullSender, PushPipeline, PushSender, Store,
+    app, openapi_spec, parse_keys, AppState, IncidentConfig, NullSender, PushPipeline, PushSender,
+    Store,
 };
 
 #[tokio::main]
@@ -37,7 +38,28 @@ async fn main() {
         .filter(|p| *p > 0.0 && *p <= 1.0)
         .unwrap_or(0.8);
 
-    let store = Arc::new(Store::new());
+    // Incident-detector thresholds, mirroring the `TOKENFUSE_CLOUD_ALERT_PCT`
+    // precedent: each env var overrides a documented default.
+    let defaults = IncidentConfig::default();
+    let incident_cfg = IncidentConfig {
+        budget_blocks: env_u64(
+            "TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS",
+            defaults.budget_blocks,
+        ),
+        loop_repeats: env_u64(
+            "TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS",
+            defaults.loop_repeats,
+        ),
+        loop_window_ms: defaults.loop_window_ms,
+        spend_per_min_micros: std::env::var("TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|p| *p > 0.0)
+            .map(|usd| (usd * 1e6) as i64)
+            .unwrap_or(defaults.spend_per_min_micros),
+    };
+
+    let store = Arc::new(Store::with_incident_config(incident_cfg));
 
     // Durable persistence: load a snapshot on startup and autosave every 2s.
     if let Ok(path) = std::env::var("TOKENFUSE_CLOUD_DATA") {
@@ -77,6 +99,16 @@ async fn main() {
     axum::serve(listener, app(state))
         .await
         .expect("serve control plane");
+}
+
+/// Parse a positive `u64` env var, falling back to `default` when unset or
+/// malformed.
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// The APNs sender, if the `apns` feature is built and the environment is

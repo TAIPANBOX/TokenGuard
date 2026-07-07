@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::store::{Store, StreamEvent};
+use crate::store::{Incident, Store, StreamEvent};
 
 /// An alert push to one device.
 #[derive(Clone, Debug, PartialEq)]
@@ -18,6 +18,10 @@ pub struct Push {
     pub body: String,
     pub run_id: String,
     pub reason: String,
+    /// Incident deep-link fields (set only for incident pushes; `None` for
+    /// kill/budget alerts).
+    pub incident_id: Option<String>,
+    pub kind: Option<String>,
 }
 
 /// A Live Activity update to one activity.
@@ -64,6 +68,13 @@ fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -144,6 +155,42 @@ impl PushPipeline {
                 }
             }
             StreamEvent::Budget { .. } => {}
+            StreamEvent::Incident(inc) => self.incident_alert(inc),
+        }
+    }
+
+    /// Fan an incident out to the org's devices as a "running hot" push. Dedup is
+    /// the incident's own `last_notified_millis` (the SINGLE source of truth),
+    /// checked-and-set atomically in the store so it can't fight the per-(org,
+    /// run, reason) map used by kill/budget alerts.
+    fn incident_alert(&self, inc: Incident) {
+        let window_ms = DEDUP_SECS * 1000;
+        if !self
+            .store
+            .mark_incident_notified(&inc.org, &inc.id, now_millis(), window_ms)
+        {
+            return;
+        }
+        let run = inc.run_id.clone().unwrap_or_default();
+        // Prefer the run id in the copy, else the incident id (org-scoped).
+        let label = inc.run_id.clone().unwrap_or_else(|| inc.id.clone());
+        let title = "Agent running hot".to_string();
+        let body = format!(
+            "Agent/run {label} running hot — {}. Tap to review and kill.",
+            inc.kind
+        );
+        for device in self.store.devices_for_org(&inc.org) {
+            if let Some(token) = device.apns_token {
+                self.sender.send(Push {
+                    device_apns_token: token,
+                    title: title.clone(),
+                    body: body.clone(),
+                    run_id: run.clone(),
+                    reason: "incident".to_string(),
+                    incident_id: Some(inc.id.clone()),
+                    kind: Some(inc.kind.clone()),
+                });
+            }
         }
     }
 
@@ -159,6 +206,8 @@ impl PushPipeline {
                     body: body.to_string(),
                     run_id: run.to_string(),
                     reason: reason.to_string(),
+                    incident_id: None,
+                    kind: None,
                 });
             }
         }
@@ -283,6 +332,44 @@ mod tests {
         assert_eq!(acts[0].spent_microusd, 250);
         assert!(!acts[0].ended);
         assert!(acts[1].ended, "kill ends the activity");
+    }
+
+    #[test]
+    fn incident_pushes_once_then_dedupes() {
+        let store = Arc::new(Store::new());
+        store.insert_device_for_test("t", device("d1", "acme", "admin", Some("apns-1")));
+        // Seed a real incident so the store has a dedup clock to advance.
+        let now = 1_000_000;
+        let block = |ts| CallRecord {
+            run_id: "r1".into(),
+            decision: "budget_exceeded".into(),
+            cost_microusd: 1000,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        store.ingest_at("acme", &[block(now - 2), block(now - 1), block(now)], now);
+        let inc = store
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "budget_exhausted")
+            .expect("incident seeded");
+
+        let (pipe, rec) = pipeline_with(store);
+        for _ in 0..3 {
+            pipe.handle(StreamEvent::Incident(inc.clone()));
+        }
+
+        let pushes = rec.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "deduped via last_notified_millis");
+        assert_eq!(pushes[0].device_apns_token, "apns-1");
+        assert_eq!(pushes[0].reason, "incident");
+        assert_eq!(pushes[0].run_id, "r1");
+        assert_eq!(
+            pushes[0].incident_id.as_deref(),
+            Some("budget_exhausted:r1")
+        );
+        assert_eq!(pushes[0].kind.as_deref(), Some("budget_exhausted"));
+        assert!(pushes[0].body.contains("running hot"));
     }
 
     fn rec_at(run: &str, cost: i64) -> CallRecord {

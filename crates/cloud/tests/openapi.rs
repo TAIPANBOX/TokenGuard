@@ -39,6 +39,8 @@ fn spec_covers_every_endpoint() {
         "/v1/kills",
         "/v1/runs/{run}/budget",
         "/v1/budgets",
+        "/v1/incidents",
+        "/v1/incidents/{id}/ack",
     ] {
         assert!(paths.contains_key(p), "spec missing path {p}");
     }
@@ -47,7 +49,7 @@ fn spec_covers_every_endpoint() {
     let schemas = json["components"]["schemas"]
         .as_object()
         .expect("component schemas");
-    for s in ["RunAgg", "Summary", "Alert", "CallRecord"] {
+    for s in ["RunAgg", "Summary", "Alert", "CallRecord", "Incident"] {
         assert!(schemas.contains_key(s), "spec missing schema {s}");
     }
 }

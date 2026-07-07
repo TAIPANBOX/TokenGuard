@@ -114,6 +114,9 @@ impl PushSender for ApnsSender {
                 "aps": { "alert": { "title": push.title, "body": push.body }, "sound": "default" },
                 "run_id": push.run_id,
                 "reason": push.reason,
+                // Incident deep-link fields — null for kill/budget alerts.
+                "incident_id": push.incident_id,
+                "kind": push.kind,
             });
             inner
                 .post(&push.device_apns_token, "alert", "", payload)

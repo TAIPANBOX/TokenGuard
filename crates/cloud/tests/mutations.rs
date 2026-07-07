@@ -128,6 +128,59 @@ async fn viewer_can_read_but_not_mutate() {
 }
 
 #[tokio::test]
+async fn incident_ack_flow_and_rbac() {
+    let state = test_state();
+
+    // Seed an incident: three budget-protection blocks on run r1.
+    let payload = r#"{"records":[
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000},
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000},
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000}
+    ]}"#;
+    let (status, _) = send(&state, "POST", "/v1/ingest", Some("devkey"), Some(payload)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A viewer cannot ack (403, before any existence check).
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/incidents/budget_exhausted:r1/ack",
+        Some("viewerkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An admin acks it (200).
+    let (status, v) = send(
+        &state,
+        "POST",
+        "/v1/incidents/budget_exhausted:r1/ack",
+        Some("devkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["acknowledged"], "budget_exhausted:r1");
+
+    // Unknown incident → 404.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/incidents/nope/ack",
+        Some("devkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The acknowledged flag surfaces on the read.
+    let (status, list) = send(&state, "GET", "/v1/incidents", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["acknowledged"], true);
+}
+
+#[tokio::test]
 async fn unknown_key_is_unauthorized_on_mutation() {
     let state = test_state();
     let (status, _) = send(&state, "POST", "/v1/runs/r1/kill", Some("nope"), None).await;

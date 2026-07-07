@@ -14,4 +14,4 @@ pub mod store;
 pub use http::{app, openapi_spec, AppState};
 pub use keys::{parse_keys, Principal};
 pub use push::{NullSender, PushPipeline, PushSender};
-pub use store::{CallRecord, Store};
+pub use store::{CallRecord, Incident, IncidentConfig, Store};
