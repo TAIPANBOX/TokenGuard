@@ -48,6 +48,14 @@ async fn main() {
                 eprintln!("backtest error: {e}");
             }
         }
+        // `tokenfuse savings` sums the avoided spend recorded at every
+        // budget-protection block in the Parquet trace (the ROI of enforcement).
+        Some("savings") => {
+            let dir = std::env::var("TOKENFUSE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+            if let Err(e) = tokenfuse_gateway::savingscli::run(&dir).await {
+                eprintln!("savings error: {e}");
+            }
+        }
         // `tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]`
         //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
         // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`

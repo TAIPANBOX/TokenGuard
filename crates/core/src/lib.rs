@@ -14,6 +14,7 @@ pub mod mcpreport;
 pub mod money;
 pub mod policy;
 pub mod pricing;
+pub mod savings;
 pub mod secretbroker;
 pub mod taint;
 
@@ -27,5 +28,6 @@ pub use mcpreport::{Finding, ScanReport, Severity};
 pub use money::Microusd;
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
 pub use pricing::{ModelPrice, PriceBook, Usage};
+pub use savings::{compute_savings, SavingsReport};
 pub use secretbroker::{inject_secrets, Injection, SecretVault};
 pub use taint::{FirewallMode, Labels, TaintRule};
