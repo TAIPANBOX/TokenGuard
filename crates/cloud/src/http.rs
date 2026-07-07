@@ -28,7 +28,9 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::devices::{self, Device};
 use crate::keys::Principal;
-use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
+use crate::store::{
+    AgentAgg, Alert, CallRecord, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
+};
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
 /// and dumped by `tokenfuse-cloud --openapi`; downstream clients (Swift, the
@@ -40,12 +42,14 @@ use crate::store::{Alert, CallRecord, RunAgg, SeriesBucket, Store, Summary};
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, summary, alerts, series, kill, kills, set_budget, budgets,
+        ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
         pair_new, pair, register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
         RunAgg,
+        AgentAgg,
+        SavingsSummary,
         Summary,
         Alert,
         SeriesBucket,
@@ -223,6 +227,8 @@ pub fn app(state: AppState) -> Router {
         .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
+        .route("/v1/agents", get(agents))
+        .route("/v1/savings", get(savings))
         .route("/v1/summary", get(summary))
         .route("/v1/alerts", get(alerts))
         .route("/v1/series", get(series))
@@ -384,6 +390,40 @@ async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.runs(&org))).into_response()
+}
+
+/// The caller org's per-agent spend rollup, highest spend first. The
+/// empty-string agent is the unattributed bucket.
+#[utoipa::path(
+    get, path = "/v1/agents",
+    responses(
+        (status = 200, description = "aggregated agents, highest spend first", body = Vec<AgentAgg>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.agents(&org))).into_response()
+}
+
+/// The caller org's FinOps savings: budget-protection blocked (avoided) spend
+/// plus semantic-cache savings, and their total.
+#[utoipa::path(
+    get, path = "/v1/savings",
+    responses(
+        (status = 200, description = "org FinOps savings totals", body = SavingsSummary),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn savings(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.savings(&org))).into_response()
 }
 
 /// Org-wide totals.

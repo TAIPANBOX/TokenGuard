@@ -65,6 +65,11 @@ pub struct CallRecord {
 pub struct RunAgg {
     pub run_id: String,
     pub model: String,
+    /// Which logical agent this run is attributed to (P2). Empty when the
+    /// gateway didn't tag the calls — folded into the "unattributed" bucket by
+    /// [`Store::agents`]. `serde(default)` so pre-P2 snapshots still load.
+    #[serde(default)]
+    pub agent_id: String,
     pub spent_microusd: i64,
     pub calls: u64,
     pub cache_hits: u64,
@@ -80,6 +85,48 @@ pub struct Summary {
     pub runs: u64,
     pub calls: u64,
     pub spent_microusd: i64,
+}
+
+/// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
+/// The empty-string `agent_id` is kept as an explicit "unattributed" bucket.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct AgentAgg {
+    /// The agent this bucket rolls up; `""` for unattributed runs.
+    pub agent_id: String,
+    /// Real spend (blocked/avoided-spend rows already excluded upstream).
+    pub spent_microusd: i64,
+    pub calls: u64,
+    /// Distinct runs attributed to this agent.
+    pub runs: u64,
+    #[serde(rename = "last_seen_millis")]
+    pub last_seen: i64,
+}
+
+/// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
+/// headline: budget-protection blocked spend plus semantic-cache savings.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct SavingsSummary {
+    /// Avoided spend from budget-protection blocks (runaway spend stopped).
+    pub blocked_spend_microusd: i64,
+    /// Dollars served for free by the semantic cache.
+    pub cache_saved_microusd: i64,
+    /// Distinct runs stopped by at least one budget-protection block.
+    pub budget_breaks: u64,
+    /// `blocked_spend_microusd + cache_saved_microusd`.
+    pub total_saved_microusd: i64,
+}
+
+/// The live FinOps savings accumulator for one org, folded incrementally in
+/// [`Store::ingest`] (the control plane is a live rollup, not a Parquet reader).
+/// Persisted in the snapshot so totals survive a restart.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct SavingsAcc {
+    blocked_spend_microusd: i64,
+    cache_saved_microusd: i64,
+    /// Distinct run ids that hit ≥1 budget-protection block — the set makes
+    /// `budget_breaks` distinct-by-run even across restarts (it's persisted).
+    #[serde(default)]
+    breaks: HashSet<String>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -161,6 +208,8 @@ struct Inner {
     budgets: HashMap<String, HashMap<String, i64>>,
     /// org → bounded log of recent samples for the burn-rate series
     series: HashMap<String, VecDeque<Sample>>,
+    /// org → live FinOps savings accumulator (persisted)
+    savings: HashMap<String, SavingsAcc>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -181,6 +230,7 @@ struct SnapshotRef<'a> {
     killed: &'a HashMap<String, HashMap<String, bool>>,
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
+    savings: &'a HashMap<String, SavingsAcc>,
 }
 
 #[derive(Default, Deserialize)]
@@ -193,6 +243,10 @@ struct SnapshotOwned {
     budgets: HashMap<String, HashMap<String, i64>>,
     #[serde(default)]
     devices: HashMap<String, Device>,
+    /// Missing on pre-P2 snapshots — `default` yields an empty map, so
+    /// `savings()` reports zeros until fresh telemetry accumulates.
+    #[serde(default)]
+    savings: HashMap<String, SavingsAcc>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -229,10 +283,14 @@ impl Store {
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
         let mut updated: Vec<RunAgg> = Vec::new();
         {
-            let mut inner = self.inner.write().unwrap();
-            inner.dirty = true;
+            let mut guard = self.inner.write().unwrap();
+            guard.dirty = true;
+            // Reborrow so `orgs` and `savings` can be borrowed as disjoint
+            // fields inside the same loop (a live rollup accumulates both).
+            let inner = &mut *guard;
             {
                 let runs = inner.orgs.entry(org.to_string()).or_default();
+                let sav = inner.savings.entry(org.to_string()).or_default();
                 for r in records {
                     let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
                         run_id: r.run_id.clone(),
@@ -251,12 +309,25 @@ impl Store {
                     if !r.model.is_empty() {
                         agg.model = r.model.clone();
                     }
+                    if !r.agent_id.is_empty() {
+                        agg.agent_id = r.agent_id.clone();
+                    }
                     if r.step > agg.steps {
                         agg.steps = r.step;
                     }
                     if r.ts_millis > agg.last_seen {
                         agg.last_seen = r.ts_millis;
                     }
+                    // FinOps savings, folded in the same pass. Only the
+                    // budget-protection subset counts as blocked (avoided)
+                    // spend — dlp/taint blocks are security value, not dollars
+                    // (and carry cost 0 anyway). Cache savings sum
+                    // unconditionally: `saved_microusd` is 0 off cache hits.
+                    if tokenfuse_core::savings::is_budget_protection(&r.decision) {
+                        sav.blocked_spend_microusd += r.cost_microusd;
+                        sav.breaks.insert(r.run_id.clone());
+                    }
+                    sav.cache_saved_microusd += r.saved_microusd;
                 }
             }
             {
@@ -369,6 +440,50 @@ impl Store {
         sum
     }
 
+    /// An org's per-agent spend rollup, highest spend first. Folds the org's
+    /// [`RunAgg`]s by `agent_id`; the empty-string agent is kept as its own
+    /// (unattributed) bucket. Spend already excludes blocked rows (that gate is
+    /// applied when folding calls into `RunAgg::spent_microusd`).
+    pub fn agents(&self, org: &str) -> Vec<AgentAgg> {
+        let inner = self.inner.read().unwrap();
+        let mut by_agent: HashMap<String, AgentAgg> = HashMap::new();
+        if let Some(runs) = inner.orgs.get(org) {
+            for agg in runs.values() {
+                let a = by_agent
+                    .entry(agg.agent_id.clone())
+                    .or_insert_with(|| AgentAgg {
+                        agent_id: agg.agent_id.clone(),
+                        ..Default::default()
+                    });
+                a.spent_microusd += agg.spent_microusd;
+                a.calls += agg.calls;
+                a.runs += 1;
+                if agg.last_seen > a.last_seen {
+                    a.last_seen = agg.last_seen;
+                }
+            }
+        }
+        let mut out: Vec<AgentAgg> = by_agent.into_values().collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.spent_microusd));
+        out
+    }
+
+    /// An org's live FinOps savings totals (blocked/avoided spend + cache
+    /// savings). Accumulated incrementally in [`Store::ingest`] and persisted.
+    pub fn savings(&self, org: &str) -> SavingsSummary {
+        let inner = self.inner.read().unwrap();
+        let acc = inner.savings.get(org);
+        let blocked = acc.map(|a| a.blocked_spend_microusd).unwrap_or(0);
+        let cache = acc.map(|a| a.cache_saved_microusd).unwrap_or(0);
+        let breaks = acc.map(|a| a.breaks.len() as u64).unwrap_or(0);
+        SavingsSummary {
+            blocked_spend_microusd: blocked,
+            cache_saved_microusd: cache,
+            budget_breaks: breaks,
+            total_saved_microusd: blocked + cache,
+        }
+    }
+
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
         {
@@ -467,6 +582,7 @@ impl Store {
                 killed: &inner.killed,
                 budgets: &inner.budgets,
                 devices: &inner.devices,
+                savings: &inner.savings,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -491,6 +607,7 @@ impl Store {
         inner.killed = snap.killed;
         inner.budgets = snap.budgets;
         inner.devices = snap.devices;
+        inner.savings = snap.savings;
         Ok(())
     }
 
@@ -803,6 +920,147 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].run_id, "r1");
         assert!((alerts[0].fraction - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn agents_roll_up_by_agent_id() {
+        let s = Store::new();
+        let r = |run: &str, agent: &str, decision: &str, cost: i64, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("r1", "planner", "allow", 1000, 10),
+                r("r2", "planner", "allow", 2000, 20),
+                // A budget-protection block for coder — its avoided cost must
+                // NOT count toward the agent's real spend.
+                r("r3", "coder", "allow", 500, 30),
+                r("r3", "coder", "budget_exceeded", 999_999, 40),
+                // Unattributed run (empty agent_id) is kept as its own bucket.
+                r("r4", "", "allow", 250, 50),
+            ],
+        );
+
+        let agents = s.agents("acme");
+        assert_eq!(agents.len(), 3);
+        // Sorted by spend desc: planner (3000) > coder (500) > "" (250).
+        assert_eq!(agents[0].agent_id, "planner");
+        assert_eq!(agents[0].spent_microusd, 3000);
+        assert_eq!(agents[0].calls, 2);
+        assert_eq!(agents[0].runs, 2);
+        assert_eq!(agents[0].last_seen, 20);
+
+        assert_eq!(agents[1].agent_id, "coder");
+        // Blocked/avoided spend excluded — only the $0.0005 allow counts.
+        assert_eq!(agents[1].spent_microusd, 500);
+        assert_eq!(agents[1].calls, 2);
+        assert_eq!(agents[1].runs, 1);
+
+        assert_eq!(agents[2].agent_id, "");
+        assert_eq!(agents[2].spent_microusd, 250);
+        assert_eq!(agents[2].runs, 1);
+    }
+
+    #[test]
+    fn savings_accumulate_across_reasons() {
+        let s = Store::new();
+        let r = |run: &str, decision: &str, cost: i64, saved: i64| CallRecord {
+            run_id: run.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            saved_microusd: saved,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("r1", "allow", 1000, 0),
+                r("r1", "budget_exceeded", 500_000, 0), // avoided spend
+                r("r2", "loop_detected", 200_000, 0),   // avoided spend, 2nd run
+                r("r1", "cache_hit", 0, 30_000),        // cache savings
+                r("r3", "dlp_blocked", 9_000_000, 0),   // security — excluded
+            ],
+        );
+
+        let sav = s.savings("acme");
+        // Only budget-protection cost counts; dlp is excluded.
+        assert_eq!(sav.blocked_spend_microusd, 700_000);
+        assert_eq!(sav.cache_saved_microusd, 30_000);
+        // Distinct blocked runs: r1 and r2 (r3's dlp doesn't count).
+        assert_eq!(sav.budget_breaks, 2);
+        assert_eq!(sav.total_saved_microusd, 730_000);
+    }
+
+    #[test]
+    fn savings_breaks_are_distinct_by_run() {
+        let s = Store::new();
+        let r = |run: &str| CallRecord {
+            run_id: run.into(),
+            decision: "budget_exceeded".into(),
+            cost_microusd: 1_000_000,
+            ..Default::default()
+        };
+        // Same run blocked twice → one break; blocked_spend still sums both.
+        s.ingest("acme", &[r("r1"), r("r1")]);
+        let sav = s.savings("acme");
+        assert_eq!(sav.budget_breaks, 1);
+        assert_eq!(sav.blocked_spend_microusd, 2_000_000);
+    }
+
+    #[test]
+    fn savings_persist_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-savings.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 400_000,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "cache_hit".into(),
+                    saved_microusd: 60_000,
+                    ..Default::default()
+                },
+            ],
+        );
+        s.save(&path).expect("save");
+
+        // Totals — including distinct budget_breaks — survive a reload.
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let sav = s2.savings("acme");
+        assert_eq!(sav.blocked_spend_microusd, 400_000);
+        assert_eq!(sav.cache_saved_microusd, 60_000);
+        assert_eq!(sav.budget_breaks, 1);
+        assert_eq!(sav.total_saved_microusd, 460_000);
+
+        // An old snapshot with no `savings` field loads to zeros, not an error.
+        let old = dir.join(format!("tf-cloud-{}-oldsnap.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert_eq!(s3.savings("acme").total_saved_microusd, 0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
     }
 
     #[test]

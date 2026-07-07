@@ -159,12 +159,121 @@ async fn alerts_only_fire_over_threshold() {
 }
 
 #[tokio::test]
+async fn agents_roll_up_and_sort_by_spend() {
+    let (state, store) = test_state();
+    store.ingest(
+        "acme",
+        &[
+            CallRecord {
+                run_id: "r1".into(),
+                agent_id: "planner".into(),
+                decision: "allow".into(),
+                cost_microusd: 1000,
+                ts_millis: 10,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r2".into(),
+                agent_id: "planner".into(),
+                decision: "allow".into(),
+                cost_microusd: 2000,
+                ts_millis: 20,
+                ..Default::default()
+            },
+            // A budget-protection block: counted, but avoided cost is not spend.
+            CallRecord {
+                run_id: "r3".into(),
+                agent_id: "coder".into(),
+                decision: "allow".into(),
+                cost_microusd: 500,
+                ts_millis: 30,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r3".into(),
+                agent_id: "coder".into(),
+                decision: "budget_exceeded".into(),
+                cost_microusd: 900_000,
+                ts_millis: 40,
+                ..Default::default()
+            },
+            // Unattributed run kept as its own ("") bucket.
+            CallRecord {
+                run_id: "r4".into(),
+                decision: "allow".into(),
+                cost_microusd: 250,
+                ts_millis: 50,
+                ..Default::default()
+            },
+        ],
+    );
+
+    // A viewer may read agents.
+    let (status, v) = get(&state, "/v1/agents", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = v.as_array().expect("agents is an array");
+    assert_eq!(agents.len(), 3);
+    // Sorted by spend desc.
+    assert_eq!(agents[0]["agent_id"], "planner");
+    assert_eq!(agents[0]["spent_microusd"], 3000);
+    assert_eq!(agents[0]["calls"], 2);
+    assert_eq!(agents[0]["runs"], 2);
+    assert_eq!(agents[1]["agent_id"], "coder");
+    // Blocked row excluded from spend.
+    assert_eq!(agents[1]["spent_microusd"], 500);
+    assert_eq!(agents[2]["agent_id"], "");
+    assert_eq!(agents[2]["spent_microusd"], 250);
+}
+
+#[tokio::test]
+async fn savings_sum_blocked_cache_and_breaks() {
+    let (state, _store) = test_state();
+    // allow + budget_exceeded (avoided) + cache_hit (saved) + dlp (excluded),
+    // over two distinct blocked runs.
+    let payload = r#"{"records":[
+        {"ts_millis":10,"run_id":"r1","decision":"allow","cost_microusd":1000},
+        {"ts_millis":20,"run_id":"r1","decision":"budget_exceeded","cost_microusd":500000},
+        {"ts_millis":30,"run_id":"r2","decision":"loop_detected","cost_microusd":200000},
+        {"ts_millis":40,"run_id":"r1","decision":"cache_hit","saved_microusd":30000},
+        {"ts_millis":50,"run_id":"r3","decision":"dlp_blocked","cost_microusd":9000000}
+    ]}"#;
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer devkey")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A viewer may read savings.
+    let (status, s) = get(&state, "/v1/savings", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Only budget-protection cost; dlp excluded.
+    assert_eq!(s["blocked_spend_microusd"], 700_000);
+    assert_eq!(s["cache_saved_microusd"], 30_000);
+    // Distinct blocked runs r1 + r2.
+    assert_eq!(s["budget_breaks"], 2);
+    assert_eq!(s["total_saved_microusd"], 730_000);
+}
+
+#[tokio::test]
 async fn reads_require_a_valid_key() {
     let (state, _) = test_state();
     let (no_key, _) = get(&state, "/v1/runs", None).await;
     assert_eq!(no_key, StatusCode::UNAUTHORIZED);
     let (wrong_key, _) = get(&state, "/v1/runs", Some("nope")).await;
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
+
+    // The new read endpoints are gated too.
+    for path in ["/v1/agents", "/v1/savings"] {
+        let (no_key, _) = get(&state, path, None).await;
+        assert_eq!(no_key, StatusCode::UNAUTHORIZED, "{path} unauth");
+        let (wrong_key, _) = get(&state, path, Some("nope")).await;
+        assert_eq!(wrong_key, StatusCode::UNAUTHORIZED, "{path} wrong key");
+    }
 }
 
 #[tokio::test]

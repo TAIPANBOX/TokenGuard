@@ -11,6 +11,7 @@ name = "tokenfuse-cloud"
 path = "src/main.rs"
 
 [dependencies]
+tokenfuse-core.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum.workspace = true
