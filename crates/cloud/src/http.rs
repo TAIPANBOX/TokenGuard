@@ -22,11 +22,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use p256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::audit_sign::AuditManifest;
 use crate::devices::{self, Device};
 use crate::entitlements::{gate, Feature};
 use crate::keys::{Plan, Principal};
@@ -46,8 +48,8 @@ use crate::store::{
     ),
     paths(
         ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        incidents, ack_incident, compliance, audit, audit_verify, pair_new, pair, register_apns,
-        register_activity,
+        incidents, ack_incident, compliance, audit, audit_verify, audit_manifest, pair_new, pair,
+        register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
@@ -62,6 +64,7 @@ use crate::store::{
         ControlEvidenceSchema,
         AuditEntrySchema,
         AuditVerifyResponse,
+        AuditManifest,
         IngestBody,
         IngestResponse,
         BudgetBody,
@@ -104,6 +107,11 @@ pub struct AppState {
     /// byte-for-byte identical to a keys-only deployment. Parsed once at
     /// construction so no env/file I/O happens per request.
     pub oidc: Option<Arc<OidcConfig>>,
+    /// Optional server P-256 key for signing audit manifests (P3 WS2). `None`
+    /// when unconfigured — `/v1/audit/manifest` then reports not-configured
+    /// (`404`); the rest of the audit trail is unaffected. Loaded once at
+    /// construction from `TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY`.
+    pub audit_signing_key: Option<Arc<SigningKey>>,
 }
 
 impl AppState {
@@ -113,6 +121,7 @@ impl AppState {
             keys,
             alert_pct,
             oidc: None,
+            audit_signing_key: None,
         }
     }
 
@@ -121,6 +130,16 @@ impl AppState {
     /// — is unchanged; a keys-only deployment simply never calls this.
     pub fn with_oidc(mut self, oidc: Option<OidcConfig>) -> Self {
         self.oidc = oidc.map(Arc::new);
+        self
+    }
+
+    /// Attach an optional audit-manifest signing key (from
+    /// [`crate::audit_sign::signing_key_from_env`]). Kept off `new` like
+    /// [`Self::with_oidc`], so existing call sites and tests are unchanged; a
+    /// deployment without a key simply never calls this and `/v1/audit/manifest`
+    /// reports not-configured.
+    pub fn with_audit_signing_key(mut self, key: Option<SigningKey>) -> Self {
+        self.audit_signing_key = key.map(Arc::new);
         self
     }
 
@@ -330,6 +349,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/compliance", get(compliance))
         .route("/v1/audit", get(audit))
         .route("/v1/audit/verify", get(audit_verify))
+        .route("/v1/audit/manifest", get(audit_manifest))
         .route("/v1/pair/new", post(pair_new))
         .route("/v1/pair", post(pair))
         .route("/v1/devices/{id}/apns", post(register_apns))
@@ -992,6 +1012,39 @@ async fn audit_verify(State(st): State<AppState>, headers: HeaderMap) -> Respons
         },
     };
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// A cryptographically-signed manifest over the caller org's audit chain tip:
+/// an ES256 signature (server P-256 key) an auditor can verify offline to prove
+/// the log ended at this entry, unaltered. Readable by any role (like the other
+/// audit reads); a paid feature. When no signing key is configured the server
+/// returns `404 {"error":"audit manifest signing not configured"}` (never a
+/// `500`); the rest of the audit trail is unaffected.
+#[utoipa::path(
+    get, path = "/v1/audit/manifest",
+    responses(
+        (status = 200, description = "signed manifest over the chain tip", body = AuditManifest),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 402, description = "plan required", body = PlanRequiredResponse),
+        (status = 404, description = "manifest signing not configured", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn audit_manifest(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+        return plan_required(&org, d.feature);
+    }
+    let Some(key) = st.audit_signing_key.as_ref() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "audit manifest signing not configured",
+        );
+    };
+    let manifest = st.store.audit_manifest(&org, key, now_millis());
+    (StatusCode::OK, Json(manifest)).into_response()
 }
 
 /// Issue a one-time pairing code (admin org key). The dashboard renders it as a

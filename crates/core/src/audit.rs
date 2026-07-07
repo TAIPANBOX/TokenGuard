@@ -12,9 +12,12 @@
 //! budget — not the enforcement (block) stream, which already lives in the
 //! gateway's Parquet trace and is not duplicated here.
 //!
-//! Deferred: a cryptographically-signed manifest over the chain tip (so a
-//! verifier need not trust the store to have retained the whole chain) is a
-//! later PR; this module deliberately stops at the hash chain.
+//! Over the tip, a cryptographically-signed manifest (so a verifier need not
+//! trust the store to have retained the whole chain) binds an external key to
+//! the chain's tip. The canonical bytes that manifest signs are built here by
+//! [`manifest_signing_bytes`] — pure and crypto-free — while the ES256 signing
+//! itself (a P-256 key, external custody) lives in the control plane
+//! (`crates/cloud/src/audit_sign.rs`), keeping this module `p256`-free.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -108,6 +111,28 @@ pub fn append(
         prev_hash,
         entry_hash,
     }
+}
+
+/// The canonical byte string a signed audit manifest covers: the org, the
+/// chain tip's `seq` and `entry_hash`, the total entry count, and the signing
+/// timestamp, joined in a fixed order by [`SEP`] — the same control-byte
+/// separator the per-entry hash uses, so no field content can be re-partitioned
+/// into a different tuple. Pure and crypto-free: the control plane signs these
+/// bytes with its P-256 key, and an auditor re-derives them from the published
+/// manifest fields to verify the ES256 signature offline.
+///
+/// An empty chain is attested as `tip_seq = 0`, `tip_hash = ""`,
+/// `entry_count = 0` — a manifest that provably says "no entries", and is just
+/// as unforgeable as one over a populated chain.
+pub fn manifest_signing_bytes(
+    org: &str,
+    tip_seq: u64,
+    tip_hash: &str,
+    entry_count: u64,
+    signed_at_millis: i64,
+) -> Vec<u8> {
+    format!("{org}{SEP}{tip_seq}{SEP}{tip_hash}{SEP}{entry_count}{SEP}{signed_at_millis}")
+        .into_bytes()
 }
 
 /// Verify a chain end-to-end. For each entry (oldest first) recompute its
@@ -214,5 +239,43 @@ mod tests {
         // Remove the middle: the follower's prev_hash/seq no longer line up.
         c.remove(2);
         assert_eq!(verify_chain(&c), Err(2));
+    }
+
+    #[test]
+    fn manifest_bytes_are_deterministic_and_field_sensitive() {
+        let base = manifest_signing_bytes("acme", 3, "abc123", 4, 1_700_000_000_000);
+        // Deterministic for the same inputs.
+        assert_eq!(
+            base,
+            manifest_signing_bytes("acme", 3, "abc123", 4, 1_700_000_000_000)
+        );
+        // Every field participates: changing any one changes the bytes.
+        assert_ne!(
+            base,
+            manifest_signing_bytes("acme2", 3, "abc123", 4, 1_700_000_000_000)
+        );
+        assert_ne!(
+            base,
+            manifest_signing_bytes("acme", 4, "abc123", 4, 1_700_000_000_000)
+        );
+        assert_ne!(
+            base,
+            manifest_signing_bytes("acme", 3, "abc124", 4, 1_700_000_000_000)
+        );
+        assert_ne!(
+            base,
+            manifest_signing_bytes("acme", 3, "abc123", 5, 1_700_000_000_000)
+        );
+        assert_ne!(
+            base,
+            manifest_signing_bytes("acme", 3, "abc123", 4, 1_700_000_000_001)
+        );
+    }
+
+    #[test]
+    fn manifest_bytes_over_empty_chain_are_the_zero_tip() {
+        // The "no entries" attestation: tip_seq/entry_count 0, empty tip_hash.
+        let b = manifest_signing_bytes("acme", 0, "", 0, 42);
+        assert_eq!(b, format!("acme{SEP}0{SEP}{SEP}0{SEP}42").into_bytes());
     }
 }

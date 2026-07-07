@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
+use p256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use tokenfuse_core::audit::{self, AuditEntry};
 use tokio::sync::broadcast;
@@ -837,6 +838,22 @@ impl Store {
             Some(chain) => audit::verify_chain(chain),
             None => Ok(()),
         }
+    }
+
+    /// A cryptographically-signed manifest over `org`'s audit chain tip, signed
+    /// with `key` and stamped `now_ms`. Derived on demand from the persisted
+    /// chain (nothing new is stored); an empty chain still yields a valid signed
+    /// zero-tip manifest. See [`crate::audit_sign::build_signed_manifest`].
+    pub fn audit_manifest(
+        &self,
+        org: &str,
+        key: &SigningKey,
+        now_ms: i64,
+    ) -> crate::audit_sign::AuditManifest {
+        let inner = self.inner.read().unwrap();
+        let empty = Vec::new();
+        let chain = inner.audit.get(org).unwrap_or(&empty);
+        crate::audit_sign::build_signed_manifest(org, chain, key, now_ms)
     }
 
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
@@ -2129,5 +2146,96 @@ mod tests {
                 .all(|i| i.kind != "fanout_explosion"),
             "unattributed runs never fan out"
         );
+    }
+
+    /// A test P-256 signing key (fixed scalar, no RNG).
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_slice(&[0x22u8; 32]).expect("valid scalar")
+    }
+
+    #[test]
+    fn audit_manifest_pins_the_current_tip() {
+        let s = Store::new();
+        let key = test_signing_key();
+        s.audit_append("acme", "key:a", "control.kill", "r1", "mode=hard");
+        s.audit_append(
+            "acme",
+            "key:a",
+            "control.set_budget",
+            "r1",
+            "budget_micros=1",
+        );
+
+        let chain = s.audit("acme");
+        let m = s.audit_manifest("acme", &key, 1_700_000_000_000);
+        assert_eq!(m.org, "acme");
+        assert_eq!(m.algorithm, "ES256");
+        assert_eq!(m.entry_count, 2);
+        assert_eq!(m.tip_seq, 1);
+        // The manifest pins the actual current chain tip.
+        assert_eq!(m.tip_hash, chain[1].entry_hash);
+        assert_eq!(m.signed_at_millis, 1_700_000_000_000);
+        assert!(!m.signature_b64.is_empty());
+        assert!(!m.public_key_b64.is_empty());
+    }
+
+    #[test]
+    fn audit_manifest_over_empty_chain_is_the_zero_tip() {
+        let s = Store::new();
+        let key = test_signing_key();
+        let m = s.audit_manifest("noorg", &key, 42);
+        assert_eq!(m.tip_seq, 0);
+        assert_eq!(m.entry_count, 0);
+        assert_eq!(m.tip_hash, "");
+        assert_eq!(m.algorithm, "ES256");
+        assert!(!m.signature_b64.is_empty());
+    }
+
+    #[test]
+    fn a_signed_manifest_catches_a_re_hashed_forge() {
+        let s = Store::new();
+        let key = test_signing_key();
+        s.audit_append("acme", "key:a", "control.kill", "r1", "mode=hard");
+        s.audit_append(
+            "acme",
+            "key:a",
+            "control.set_budget",
+            "r1",
+            "budget_micros=1",
+        );
+        // An auditor holds this manifest, pinning the intact tip.
+        let signed = s.audit_manifest("acme", &key, 1);
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+
+        // A forger edits entry 0 and RE-HASHES the whole chain so the plain
+        // hash-chain check passes again — this is exactly the attack the signed
+        // tip defends against (the store alone cannot detect it).
+        {
+            let mut inner = s.inner.write().unwrap();
+            let chain = inner.audit.get_mut("acme").unwrap();
+            let mut forged: Vec<AuditEntry> = Vec::new();
+            for (i, e) in chain.iter().enumerate() {
+                let detail = if i == 0 {
+                    "mode=soft"
+                } else {
+                    e.detail.as_str()
+                };
+                forged.push(audit::append(
+                    forged.last(),
+                    e.ts_millis,
+                    e.actor.clone(),
+                    e.action.clone(),
+                    e.subject.clone(),
+                    detail,
+                ));
+            }
+            *chain = forged;
+        }
+        // The re-hashed forge passes the hash-chain check...
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+        // ...but re-hashing moved the tip, which the forger cannot re-sign: the
+        // recomputed tip_hash no longer matches the signed manifest's.
+        let after = s.audit_manifest("acme", &key, 2);
+        assert_ne!(after.tip_hash, signed.tip_hash);
     }
 }

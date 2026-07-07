@@ -21,7 +21,8 @@ use futures::StreamExt;
 use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
-    dlp, evaluate, BudgetError, DlpMode, Microusd, Mode, Reservation, SemanticCache,
+    dlp, evaluate, BreakerReason, BreakerVerdict, BudgetError, DlpMode, Microusd, Mode,
+    Reservation, SemanticCache,
 };
 
 /// Where a non-streaming response should be cached after it settles.
@@ -90,14 +91,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             agent_id: agent_id.clone(),
             saved_microusd: 0,
         });
-        return budget_error(
-            "killed",
-            &run_id,
+        let verdict = budget_verdict(
+            BreakerReason::Killed,
             budget,
             spent,
             &st.policy_id,
             "run killed by operator",
         );
+        return breaker_error_response(&run_id, &verdict);
     }
 
     // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
@@ -223,14 +224,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
             });
-            return budget_error(
-                "policy_violation",
-                &run_id,
+            let verdict = budget_verdict(
+                BreakerReason::PolicyViolation,
                 budget,
                 snapshot.spent,
                 &st.policy_id,
                 &eval.violated.clone().unwrap_or_default(),
             );
+            return breaker_error_response(&run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
             st.sink.record(CallRecord {
@@ -245,14 +246,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
             });
-            return budget_error(
-                "loop_detected",
-                &run_id,
+            let verdict = budget_verdict(
+                BreakerReason::LoopDetected,
                 budget,
                 snapshot.spent,
                 &st.policy_id,
                 reason,
             );
+            return breaker_error_response(&run_id, &verdict);
         }
     }
 
@@ -286,14 +287,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
             });
-            return budget_error(
-                "wasm_policy",
-                &run_id,
+            let verdict = budget_verdict(
+                BreakerReason::WasmPolicy,
                 budget,
                 snapshot.spent,
                 &st.policy_id,
                 "blocked by custom wasm policy",
             );
+            return breaker_error_response(&run_id, &verdict);
         }
     }
 
@@ -328,14 +329,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     agent_id: agent_id.clone(),
                     saved_microusd: 0,
                 });
-                return budget_error(
-                    "budget_exceeded",
-                    &run_id,
+                let verdict = budget_verdict(
+                    BreakerReason::BudgetExceeded,
                     budget,
                     spent,
                     &st.policy_id,
                     &reason,
                 );
+                return breaker_error_response(&run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
                 st.ledger.reserve_unchecked(&run_id, estimate).await
@@ -695,33 +696,45 @@ async fn collect(
     Ok(acc)
 }
 
-/// Build the stable 402 budget/policy error contract.
-fn budget_error(
-    kind: &str,
-    run_id: &str,
-    budget: Microusd,
-    spent: Microusd,
-    policy_id: &str,
-    reason: &str,
-) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "type": kind,
-            "run_id": run_id,
-            "budget_usd": budget.as_usd(),
-            "spent_usd": spent.as_usd(),
-            "policy_id": policy_id,
-            "reason": reason,
-            "retryable": false,
-        }
-    });
+/// Build a budget-family block response from a `BreakerVerdict`, the single
+/// owner of the 402 budget/policy/loop/kill/wasm wire contract. Status, body,
+/// and headers are byte-identical to the pre-refactor `budget_error` builder;
+/// the verdict's `to_error_json` mirrors that JSON shape exactly.
+fn breaker_error_response(run_id: &str, verdict: &BreakerVerdict) -> Response {
+    let status = verdict
+        .reason
+        .map(BreakerReason::http_status)
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::PAYMENT_REQUIRED);
+    let body = verdict.to_error_json(run_id);
     Response::builder()
-        .status(StatusCode::PAYMENT_REQUIRED)
+        .status(status)
         .header("content-type", "application/json")
         .header("x-fuse", "blocked")
         .header("x-fuse-run-id", run_id)
         .body(Body::from(body.to_string()))
         .expect("valid response")
+}
+
+/// Construct the 402 budget-family verdict the five block sites share: tripped,
+/// with budget/spent/policy_id always present (matching the old `budget_error`
+/// args) and `detail` carrying the human-readable reason string.
+fn budget_verdict(
+    reason: BreakerReason,
+    budget: Microusd,
+    spent: Microusd,
+    policy_id: &str,
+    detail: &str,
+) -> BreakerVerdict {
+    BreakerVerdict {
+        tripped: true,
+        reason: Some(reason),
+        detail: Some(detail.to_string()),
+        budget_usd: Some(budget.as_usd()),
+        spent_usd: Some(spent.as_usd()),
+        policy_id: Some(policy_id.to_string()),
+        would_trip_only: false,
+    }
 }
 
 fn upstream_error(e: ProviderError) -> Response {
@@ -1327,5 +1340,109 @@ mod tests {
         let snap = ledger.snapshot("run-stream").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.reserved, Microusd::ZERO); // reservation released on settle
+    }
+
+    /// The pre-refactor `budget_error` builder, kept verbatim as the golden
+    /// wire format. The new `breaker_error_response` path MUST reproduce this
+    /// byte-for-byte (body, status, headers) — that is the whole point of the
+    /// facade refactor. Do NOT "fix" this to match new code: this is the
+    /// contract clients already depend on and it must not change.
+    fn golden_budget_error(
+        kind: &str,
+        run_id: &str,
+        budget: Microusd,
+        spent: Microusd,
+        policy_id: &str,
+        reason: &str,
+    ) -> Response {
+        let body = serde_json::json!({
+            "error": {
+                "type": kind,
+                "run_id": run_id,
+                "budget_usd": budget.as_usd(),
+                "spent_usd": spent.as_usd(),
+                "policy_id": policy_id,
+                "reason": reason,
+                "retryable": false,
+            }
+        });
+        Response::builder()
+            .status(StatusCode::PAYMENT_REQUIRED)
+            .header("content-type", "application/json")
+            .header("x-fuse", "blocked")
+            .header("x-fuse-run-id", run_id)
+            .body(Body::from(body.to_string()))
+            .expect("valid response")
+    }
+
+    /// For each of the five 402 budget-family reasons, assert the new
+    /// facade-backed `breaker_error_response` is byte-identical to the old
+    /// `budget_error` builder: same status, same body bytes, same headers.
+    #[tokio::test]
+    async fn breaker_error_response_matches_budget_error_byte_for_byte() {
+        let cases = [
+            (
+                BreakerReason::Killed,
+                "killed",
+                "run killed by operator",
+                Microusd(5_000_000),
+                Microusd(0),
+            ),
+            (
+                BreakerReason::PolicyViolation,
+                "policy_violation",
+                "max_steps exceeded",
+                Microusd(5_000_000),
+                Microusd(2_500_000),
+            ),
+            (
+                BreakerReason::LoopDetected,
+                "loop_detected",
+                "repeated tool-call signature",
+                Microusd(5_000_000),
+                Microusd(1_250_000),
+            ),
+            (
+                BreakerReason::WasmPolicy,
+                "wasm_policy",
+                "blocked by custom wasm policy",
+                Microusd(2_000_000),
+                Microusd(100_000),
+            ),
+            (
+                BreakerReason::BudgetExceeded,
+                "budget_exceeded",
+                "per-run budget exceeded",
+                Microusd(5_000_000),
+                Microusd(5_250_000),
+            ),
+        ];
+
+        for (reason, kind, detail, budget, spent) in cases {
+            let run_id = "run-golden";
+            let policy_id = "default";
+
+            let old = golden_budget_error(kind, run_id, budget, spent, policy_id, detail);
+            let verdict = budget_verdict(reason, budget, spent, policy_id, detail);
+            let new = breaker_error_response(run_id, &verdict);
+
+            // Status.
+            assert_eq!(new.status(), old.status(), "status mismatch for {kind}");
+            assert_eq!(new.status(), StatusCode::PAYMENT_REQUIRED);
+
+            // Headers (content-type, x-fuse, x-fuse-run-id).
+            for h in ["content-type", "x-fuse", "x-fuse-run-id"] {
+                assert_eq!(
+                    new.headers().get(h),
+                    old.headers().get(h),
+                    "header {h} mismatch for {kind}"
+                );
+            }
+
+            // Body bytes.
+            let old_bytes = to_bytes(old.into_body(), usize::MAX).await.unwrap();
+            let new_bytes = to_bytes(new.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(new_bytes, old_bytes, "body bytes mismatch for {kind}");
+        }
     }
 }

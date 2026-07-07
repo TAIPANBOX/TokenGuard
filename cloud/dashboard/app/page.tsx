@@ -21,6 +21,12 @@ type Alert = {
   fraction: number;
   killed: boolean;
 };
+type Savings = {
+  blocked_spend_microusd: number;
+  cache_saved_microusd: number;
+  budget_breaks: number;
+  total_saved_microusd: number;
+};
 
 const usd = (micro: number) => "$" + (micro / 1e6).toFixed(2);
 
@@ -72,6 +78,7 @@ export default function Page() {
   const [budgets, setBudgets] = useState<Record<string, number>>({});
   const [series, setSeries] = useState<Bucket[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [savings, setSavings] = useState<Savings | null>(null);
   const [status, setStatus] = useState("");
   const [armed, setArmed] = useState<string | null>(null);
 
@@ -105,12 +112,17 @@ export default function Page() {
   const refresh = useCallback(async () => {
     if (!connected || !key) return;
     try {
-      const [runsRes, sumRes, budRes, serRes, alertRes] = await Promise.all([
+      const [runsRes, sumRes, budRes, serRes, alertRes, sav] = await Promise.all([
         api("/v1/runs"),
         api("/v1/summary"),
         api("/v1/budgets"),
         api("/v1/series?window=15m&step=60s"),
         api("/v1/alerts"),
+        // Savings is a paid-plan feature: 402/absent on free plans. Swallow the
+        // error so the rest of the dashboard still refreshes; the tile hides.
+        api("/v1/savings")
+          .then((r) => r.json() as Promise<Savings>)
+          .catch(() => null),
       ]);
       const rs: Run[] = await runsRes.json();
       const bud: Record<string, number> = await budRes.json();
@@ -124,6 +136,7 @@ export default function Page() {
       setSummary(await sumRes.json());
       setSeries(await serRes.json());
       setAlerts(await alertRes.json());
+      setSavings(sav);
       setStatus("live");
     } catch (e) {
       setStatus("error: " + (e as Error).message);
@@ -318,6 +331,21 @@ export default function Page() {
                 <div className="n">{killedRuns}</div>
                 <div className="s">this org</div>
               </div>
+              {savings && (
+                <div className="card tile" style={{ gridColumn: "1 / -1" }}>
+                  <div className="k">Saved this month</div>
+                  <div
+                    className="n"
+                    style={savings.total_saved_microusd ? { color: "var(--mint)" } : undefined}
+                  >
+                    {usd(savings.total_saved_microusd)}
+                  </div>
+                  <div className="s">
+                    blocked {usd(savings.blocked_spend_microusd)} · cache {usd(savings.cache_saved_microusd)}
+                    {savings.budget_breaks > 0 && ` · ${savings.budget_breaks} budget breaks`}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 

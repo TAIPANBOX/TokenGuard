@@ -20,8 +20,10 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 utoipa = { version = "5", features = ["axum_extras"] }
-# Device pairing + Secure-Enclave-signed mutations (ES256 = ECDSA P-256/SHA-256).
-p256 = { version = "0.13", features = ["ecdsa"] }
+# Device pairing + Secure-Enclave-signed mutations, and the signed audit
+# manifest (ES256 = ECDSA P-256/SHA-256). `pkcs8`/`pem` let the audit signing
+# key load from a PKCS#8/SEC1 PEM or DER (see `audit_sign.rs`).
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
@@ -39,7 +41,13 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The signed-audit-manifest tests re-derive the canonical bytes (core) and
+# verify the ES256 signature independently (p256), exactly as an auditor would.
+tokenfuse-core.workspace = true
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
 
 [features]
-# Build the real APNs client; needs `p256` PKCS#8/PEM for the provider JWT key.
-apns = ["dep:reqwest", "p256/pkcs8", "p256/pem"]
+# Build the real APNs client; needs `p256` PKCS#8/PEM for the provider JWT key
+# (already enabled unconditionally above for the audit-manifest signing key).
+apns = ["dep:reqwest"]

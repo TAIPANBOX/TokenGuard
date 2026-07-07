@@ -97,7 +97,18 @@ async fn main() {
     if oidc.is_some() {
         tracing::info!("OIDC bearer auth enabled (offline JWKS)");
     }
-    let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct).with_oidc(oidc);
+
+    // Optional server P-256 key for signing audit manifests (P3 WS2).
+    // Unconfigured ⇒ `None`, and `/v1/audit/manifest` reports not-configured;
+    // the rest of the audit trail is unaffected.
+    let audit_signing_key = tokenfuse_cloud::audit_signing_key_from_env();
+    if audit_signing_key.is_some() {
+        tracing::info!("audit manifest signing enabled (ES256)");
+    }
+
+    let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct)
+        .with_oidc(oidc)
+        .with_audit_signing_key(audit_signing_key);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -5,6 +5,7 @@
 
 #[cfg(feature = "apns")]
 pub mod apns;
+pub mod audit_sign;
 pub mod devices;
 pub mod entitlements;
 pub mod http;
@@ -13,6 +14,7 @@ pub mod oidc;
 pub mod push;
 pub mod store;
 
+pub use audit_sign::{signing_key_from_env as audit_signing_key_from_env, AuditManifest};
 pub use entitlements::{gate, Denied, Feature};
 pub use http::{app, openapi_spec, AppState};
 pub use keys::{parse_keys, Plan, Principal};
