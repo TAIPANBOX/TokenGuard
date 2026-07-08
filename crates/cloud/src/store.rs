@@ -171,14 +171,30 @@ pub struct SavingsSummary {
 /// The live FinOps savings accumulator for one org, folded incrementally in
 /// [`Store::ingest`] (the control plane is a live rollup, not a Parquet reader).
 /// Persisted in the snapshot so totals survive a restart.
+///
+/// `breaks` is a BOUNDED dedup structure (capped at [`MAX_BREAK_KEYS`], LRU
+/// evicted — see `ingest_at`), not an unbounded ledger of every run_id ever
+/// blocked: `/v1/ingest` is intentionally ungated, so one ingest record per
+/// unique `run_id` with a budget-protection decision would otherwise grow this
+/// set forever. `budget_breaks` is the durable, MONOTONIC count of distinct
+/// breaks observed — it survives `breaks` eviction (a run whose dedup key was
+/// evicted and later re-breaks increments this again: a small, bounded
+/// over-count, never unbounded memory or an undercount).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct SavingsAcc {
     blocked_spend_microusd: i64,
     cache_saved_microusd: i64,
-    /// Distinct run ids that hit ≥1 budget-protection block — the set makes
-    /// `budget_breaks` distinct-by-run even across restarts (it's persisted).
+    /// Distinct run ids that hit ≥1 budget-protection block AND are still
+    /// within [`MAX_BREAK_KEYS`] — bounded, LRU-evicted dedup memory for
+    /// `budget_breaks`, not a durable historical record (that's the counter).
     #[serde(default)]
     breaks: HashSet<String>,
+    /// Monotonic count of distinct budget-protection breaks ever observed
+    /// (see the struct doc). `#[serde(default)]` so pre-fix snapshots (which
+    /// only carried `breaks`) load to `0` and are backfilled from
+    /// `breaks.len()` in `Store::load` — never silently losing history.
+    #[serde(default)]
+    budget_breaks: u64,
 }
 
 /// Per-org running totals, folded on EVERY ingested record — independent of
@@ -313,6 +329,29 @@ const MAX_RUNS_PER_ORG: usize = 50_000;
 /// tripped, lives in a separate map and is never evicted by this.
 const MAX_TRACKER_KEYS: usize = 20_000;
 
+/// Hard cap on the number of distinct incidents retained per org in
+/// [`Inner::incidents`]. Unlike `orgs`/`incident_tracker`/`fanout_tracker`,
+/// this map was NOT bounded by the earlier LRU pass: `/v1/ingest` is ungated,
+/// and each unique `run_id` that trips a detector (e.g. `budget_blocks`
+/// budget-protection blocks — 3 by default) becomes one permanent, persisted
+/// `Incident` keyed by that run_id, so an attacker could open unlimited
+/// incidents, growing the autosaved snapshot and slowing `/v1/incidents`
+/// (unpaginated) and `/v1/compliance` (folds every incident). On overflow the
+/// incident with the OLDEST `last_seen_millis` is evicted — see `upsert_incident`.
+const MAX_INCIDENTS_PER_ORG: usize = 10_000;
+
+/// Hard cap on the number of distinct run_ids retained in each org's
+/// [`SavingsAcc::breaks`] dedup set (see that field's doc). Reuses the same
+/// ungated-`/v1/ingest` cardinality concern as [`MAX_RUNS_PER_ORG`].
+const MAX_BREAK_KEYS: usize = 10_000;
+
+/// Default alert-fraction threshold (mirrors `TOKENFUSE_CLOUD_ALERT_PCT`'s
+/// documented default in `main.rs`), used by [`Store::with_incident_config`]
+/// when no explicit value is given. `Store` needs its OWN copy of this
+/// threshold (not just the HTTP layer's) so `MAX_RUNS_PER_ORG` eviction can
+/// tell an "alerting" run apart from an idle one — see C5 in `ingest_at`.
+const DEFAULT_ALERT_PCT: f64 = 0.8;
+
 /// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
 /// to the right subscriber and is not sent in the payload.
 #[derive(Debug, Clone, Serialize)]
@@ -416,6 +455,37 @@ impl<K: Ord + Clone + std::hash::Hash + Eq> RecencyIndex<K> {
         self.seq_of.remove(&key);
         Some(key)
     }
+
+    /// Like [`RecencyIndex::evict_oldest`], but skips over least-recently
+    /// touched keys for which `protected` returns `true` (scanned in ascending
+    /// recency order — oldest first) and evicts the first NON-protected one
+    /// instead. Used by C5 (see `ingest_at`'s `MAX_RUNS_PER_ORG` eviction) so a
+    /// flood of fresh run_ids can't evict a run that's currently over its
+    /// alert threshold, silently dropping it from `/v1/alerts`.
+    ///
+    /// Falls back to the plain-oldest key if EVERY retained key is protected
+    /// (pathological — e.g. every retained run is alerting) so the cap is
+    /// still enforced and memory never grows unbounded. `O(k)` in the number
+    /// of protected keys scanned before a non-protected one is found (or the
+    /// full map, in the fallback case).
+    fn evict_oldest_unprotected(&mut self, mut protected: impl FnMut(&K) -> bool) -> Option<K> {
+        let mut fallback_seq: Option<u64> = None;
+        for (&seq, key) in self.by_seq.iter() {
+            if fallback_seq.is_none() {
+                fallback_seq = Some(seq);
+            }
+            if !protected(key) {
+                let key = key.clone();
+                self.by_seq.remove(&seq);
+                self.seq_of.remove(&key);
+                return Some(key);
+            }
+        }
+        let seq = fallback_seq?;
+        let key = self.by_seq.remove(&seq)?;
+        self.seq_of.remove(&key);
+        Some(key)
+    }
 }
 
 #[derive(Default)]
@@ -463,6 +533,15 @@ struct Inner {
     /// Recency index over `fanout_tracker`'s keys, bounding it to
     /// [`MAX_TRACKER_KEYS`]. Ephemeral, like the tracker itself.
     fanout_recency: RecencyIndex<(String, String)>,
+    /// org → LRU recency index over that org's `savings.breaks` set, bounding
+    /// it to [`MAX_BREAK_KEYS`] (see [`SavingsAcc::breaks`]). Ephemeral and NOT
+    /// seeded on load (the persisted `breaks` set carries no per-entry
+    /// timestamp to seed from — unlike `run_recency`'s `RunAgg::last_seen`), so
+    /// a store can briefly hold up to its pre-restart `breaks.len()` before the
+    /// index is populated by fresh touches; the ingest-time eviction still
+    /// falls back to an arbitrary member if the index has nothing to offer, so
+    /// the cap is never structurally violated.
+    break_recency: HashMap<String, RecencyIndex<String>>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -534,6 +613,12 @@ pub struct Store {
     events: broadcast::Sender<StreamEvent>,
     /// Incident-detector thresholds (env-configured at the composition root).
     incident_cfg: IncidentConfig,
+    /// The alert-fraction threshold (0..1) a run's `spent/budget` must reach to
+    /// be considered "alerting". Should be kept in sync with whatever the HTTP
+    /// layer passes as its own default `alert_pct` (see `main.rs`) — used here
+    /// so `MAX_RUNS_PER_ORG` eviction never evicts a run that `/v1/alerts`
+    /// would currently report (C5).
+    alert_pct: f64,
 }
 
 impl Default for Store {
@@ -547,14 +632,27 @@ impl Store {
         Self::with_incident_config(IncidentConfig::default())
     }
 
-    /// Build with explicit incident thresholds (used by `main` after reading the
-    /// environment, and by unit tests that pin a threshold).
+    /// Build with explicit incident thresholds and the default alert-fraction
+    /// threshold (used by `main` after reading the environment, and by unit
+    /// tests that pin a threshold). Use [`Store::with_config`] to also pin the
+    /// alert-fraction threshold explicitly.
     pub fn with_incident_config(incident_cfg: IncidentConfig) -> Self {
+        Self::with_config(incident_cfg, DEFAULT_ALERT_PCT)
+    }
+
+    /// Build with explicit incident thresholds AND the alert-fraction
+    /// threshold used both by `/v1/alerts` and, internally, by
+    /// `MAX_RUNS_PER_ORG` eviction's "don't evict an alerting run" policy
+    /// (C5). The composition root should pass the SAME value it passes to
+    /// `AppState`/`PushPipeline` so eviction and `/v1/alerts` agree on what
+    /// "alerting" means.
+    pub fn with_config(incident_cfg: IncidentConfig, alert_pct: f64) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: RwLock::new(Inner::default()),
             events,
             incident_cfg,
+            alert_pct,
         }
     }
 
@@ -597,15 +695,45 @@ impl Store {
                 let dc = inner.decision_counts.entry(org.to_string()).or_default();
                 let totals = inner.org_totals.entry(org.to_string()).or_default();
                 let recency = inner.run_recency.entry(org.to_string()).or_default();
+                let break_recency = inner.break_recency.entry(org.to_string()).or_default();
+                let budgets = inner.budgets.get(org);
+                let alert_pct = self.alert_pct;
                 for r in records {
+                    // C4: `cost_microusd`/`saved_microusd` are attacker-
+                    // controlled (ingest is ungated). A negative value is
+                    // nonsensical and an attack vector (it could be used to
+                    // deflate a total) — clamp to >= 0 once, here, before any
+                    // accumulator sees it.
+                    let cost = r.cost_microusd.max(0);
+                    let saved = r.saved_microusd.max(0);
+
                     // Bound `runs`' cardinality (see `MAX_RUNS_PER_ORG`):
-                    // evict the least-recently-touched run before inserting a
-                    // genuinely NEW run_id that would exceed the cap. This
-                    // only drops that run's own `RunAgg` — `totals` below
-                    // already captured its contribution and is never
-                    // affected by eviction (see `Store::summary`).
+                    // evict a run before inserting a genuinely NEW run_id that
+                    // would exceed the cap. This only drops that run's own
+                    // `RunAgg` — `totals` below already captured its
+                    // contribution and is never affected by eviction (see
+                    // `Store::summary`).
+                    //
+                    // C5: the eviction VICTIM must not be a run that's
+                    // currently alerting (a budget is set and spend has
+                    // reached `alert_pct` of it) — otherwise a flood of fresh
+                    // run_ids could evict a genuinely over-budget/idle run and
+                    // silently drop it from `/v1/alerts`. Skip alerting runs
+                    // in recency order and evict the oldest NON-alerting one
+                    // instead; if literally every retained run is alerting,
+                    // fall back to the oldest so memory still stays bounded.
                     if !runs.contains_key(&r.run_id) && runs.len() >= MAX_RUNS_PER_ORG {
-                        if let Some(evict_id) = recency.evict_oldest() {
+                        let is_alerting = |run_id: &String| -> bool {
+                            let Some(&budget) = budgets.and_then(|b| b.get(run_id)) else {
+                                return false;
+                            };
+                            if budget <= 0 {
+                                return false;
+                            }
+                            let spent = runs.get(run_id).map(|a| a.spent_microusd).unwrap_or(0);
+                            (spent as f64 / budget as f64) >= alert_pct
+                        };
+                        if let Some(evict_id) = recency.evict_oldest_unprotected(is_alerting) {
                             runs.remove(&evict_id);
                         } else if let Some(any_id) = runs.keys().next().cloned() {
                             // Defensive fallback: `recency` and `runs` are
@@ -633,10 +761,12 @@ impl Store {
                     // cost_microusd (avoided spend, or 0 for security blocks)
                     // must not inflate the org's real spend total. `totals`
                     // mirrors the same gate so it stays exact regardless of
-                    // `runs` eviction.
+                    // `runs` eviction. C4: saturating, so an attacker-supplied
+                    // extreme cost can't wrap a release-build i64 into
+                    // garbage/negative.
                     if !is_blocked(&r.decision) {
-                        agg.spent_microusd += r.cost_microusd;
-                        totals.spent_microusd += r.cost_microusd;
+                        agg.spent_microusd = agg.spent_microusd.saturating_add(cost);
+                        totals.spent_microusd = totals.spent_microusd.saturating_add(cost);
                     }
                     agg.calls += 1;
                     totals.calls += 1;
@@ -658,13 +788,44 @@ impl Store {
                     // FinOps savings, folded in the same pass. Only the
                     // budget-protection subset counts as blocked (avoided)
                     // spend — dlp/taint blocks are security value, not dollars
-                    // (and carry cost 0 anyway). Cache savings sum
-                    // unconditionally: `saved_microusd` is 0 off cache hits.
+                    // (and carry cost 0 anyway).
                     if tokenfuse_core::savings::is_budget_protection(&r.decision) {
-                        sav.blocked_spend_microusd += r.cost_microusd;
-                        sav.breaks.insert(r.run_id.clone());
+                        sav.blocked_spend_microusd =
+                            sav.blocked_spend_microusd.saturating_add(cost);
+                        // C2: `breaks` is bounded dedup memory, not a durable
+                        // ledger — cap it at MAX_BREAK_KEYS (LRU-evicted) and
+                        // let the MONOTONIC `budget_breaks` counter (which
+                        // never shrinks) carry the durable "distinct breaks"
+                        // history. Only a genuinely NEW (not-yet-deduped) run
+                        // increments the counter and touches eviction.
+                        if !sav.breaks.contains(&r.run_id) {
+                            if sav.breaks.len() >= MAX_BREAK_KEYS {
+                                if let Some(evict_id) = break_recency.evict_oldest() {
+                                    sav.breaks.remove(&evict_id);
+                                } else if let Some(any_id) = sav.breaks.iter().next().cloned() {
+                                    // Defensive fallback (mirrors the `runs`
+                                    // eviction fallback above): `break_recency`
+                                    // isn't seeded from a persisted snapshot
+                                    // (no per-entry timestamp to seed from), so
+                                    // it can start cold while `breaks` is
+                                    // already at cap right after a restart.
+                                    sav.breaks.remove(&any_id);
+                                }
+                            }
+                            sav.breaks.insert(r.run_id.clone());
+                            sav.budget_breaks = sav.budget_breaks.saturating_add(1);
+                        }
+                        break_recency.touch(r.run_id.clone());
                     }
-                    sav.cache_saved_microusd += r.saved_microusd;
+                    // C3: cache savings are a customer-facing headline
+                    // (`/v1/savings.total_saved_microusd`) — only a REAL
+                    // `cache_hit` may contribute (mirrors `agg.cache_hits`'
+                    // own gate above). Without this, any principal could POST
+                    // `{"decision":"anything","saved_microusd":huge}` and
+                    // inflate "Saved this month" for free.
+                    if r.decision == "cache_hit" {
+                        sav.cache_saved_microusd = sav.cache_saved_microusd.saturating_add(saved);
+                    }
                 }
             }
             {
@@ -673,7 +834,10 @@ impl Store {
                     log.push_back(Sample {
                         ts_millis: r.ts_millis,
                         run_id: r.run_id.clone(),
-                        cost_microusd: r.cost_microusd,
+                        // C4: same clamp as above — negative sample cost could
+                        // otherwise be used to deflate `spend_spike` burn-rate
+                        // detection.
+                        cost_microusd: r.cost_microusd.max(0),
                         blocked: is_blocked(&r.decision),
                     });
                 }
@@ -859,7 +1023,10 @@ impl Store {
                 }
                 let idx = (((s.ts_millis - start) / step) as usize).min(n - 1);
                 let b = &mut buckets[idx];
-                b.cost_microusd += s.cost_microusd;
+                // C4: samples already carry a clamped-non-negative cost (see
+                // `ingest_at`), but a bucket summing many extreme values could
+                // still overflow a plain `+=` in a release build.
+                b.cost_microusd = b.cost_microusd.saturating_add(s.cost_microusd);
                 b.calls += 1;
                 if s.blocked {
                     b.blocked += 1;
@@ -921,7 +1088,11 @@ impl Store {
                         agent_id: agg.agent_id.clone(),
                         ..Default::default()
                     });
-                a.spent_microusd += agg.spent_microusd;
+                // C4 defense-in-depth: `agg.spent_microusd` is already
+                // saturated per-run, but folding several near-`i64::MAX` runs
+                // together could still overflow a plain `+=` in a release
+                // build.
+                a.spent_microusd = a.spent_microusd.saturating_add(agg.spent_microusd);
                 a.calls += agg.calls;
                 a.runs += 1;
                 if agg.last_seen > a.last_seen {
@@ -941,12 +1112,15 @@ impl Store {
         let acc = inner.savings.get(org);
         let blocked = acc.map(|a| a.blocked_spend_microusd).unwrap_or(0);
         let cache = acc.map(|a| a.cache_saved_microusd).unwrap_or(0);
-        let breaks = acc.map(|a| a.breaks.len() as u64).unwrap_or(0);
+        // C2: read the MONOTONIC counter, not `breaks.len()` — `breaks` is now
+        // bounded/LRU-evicted dedup memory (see `SavingsAcc::breaks`), so its
+        // length would undercount once eviction has happened.
+        let breaks = acc.map(|a| a.budget_breaks).unwrap_or(0);
         SavingsSummary {
             blocked_spend_microusd: blocked,
             cache_saved_microusd: cache,
             budget_breaks: breaks,
-            total_saved_microusd: blocked + cache,
+            total_saved_microusd: blocked.saturating_add(cache),
         }
     }
 
@@ -1278,6 +1452,21 @@ impl Store {
         inner.incidents = snap.incidents;
         inner.audit = snap.audit;
 
+        // C2: `budget_breaks` is the durable, monotonic counter (see
+        // `SavingsAcc`'s doc); older snapshots only carried the `breaks`
+        // dedup set and deserialize `budget_breaks` to its `#[serde(default)]`
+        // of `0`. Backfill from `breaks.len()` when it's the larger of the
+        // two — a pre-fix snapshot's `breaks` was never evicted, so this
+        // recovers the exact historical count; a post-fix snapshot's counter
+        // is already >= its (possibly-evicted-down) `breaks.len()`, so this
+        // is a no-op for those.
+        for acc in inner.savings.values_mut() {
+            let observed = acc.breaks.len() as u64;
+            if observed > acc.budget_breaks {
+                acc.budget_breaks = observed;
+            }
+        }
+
         // Pre-existing snapshots (from before MAX_RUNS_PER_ORG eviction
         // landed) have no `org_totals` entry for an org; since their `orgs`
         // map was never evicted, summing it recovers EXACT historical totals
@@ -1290,12 +1479,28 @@ impl Store {
                 let mut t = OrgTotals::default();
                 for agg in runs.values() {
                     t.calls += agg.calls;
-                    t.spent_microusd += agg.spent_microusd;
+                    // C4 defense-in-depth: see the `agents()` note above.
+                    t.spent_microusd = t.spent_microusd.saturating_add(agg.spent_microusd);
                 }
                 t
             });
         }
         inner.org_totals = org_totals;
+
+        // C7: don't blindly trust a possibly-corrupt/tampered snapshot — after
+        // installing it, verify every org's audit chain end-to-end and warn
+        // (with the org and the first broken index) if one fails. The
+        // snapshot file is local-only and 0600 (see `write_file_private`), so
+        // this only SURFACES a problem; it never refuses to load.
+        for (org, chain) in &inner.audit {
+            if let Err(break_index) = audit::verify_chain(chain) {
+                tracing::warn!(
+                    org = %org,
+                    break_index,
+                    "audit chain failed verification on load (possibly corrupt or tampered snapshot)"
+                );
+            }
+        }
 
         // Seed the run-recency index (ephemeral, not persisted) from the
         // loaded runs, ordered by each RunAgg's own `last_seen`, so an
@@ -1633,6 +1838,28 @@ fn upsert_incident(
 ) -> Incident {
     let id = incident_id(kind, scope);
     let per_org = incidents.entry(org.to_string()).or_default();
+    // C1: bound `per_org`'s cardinality — `/v1/ingest` is ungated, so nothing
+    // but this cap stops an attacker from opening unlimited distinct
+    // `(kind, run_or_agent)` incidents (3 budget-protection blocks on 3
+    // unique run_ids = 3 permanent, persisted incidents), which also grows
+    // the autosaved snapshot and slows the unpaginated `/v1/incidents` and
+    // the fold-every-incident `/v1/compliance`. Evict the OLDEST incident (by
+    // `last_seen_millis`) before inserting a genuinely NEW one that would
+    // exceed the cap — an existing incident's repeat trip below never goes
+    // through this branch, so it's never itself evicted by its own trigger. A
+    // simple linear scan (bounded by `MAX_INCIDENTS_PER_ORG`, not the
+    // `RecencyIndex` machinery the run/tracker caps use) is enough here: this
+    // only runs when the map is already AT the cap and a genuinely new id
+    // arrives, not on every call.
+    if !per_org.contains_key(&id) && per_org.len() >= MAX_INCIDENTS_PER_ORG {
+        if let Some(evict_id) = per_org
+            .iter()
+            .min_by_key(|(_, inc)| inc.last_seen_millis)
+            .map(|(k, _)| k.clone())
+        {
+            per_org.remove(&evict_id);
+        }
+    }
     let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {
         id: id.clone(),
         org: org.to_string(),
@@ -1662,10 +1889,12 @@ fn upsert_incident(
 /// Sum sample cost over `[start, now]` for the org's burn series (the same
 /// accumulation `series()` does within one bucket) — the `spend_spike` rate.
 fn burn_since(log: &VecDeque<Sample>, start: i64, now: i64) -> i64 {
+    // C4: saturating fold, not `.sum()` — a plain sum can overflow a release
+    // build's `i64` given enough extreme (already-clamped-non-negative, but
+    // individually huge) sample costs in the window.
     log.iter()
         .filter(|s| s.ts_millis >= start && s.ts_millis <= now)
-        .map(|s| s.cost_microusd)
-        .sum()
+        .fold(0i64, |acc, s| acc.saturating_add(s.cost_microusd))
 }
 
 /// Write `data` to `path` with owner-only permissions on unix (the snapshot can
@@ -1979,6 +2208,105 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&old);
+    }
+
+    /// C3: `cache_saved_microusd` — the source of `/v1/savings`'s
+    /// customer-facing "Saved this month" headline — must only be credited by
+    /// a REAL `cache_hit` record. `/v1/ingest` is ungated (any org principal,
+    /// including a read-only viewer key, may POST a batch), so without this
+    /// gate a viewer could POST `{"decision":"anything","saved_microusd":N}`
+    /// (or even `"allow"`, a real but unrelated outcome) and inflate the
+    /// figure for free.
+    #[test]
+    fn cache_savings_only_count_on_a_real_cache_hit() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                // Fabricated/irrelevant decisions carrying a huge claimed
+                // saving must contribute ZERO.
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "pwned".into(),
+                    saved_microusd: 999_999_999_999,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "allow".into(),
+                    saved_microusd: 999_999_999_999,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r3".into(),
+                    decision: "budget_exceeded".into(),
+                    saved_microusd: 999_999_999_999,
+                    ..Default::default()
+                },
+                // A real cache hit still counts, for the exact amount.
+                CallRecord {
+                    run_id: "r4".into(),
+                    decision: "cache_hit".into(),
+                    saved_microusd: 30_000,
+                    ..Default::default()
+                },
+            ],
+        );
+        let sav = s.savings("acme");
+        assert_eq!(
+            sav.cache_saved_microusd, 30_000,
+            "only the real cache_hit's saved_microusd may count"
+        );
+        assert_eq!(sav.total_saved_microusd, 30_000);
+    }
+
+    /// C4: attacker-controlled `cost_microusd`/`saved_microusd` accumulators
+    /// must saturate rather than silently wrap in a release build (no global
+    /// `overflow-checks` is enabled — see `Cargo.toml`), and a negative cost
+    /// (nonsensical, and a way to deflate a total) must be clamped to zero at
+    /// the ingest boundary rather than subtracted.
+    #[test]
+    fn ingest_saturates_on_overflow_and_clamps_negative_cost() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "allow".into(),
+                    cost_microusd: i64::MAX,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "allow".into(),
+                    cost_microusd: i64::MAX,
+                    ..Default::default()
+                },
+            ],
+        );
+        // Org totals AND the per-run aggregate saturate at i64::MAX — never
+        // wrap into a negative or garbage value.
+        let sum = s.summary("acme");
+        assert_eq!(sum.spent_microusd, i64::MAX);
+        let runs = s.runs("acme");
+        let r1 = runs.iter().find(|r| r.run_id == "r1").expect("r1");
+        assert_eq!(r1.spent_microusd, i64::MAX);
+
+        // A negative cost contributes exactly 0, not a negative adjustment.
+        let s2 = Store::new();
+        s2.ingest(
+            "acme",
+            &[CallRecord {
+                run_id: "r2".into(),
+                decision: "allow".into(),
+                cost_microusd: -999_999,
+                ..Default::default()
+            }],
+        );
+        assert_eq!(s2.summary("acme").spent_microusd, 0);
+        let runs2 = s2.runs("acme");
+        assert_eq!(runs2[0].spent_microusd, 0);
     }
 
     #[test]
@@ -2958,6 +3286,155 @@ mod tests {
         );
     }
 
+    /// C1: unlike `orgs`/`incident_tracker`/`fanout_tracker`, `Inner::incidents`
+    /// had no cap — `/v1/ingest` is ungated, so 3 budget-protection blocks
+    /// (the default `budget_blocks` threshold) on each of many unique
+    /// `run_id`s opens one permanent, persisted `Incident` per run,
+    /// unboundedly. Opening far more than `MAX_INCIDENTS_PER_ORG` distinct
+    /// incidents must keep the map capped AND retain the most-recently-seen
+    /// ones (oldest-by-`last_seen_millis` evicted first).
+    #[test]
+    fn incidents_are_capped_and_retain_the_most_recent() {
+        let s = Store::new(); // default budget_blocks = 3
+        let extra = 25;
+        let total = MAX_INCIDENTS_PER_ORG + extra;
+
+        // Trip a distinct `budget_exhausted:run-{i}` incident for each of
+        // `total` unique runs (3 budget-protection blocks each), each at an
+        // increasing timestamp so `last_seen_millis` orders them the same as
+        // `i` — the oldest incidents (small `i`) should be evicted first.
+        for i in 0..total {
+            let ts = i as i64 + 1;
+            let records: Vec<CallRecord> = (0..3)
+                .map(|_| CallRecord {
+                    run_id: format!("run-{i}"),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 1,
+                    ts_millis: ts,
+                    ..Default::default()
+                })
+                .collect();
+            s.ingest_at("acme", &records, ts);
+        }
+
+        let incidents = s.incidents("acme");
+        assert!(
+            incidents.len() <= MAX_INCIDENTS_PER_ORG,
+            "incidents map must stay capped, got {}",
+            incidents.len()
+        );
+
+        let ids: HashSet<String> = incidents.iter().map(|i| i.id.clone()).collect();
+        // The most-recently-tripped incidents (large i, the tail) survive.
+        for i in extra..total {
+            let id = format!("budget_exhausted:run-{i}");
+            assert!(ids.contains(&id), "{id} should still be retained");
+        }
+        // The earliest-tripped incidents (small i, the head) were evicted.
+        for i in 0..extra {
+            let id = format!("budget_exhausted:run-{i}");
+            assert!(!ids.contains(&id), "{id} should have been evicted");
+        }
+    }
+
+    /// C2: `SavingsAcc::breaks` is a bounded dedup structure, not an unbounded
+    /// ledger — one ingest record per unique `run_id` with a budget-protection
+    /// decision must not grow it forever. The durable `budget_breaks` MONOTONIC
+    /// counter, however, keeps counting every distinct break exactly (no
+    /// eviction here, since each run_id below is unique and blocked only once,
+    /// so nothing gets re-counted).
+    #[test]
+    fn savings_breaks_dedup_set_is_capped_but_counter_keeps_counting() {
+        let s = Store::new();
+        let extra = 25;
+        let total = MAX_BREAK_KEYS + extra;
+        let records: Vec<CallRecord> = (0..total)
+            .map(|i| CallRecord {
+                run_id: format!("run-{i}"),
+                decision: "budget_exceeded".into(),
+                cost_microusd: 1,
+                ..Default::default()
+            })
+            .collect();
+        s.ingest("acme", &records);
+
+        {
+            let inner = s.inner.read().unwrap();
+            let breaks_len = inner
+                .savings
+                .get("acme")
+                .map(|a| a.breaks.len())
+                .unwrap_or(0);
+            assert!(
+                breaks_len <= MAX_BREAK_KEYS,
+                "breaks dedup set must stay capped, got {breaks_len}"
+            );
+        }
+
+        // Every one of the `total` records was a genuinely new, distinct
+        // run_id blocked exactly once — the monotonic counter must reflect
+        // ALL of them regardless of dedup-set eviction.
+        let sav = s.savings("acme");
+        assert_eq!(sav.budget_breaks, total as u64);
+    }
+
+    /// C5: `MAX_RUNS_PER_ORG` eviction must never pick a run that's currently
+    /// "alerting" (a central budget is set and spend has reached the store's
+    /// alert-fraction threshold) as its victim — otherwise flooding an org
+    /// with cheap fresh run_ids could evict a genuinely over-budget run and
+    /// silently drop it from `/v1/alerts`.
+    #[test]
+    fn eviction_never_drops_an_alerting_run() {
+        let s = Store::new(); // default alert_pct = 0.8
+
+        // "hot" is touched exactly once, right at the start — the
+        // least-recently-touched run for the entire flood that follows — and
+        // is over its alert threshold (900/1000 = 0.9 >= 0.8).
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "hot".into(),
+                decision: "allow".into(),
+                cost_microusd: 900,
+                ts_millis: 0,
+                ..Default::default()
+            }],
+            0,
+        );
+        s.set_budget("acme", "hot", 1000);
+
+        // Flood with exactly MAX_RUNS_PER_ORG fresh, cheap, UNBUDGETED runs —
+        // enough to force eviction down to the cap, so something must go.
+        let records: Vec<CallRecord> = (0..MAX_RUNS_PER_ORG)
+            .map(|i| CallRecord {
+                run_id: format!("flood-{i}"),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                ts_millis: i as i64 + 1,
+                ..Default::default()
+            })
+            .collect();
+        s.ingest_at("acme", &records, MAX_RUNS_PER_ORG as i64);
+
+        let runs = s.runs("acme");
+        assert!(
+            runs.len() <= MAX_RUNS_PER_ORG,
+            "run map must stay capped, got {}",
+            runs.len()
+        );
+        assert!(
+            runs.iter().any(|r| r.run_id == "hot"),
+            "the alerting run must survive eviction even though it's the LRU victim"
+        );
+
+        // ...and it must still show up in `/v1/alerts` — the whole point.
+        let alerts = s.alerts("acme", 0.8);
+        assert!(
+            alerts.iter().any(|a| a.run_id == "hot"),
+            "the alerting run must still be reported by alerts()"
+        );
+    }
+
     /// The `OrgTotals` accumulator round-trips through save/load exactly, and
     /// a snapshot from before this field existed (whose `orgs` map was, by
     /// definition, never evicted) backfills sane — exact, not zero — totals
@@ -3011,5 +3488,44 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&old);
+    }
+
+    /// C7: `Store::load()` must not blindly trust a possibly-corrupt/tampered
+    /// snapshot. It still LOADS (the file is local-only, 0600 — refusing to
+    /// start over this would be worse), but a chain broken by the tamper must
+    /// be detectable afterward via `audit_verify` (the same check `load` now
+    /// runs internally and logs a `tracing::warn!` for, per org and break
+    /// index — verified here indirectly since asserting on a `tracing::warn!`
+    /// needs a subscriber this crate doesn't wire up for tests).
+    #[test]
+    fn load_detects_a_tampered_audit_chain() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-tamperaudit.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.audit_append("acme", "key:abc", "control.kill", "run-1", "mode=hard");
+        s.audit_append("acme", "key:abc", "control.kill", "run-2", "mode=hard");
+        // A clean save's chain verifies fine before any tampering.
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+        s.save(&path).expect("save");
+
+        // Tamper the PERSISTED snapshot on disk: flip the first entry's
+        // `detail` without recomputing its `entry_hash` — exactly what an
+        // out-of-band edit of the (locally-writable) snapshot file would do.
+        let raw = std::fs::read_to_string(&path).expect("read snapshot");
+        let tampered = raw.replacen("mode=hard", "mode=SOFT", 1);
+        assert_ne!(raw, tampered, "sanity: the replacement must have applied");
+        std::fs::write(&path, tampered).expect("write tampered snapshot");
+
+        let s2 = Store::new();
+        s2.load(&path)
+            .expect("load must still succeed — warn, don't refuse");
+        assert!(
+            s2.audit_verify("acme").is_err(),
+            "a tampered chain must be detectable after load, not silently trusted"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

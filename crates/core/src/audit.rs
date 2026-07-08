@@ -52,6 +52,31 @@ pub struct AuditEntry {
     pub entry_hash: String,
 }
 
+/// Replace every ASCII control byte (`< 0x20`, which includes [`SEP`] itself)
+/// in `s` with U+FFFD (the Unicode replacement character), so no field's
+/// CONTENT can smuggle the chain's own field separator (or any other control
+/// byte) into the hash pre-image. Without this, an attacker-influenced field
+/// (a percent-decoded `{run}`/`{id}` path param, or `PairRequest.platform`/
+/// `name`) that itself contains a raw `\x1f` can make two different
+/// `(actor, action, subject, detail)` tuples canonicalize to the IDENTICAL
+/// joined pre-image — e.g. `subject="run\x1fX", detail="Y"` and
+/// `subject="run", detail="X\x1fY"` both join to `"run\x1fX\x1fY"` — breaking
+/// the "no re-partition" tamper-evidence claim for anyone who edits a
+/// persisted snapshot later. Sanitize-and-record rather than reject: an audit
+/// entry is never silently dropped just because a field happened to carry a
+/// control byte. Called from [`append`] BEFORE hashing/storing, so the stored
+/// field and the hashed field always match.
+fn sanitize_field(s: &str) -> String {
+    if s.bytes().any(|b| b < 0x20) {
+        s.chars()
+            .map(|c| if (c as u32) < 0x20 { '\u{FFFD}' } else { c })
+            .collect()
+    } else {
+        // Fast path: no control bytes, no allocation-per-char rebuild needed.
+        s.to_string()
+    }
+}
+
 /// Lowercase-hex encode bytes (no external `hex` dep in core).
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -94,10 +119,11 @@ pub fn append(
 ) -> AuditEntry {
     let seq = prev.map(|p| p.seq + 1).unwrap_or(0);
     let prev_hash = prev.map(|p| p.entry_hash.clone()).unwrap_or_default();
-    let actor = actor.into();
-    let action = action.into();
-    let subject = subject.into();
-    let detail = detail.into();
+    // C6: sanitize BEFORE hashing/storing — see `sanitize_field`'s doc.
+    let actor = sanitize_field(&actor.into());
+    let action = sanitize_field(&action.into());
+    let subject = sanitize_field(&subject.into());
+    let detail = sanitize_field(&detail.into());
     let entry_hash = compute_hash(
         seq, ts_millis, &actor, &action, &subject, &detail, &prev_hash,
     );
@@ -270,6 +296,33 @@ mod tests {
             base,
             manifest_signing_bytes("acme", 3, "abc123", 4, 1_700_000_000_001)
         );
+    }
+
+    #[test]
+    fn sep_injection_across_fields_no_longer_collides() {
+        // Before sanitization, `subject="run\x1fX", detail="Y"` and
+        // `subject="run", detail="X\x1fY"` both canonicalize to the SAME
+        // SEP-joined pre-image (`"...run\x1fX\x1fY..."`) and so produced the
+        // SAME `entry_hash` — a delimiter-injection attack against the "no
+        // re-partition" tamper-evidence claim. After sanitizing control bytes
+        // out of every field before hashing, the two must diverge.
+        let e1 = append(None, 1_000, "actor", "control.kill", "run\u{1f}X", "Y");
+        let e2 = append(None, 1_000, "actor", "control.kill", "run", "X\u{1f}Y");
+        assert_ne!(
+            e1.entry_hash, e2.entry_hash,
+            "SEP-injected fields must no longer collide"
+        );
+        // The persisted field values themselves never carry the raw
+        // separator either — a later editor re-hashing from the stored JSON
+        // can't reintroduce the same ambiguity.
+        assert!(!e1.subject.contains('\u{1f}'));
+        assert!(!e2.detail.contains('\u{1f}'));
+        assert_eq!(e1.subject, "run\u{fffd}X");
+        assert_eq!(e2.detail, "X\u{fffd}Y");
+        // The chain still verifies normally — sanitization doesn't break
+        // ordinary (control-byte-free) entries or the chain itself.
+        assert_eq!(verify_chain(&[e1]), Ok(()));
+        assert_eq!(verify_chain(&[e2]), Ok(()));
     }
 
     #[test]

@@ -61,7 +61,10 @@ async fn main() {
         fanout_window_ms: defaults.fanout_window_ms,
     };
 
-    let store = Arc::new(Store::with_incident_config(incident_cfg));
+    // `alert_pct` is passed to the store too (not just `AppState`/
+    // `PushPipeline`): C5's `MAX_RUNS_PER_ORG` eviction policy needs the SAME
+    // threshold `/v1/alerts` uses to decide which runs it must not evict.
+    let store = Arc::new(Store::with_config(incident_cfg, alert_pct));
 
     // Durable persistence: load a snapshot on startup and autosave every 2s.
     if let Ok(path) = std::env::var("TOKENFUSE_CLOUD_DATA") {
