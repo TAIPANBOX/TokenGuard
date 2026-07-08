@@ -48,8 +48,16 @@ pub struct ScanOptions {
     /// ([`run_live`]); ignored by [`run`] (file mode has no server to probe).
     pub skip_exposure: bool,
     /// `--attempt-call`: opt into the one invasive exposure check (an
-    /// unauthenticated `tools/call`). Live-only; ignored by [`run`].
+    /// unauthenticated `tools/call`). Requires `call_tool` to actually
+    /// invoke anything — the operator must name the tool explicitly via
+    /// `--call-tool <name>`; the scanner never auto-picks a "safe-looking"
+    /// tool from the server's own (attacker-controlled) name/description.
+    /// Live-only; ignored by [`run`].
     pub attempt_call: bool,
+    /// `--call-tool <name>`: the exact tool name `attempt_call` invokes. If
+    /// `attempt_call` is set and this is `None`, the call probe is skipped
+    /// with an explicit reason instead of guessing a target.
+    pub call_tool: Option<String>,
 }
 
 /// Scan `tools_path` (a saved `tools/list` JSON). Optionally diff against
@@ -94,7 +102,7 @@ pub async fn run_live(url: &str, opts: &ScanOptions) -> Result<ScanReport, Strin
     let mut report = build_scan_report(&tools, opts.lock_path.as_deref(), opts.write_lock, mode)?;
 
     if !opts.skip_exposure {
-        let outcome = run_exposure_probe(url, &tools, opts.attempt_call).await;
+        let outcome = run_exposure_probe(url, opts.attempt_call, opts.call_tool.as_deref()).await;
         let mut extra = exposure_findings(&outcome);
         extra.extend(ssrf_capable_findings(&tools));
         if mode == OutputMode::Human {

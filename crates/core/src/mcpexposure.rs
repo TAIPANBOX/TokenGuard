@@ -48,17 +48,6 @@ use crate::mcpreport::{Finding, Severity};
 /// completely legitimate (e.g. a `fetch_url` tool is often the point).
 const SSRF_KEYWORDS: &[&str] = &["fetch", "http", "url", "webhook", "proxy", "download"];
 
-/// Name prefixes that make a tool a plausible candidate for the opt-in
-/// unauthenticated `tools/call` probe: reads, not mutations.
-const SAFE_CALL_PREFIXES: &[&str] = &["list_", "get_", "read_"];
-
-/// Verbs (case-insensitive substring match against name + description) that
-/// disqualify a tool from the unauthenticated call probe outright, even if
-/// its name happens to start with a "safe" prefix.
-const MUTATION_VERBS: &[&str] = &[
-    "write", "delete", "exec", "run", "deploy", "send", "create", "update", "remove",
-];
-
 /// Is `host` a loopback or private-range literal (`localhost`, `127.0.0.1`,
 /// `::1`, RFC1918 `10.*` / `172.16-31.*` / `192.168.*`, link-local
 /// `169.254.*` / `fe80::*`, or IPv6 unique-local `fc00::/7`)? Pure string/number
@@ -115,15 +104,35 @@ pub fn host_is_local(host: &str) -> bool {
 /// unwrapping a bracketed IPv6 literal. Pure string parsing (no `url` crate
 /// dependency in this pure-logic core crate) — good enough for the scheme
 /// and host, which is all the exposure checks need.
+///
+/// This is a **best-effort fallback**, not the source of truth: the live scan
+/// path (`mcpexposure_probe::run_exposure_probe` in the gateway crate) parses
+/// the URL with `reqwest::Url` (the same WHATWG-compliant parser reqwest uses
+/// to pick a connect host) and passes that authoritative `(scheme, host)`
+/// into [`exposure_findings`] directly, so classification can never diverge
+/// from where the scan actually connects. This function only exists for
+/// callers without a `reqwest::Url` handy, and is hardened to track WHATWG
+/// behavior as closely as a dependency-free parser reasonably can:
+/// - a `\` inside the authority is treated as an authority terminator, same
+///   as `/`/`?`/`#` — WHATWG (and therefore `url`/`reqwest`) treats `\`
+///   exactly like `/` for "special" schemes (http/https/ws/wss/ftp/file), so
+///   `scheme://host\@evil/x` must resolve to host `host`, not `evil`.
+/// - excess `/`/`\` immediately after `://` are collapsed (ignored) before
+///   authority parsing starts, mirroring WHATWG's "special authority ignore
+///   slashes" state — so `https:///path` lands on host `path` (matching
+///   `reqwest::Url::parse`) instead of an empty/bogus host.
 pub fn parse_url_host_scheme(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.trim().to_lowercase();
-    // Isolate the AUTHORITY first: everything up to the first '/', '?', or '#'.
-    // Splitting on '@' over the *whole* remainder is wrong — an '@' in the
-    // path/query/fragment (e.g. `…/x?cb=a@b`) would be mistaken for a userinfo
-    // separator and yield a bogus host. Confining the '@' split to the
-    // authority prevents that.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // Collapse any run of extra '/' or '\' right after "://" before isolating
+    // the authority — see the WHATWG note above.
+    let rest = rest.trim_start_matches(['/', '\\']);
+    // Isolate the AUTHORITY first: everything up to the first '/', '?', '#',
+    // or '\'. Splitting on '@' over the *whole* remainder is wrong — an '@'
+    // in the path/query/fragment (e.g. `…/x?cb=a@b`) would be mistaken for a
+    // userinfo separator and yield a bogus host. Confining the '@' split to
+    // the authority prevents that.
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     // Drop userinfo (`user:pass@host`) — now only within the authority.
     let host_port = authority
@@ -156,11 +165,6 @@ fn haystack(t: &McpTool) -> String {
     format!("{} {}", t.name.to_lowercase(), t.description.to_lowercase())
 }
 
-fn is_mutation_tool(t: &McpTool) -> bool {
-    let hay = haystack(t);
-    MUTATION_VERBS.iter().any(|v| hay.contains(v))
-}
-
 /// One `Low`-severity `ssrf_capable_tool` finding per tool whose name or
 /// description matches an SSRF keyword (`fetch`, `http`, `url`, `webhook`,
 /// `proxy`, `download`). Informational capability flag, not a poisoning
@@ -184,29 +188,25 @@ pub fn ssrf_capable_findings(tools: &[McpTool]) -> Vec<Finding> {
         .collect()
 }
 
-/// Pick the least-destructive advertised tool to target with the opt-in
-/// unauthenticated `tools/call` probe: a tool whose name starts with
-/// `list_`/`get_`/`read_` **and** whose name/description doesn't match a
-/// mutation verb. Returns the first such tool (deterministic, in advertised
-/// order), or `None` if nothing looks clearly safe — callers must skip the
-/// call probe entirely in that case rather than guess.
-pub fn pick_safe_call_target(tools: &[McpTool]) -> Option<&McpTool> {
-    tools.iter().find(|t| {
-        if is_mutation_tool(t) {
-            return false;
-        }
-        let name = t.name.to_lowercase();
-        SAFE_CALL_PREFIXES.iter().any(|p| name.starts_with(p))
-    })
-}
-
 /// Outcome of the opt-in `--attempt-call` probe (a no-auth `tools/call`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// There is deliberately **no** "pick a tool automatically" variant: an
+/// earlier version of this scanner picked the call target itself by matching
+/// tool name/description against a keyword blocklist
+/// (`list_`/`get_`/`read_` prefix, no mutation verb like `delete`/`exec`).
+/// That heuristic runs over attacker-controlled strings — a malicious server
+/// can name a destructive tool `get_status` and describe it as read-only, and
+/// a substring filter over adversarial input can't be trusted to catch that.
+/// The operator now MUST name the tool explicitly (`--call-tool <name>`);
+/// see `mcpexposure_probe::run_exposure_probe` in the gateway crate.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CallAttempt {
     /// `--attempt-call` was not passed; the probe never ran.
+    #[default]
     NotRequested,
-    /// `--attempt-call` was passed, but no advertised tool looked clearly
-    /// safe (see [`pick_safe_call_target`]), so nothing was called.
+    /// `--attempt-call` was passed without an explicit `--call-tool <name>`,
+    /// so nothing was called — the scanner refuses to guess a target from
+    /// server-controlled tool metadata.
     Skipped { reason: String },
     /// The unauthenticated call was rejected (HTTP error status, or a
     /// JSON-RPC `error` response) — the server enforced auth as expected.
@@ -220,11 +220,18 @@ pub enum CallAttempt {
 /// server. Pure data — no I/O lives on this type; `mcpexposure_probe` (the
 /// gateway crate) performs the actual requests and fills this in, then
 /// passes it to [`exposure_findings`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProbeOutcome {
-    /// The scanned server's URL (used to derive scheme/host for the
-    /// plaintext and host-locality checks).
-    pub url: String,
+    /// The scanned server's scheme (`"http"`/`"https"`), used for the
+    /// plaintext check. **Must** come from the same parser that actually
+    /// connects (the gateway derives this from `reqwest::Url::parse`, not
+    /// from re-parsing the raw URL string here) — see [`is_plaintext_exposure`]
+    /// and the module doc's SSRF-safety note.
+    pub scheme: String,
+    /// The scanned server's host, used for the host-locality check. **Must**
+    /// come from the same parser that actually connects — see `scheme` above
+    /// and [`host_is_local`].
+    pub host: String,
     /// A `tools/list` sent with **no** authentication got a 2xx response
     /// that parsed into at least one tool.
     pub unauth_list_returned: bool,
@@ -243,10 +250,15 @@ pub struct ProbeOutcome {
 /// unit-testable without a network). Does **not** include
 /// `ssrf_capable_tool` findings — call [`ssrf_capable_findings`] separately
 /// with the tool list.
+///
+/// Classification is driven entirely by `outcome.scheme`/`outcome.host` —
+/// this function does **not** re-parse a raw URL string, so it can never
+/// diverge from whatever parser the caller used to obtain them (see
+/// [`ProbeOutcome`]'s field docs).
 pub fn exposure_findings(outcome: &ProbeOutcome) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let (scheme, host) = parse_url_host_scheme(&outcome.url).unwrap_or_default();
-    let local = host_is_local(&host);
+    let (scheme, host) = (outcome.scheme.as_str(), outcome.host.as_str());
+    let local = host_is_local(host);
 
     let mut unauth_list_public = false;
     if outcome.unauth_list_returned && outcome.unauth_tool_count > 0 {
@@ -272,7 +284,7 @@ pub fn exposure_findings(outcome: &ProbeOutcome) -> Vec<Finding> {
         });
     }
 
-    if is_plaintext_exposure(&scheme, &host) {
+    if is_plaintext_exposure(scheme, host) {
         // CVE-2025-49596 shape: internet-reachable + unauthenticated +
         // unencrypted escalates from Medium to High.
         let severity = if unauth_list_public {
@@ -447,10 +459,48 @@ mod tests {
         );
     }
 
+    /// S1 hardening: a `\` inside the authority must terminate it, exactly
+    /// like `/`/`?`/`#` — matching `reqwest`/`url`'s WHATWG behavior, where
+    /// `\` is a path separator for "special" schemes (http/https/...).
+    /// Before this fix, `\@127.0.0.1` after the real host was read as
+    /// "everything up to the last `@`", so the *attacker-chosen* text after
+    /// the backslash (`127.0.0.1`) was misread as the host instead of the
+    /// host reqwest actually connects to (`target.example.com`).
+    #[test]
+    fn parse_url_host_scheme_treats_backslash_as_authority_terminator() {
+        assert_eq!(
+            parse_url_host_scheme(r"https://target.example.com\@127.0.0.1/rpc"),
+            Some(("https".to_string(), "target.example.com".to_string())),
+            "must match reqwest::Url::parse's connect host, not the text after '\\'"
+        );
+        assert_eq!(
+            parse_url_host_scheme(r"https://a.com\b\c"),
+            Some(("https".to_string(), "a.com".to_string()))
+        );
+    }
+
+    /// S1 hardening (finding #7): excess `/`/`\` immediately after `://` are
+    /// collapsed before authority parsing starts, mirroring
+    /// `reqwest::Url::parse`'s "special authority ignore slashes" behavior —
+    /// so `https:///path` lands on host `path` (matching reqwest) instead of
+    /// an empty/bogus host that would silently disable classification.
+    #[test]
+    fn parse_url_host_scheme_collapses_excess_leading_slashes() {
+        assert_eq!(
+            parse_url_host_scheme("https:///path"),
+            Some(("https".to_string(), "path".to_string()))
+        );
+        assert_eq!(
+            parse_url_host_scheme("https://////evil.com/path"),
+            Some(("https".to_string(), "evil.com".to_string()))
+        );
+    }
+
     #[test]
     fn plaintext_severity_medium_standalone_high_when_unauth_public() {
         let local_http = ProbeOutcome {
-            url: "http://127.0.0.1:4200/".to_string(),
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
             unauth_list_returned: true,
             unauth_tool_count: 2,
             cors_wildcard: false,
@@ -462,7 +512,8 @@ mod tests {
             .all(|f| f.kind != "exposure_plaintext"));
 
         let public_http_authed = ProbeOutcome {
-            url: "http://mcp.example.com/".to_string(),
+            scheme: "http".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: false,
             unauth_tool_count: 0,
             cors_wildcard: false,
@@ -473,7 +524,8 @@ mod tests {
         assert_eq!(plaintext.severity, Severity::Medium);
 
         let public_http_unauth = ProbeOutcome {
-            url: "http://mcp.example.com/".to_string(),
+            scheme: "http".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: true,
             unauth_tool_count: 3,
             cors_wildcard: false,
@@ -492,7 +544,8 @@ mod tests {
     #[test]
     fn unauth_list_severity_info_on_local_high_on_public() {
         let local = ProbeOutcome {
-            url: "https://localhost:8443/".to_string(),
+            scheme: "https".to_string(),
+            host: "localhost".to_string(),
             unauth_list_returned: true,
             unauth_tool_count: 1,
             cors_wildcard: false,
@@ -503,7 +556,8 @@ mod tests {
         assert_eq!(finding.severity, Severity::Info);
 
         let public = ProbeOutcome {
-            url: "https://mcp.example.com/".to_string(),
+            scheme: "https".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: true,
             unauth_tool_count: 1,
             cors_wildcard: false,
@@ -520,7 +574,8 @@ mod tests {
     #[test]
     fn no_unauth_finding_when_list_not_returned() {
         let outcome = ProbeOutcome {
-            url: "https://mcp.example.com/".to_string(),
+            scheme: "https".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: false,
             unauth_tool_count: 0,
             cors_wildcard: false,
@@ -533,7 +588,8 @@ mod tests {
     #[test]
     fn cors_wildcard_finding() {
         let outcome = ProbeOutcome {
-            url: "https://mcp.example.com/".to_string(),
+            scheme: "https".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: false,
             unauth_tool_count: 0,
             cors_wildcard: true,
@@ -545,6 +601,53 @@ mod tests {
             .find(|f| f.kind == "exposure_cors_wildcard")
             .unwrap();
         assert_eq!(f.severity, Severity::Medium);
+    }
+
+    /// S1 regression: `exposure_findings` classifies strictly off
+    /// `outcome.scheme`/`outcome.host` — the fields the gateway fills from
+    /// `reqwest::Url::parse`, i.e. the same parser that decides where the
+    /// scan actually connects. A backslash-smuggled authority
+    /// (`target.example.com\@127.0.0.1`) must classify against the host
+    /// reqwest connects to (`target.example.com`, public), not the
+    /// after-the-backslash text (`127.0.0.1`, which would wrongly suppress
+    /// the finding as "local/dev, expected").
+    #[test]
+    fn exposure_findings_uses_authoritative_host_not_a_raw_url_reparse() {
+        // Simulates what `run_exposure_probe` computes via
+        // `reqwest::Url::parse("https://target.example.com\\@127.0.0.1/rpc")`
+        // — scheme "https", host "target.example.com".
+        let outcome = ProbeOutcome {
+            scheme: "https".to_string(),
+            host: "target.example.com".to_string(),
+            unauth_list_returned: true,
+            unauth_tool_count: 1,
+            cors_wildcard: false,
+            call_attempt: CallAttempt::NotRequested,
+        };
+        let findings = exposure_findings(&outcome);
+        let f = findings
+            .iter()
+            .find(|f| f.kind == "exposure_unauth_list")
+            .expect("expected an exposure_unauth_list finding");
+        assert_eq!(
+            f.severity,
+            Severity::High,
+            "a public host smuggled behind a backslash-prefixed userinfo-looking \
+             segment must still classify as public/High, not local/Info"
+        );
+
+        // The http:// variant of the same authoritative host must also keep
+        // (not drop) the plaintext finding.
+        let http_outcome = ProbeOutcome {
+            scheme: "http".to_string(),
+            ..outcome
+        };
+        let http_findings = exposure_findings(&http_outcome);
+        assert!(
+            http_findings.iter().any(|f| f.kind == "exposure_plaintext"),
+            "the plaintext finding must not be dropped for the authoritative \
+             (public) host: {http_findings:?}"
+        );
     }
 
     #[test]
@@ -568,30 +671,10 @@ mod tests {
     }
 
     #[test]
-    fn pick_safe_call_target_prefers_safe_prefix_and_excludes_mutations() {
-        let tools = vec![
-            tool("delete_project", "Deletes a project permanently"),
-            tool("get_status", "Get the current server status"),
-        ];
-        let picked = pick_safe_call_target(&tools).unwrap();
-        assert_eq!(picked.name, "get_status");
-
-        let only_mutation = vec![tool("delete_project", "Deletes a project permanently")];
-        assert!(pick_safe_call_target(&only_mutation).is_none());
-
-        // A get_/list_/read_-named tool whose *description* mentions a
-        // mutation verb must still be excluded.
-        let trap = vec![tool(
-            "get_report",
-            "Get a report; also runs a delete of stale rows",
-        )];
-        assert!(pick_safe_call_target(&trap).is_none());
-    }
-
-    #[test]
     fn call_attempt_outcomes_map_to_expected_findings() {
         let succeeded = ProbeOutcome {
-            url: "https://mcp.example.com/".to_string(),
+            scheme: "https".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: false,
             unauth_tool_count: 0,
             cors_wildcard: false,
@@ -635,7 +718,8 @@ mod tests {
 
     fn succeeded_base() -> ProbeOutcome {
         ProbeOutcome {
-            url: "https://mcp.example.com/".to_string(),
+            scheme: "https".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: false,
             unauth_tool_count: 0,
             cors_wildcard: false,

@@ -617,7 +617,8 @@ mod tests {
         // mcpexposure: a public-http outcome yields unauth_list + plaintext +
         // cors_wildcard + unauth_call; rejected/skipped yield the other two.
         let public = ProbeOutcome {
-            url: "http://mcp.example.com/".to_string(),
+            scheme: "http".to_string(),
+            host: "mcp.example.com".to_string(),
             unauth_list_returned: true,
             unauth_tool_count: 2,
             cors_wildcard: true,

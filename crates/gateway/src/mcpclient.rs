@@ -83,6 +83,20 @@ pub enum McpClientError {
     BodyTooLarge { limit: usize },
 }
 
+/// Does `content_type` (a raw `content-type` header value, possibly with a
+/// `; charset=...` parameter) name `expected` as its media type? Splits on
+/// `;` and trims before comparing, so e.g. `application/jsonx` or
+/// `application/json-patch` don't falsely match `application/json` the way a
+/// bare `starts_with` would.
+fn content_type_matches(content_type: &str, expected: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case(expected)
+}
+
 /// Buffer a response body, aborting once it exceeds `max_bytes`. Streams the
 /// body in chunks (rather than `resp.bytes()`, which buffers the whole thing
 /// unconditionally) so an oversized/hostile body fails fast with
@@ -198,7 +212,7 @@ async fn post_rpc_full(
         });
     }
 
-    if content_type.starts_with("text/event-stream") {
+    if content_type_matches(&content_type, "text/event-stream") {
         let text = String::from_utf8_lossy(&bytes);
         let want_id = req.get("id");
         for frame in parse_sse_frames(&text) {
@@ -212,7 +226,7 @@ async fn post_rpc_full(
         )));
     }
 
-    if !content_type.starts_with("application/json") {
+    if !content_type_matches(&content_type, "application/json") {
         return Err(McpClientError::UnsupportedTransport(format!(
             "server responded with unsupported content-type {content_type:?}"
         )));
@@ -317,6 +331,19 @@ fn build_client(cfg: &McpClientConfig) -> Result<reqwest::Client, McpClientError
     reqwest::Client::builder()
         .connect_timeout(cfg.connect_timeout)
         .timeout(cfg.total_timeout)
+        // Never follow redirects (S2/SSRF): the scanned MCP server is
+        // untrusted input, and reqwest's default policy follows up to 10
+        // redirects to ANY host it's pointed at. A hostile server could 302
+        // the scanner onto `http://169.254.169.254/...` (cloud metadata) or
+        // another internal/RFC1918 address and read the probe's response
+        // back out. `Policy::none()` is the safe default here — a redirect
+        // from an MCP endpoint isn't something this scanner should silently
+        // chase; a same-origin-only custom policy would also close the SSRF
+        // hole, but "none" needs no origin-comparison logic to get right and
+        // every call site already treats a 3xx as a normal error (see
+        // below), so there's no behavior to preserve by allowing any
+        // redirects at all.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| McpClientError::Transport(e.to_string()))
 }

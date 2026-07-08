@@ -71,7 +71,7 @@ async fn main() {
         //     `[--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]`
         // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`
         //     `[--json] [--json-out <file>] [--fail-on <severity>|none]`
-        //     `[--skip-exposure] [--attempt-call]`
+        //     `[--skip-exposure] [--attempt-call --call-tool <name>]`
         Some("mcp-scan") => {
             let rest: Vec<String> = args.collect();
             let url_idx = rest.iter().position(|a| a == "--url");
@@ -85,12 +85,18 @@ async fn main() {
             let sarif_out = sarif_idx.and_then(|i| rest.get(i + 1).cloned());
             let fail_on_idx = rest.iter().position(|a| a == "--fail-on");
             let fail_on_raw = fail_on_idx.and_then(|i| rest.get(i + 1).cloned());
+            let call_tool_idx = rest.iter().position(|a| a == "--call-tool");
+            let call_tool = call_tool_idx.and_then(|i| rest.get(i + 1).cloned());
             // Live-scan-only: exposure checks (unauth tools/list, plaintext
             // transport, wildcard CORS, SSRF-capable tools) run by default
             // against `--url` targets; `--skip-exposure` turns them off.
             // `--attempt-call` opts into the one invasive check (an
             // unauthenticated `tools/call`) — off by default because
-            // invoking a stranger's tool is itself side-effecting.
+            // invoking a stranger's tool is itself side-effecting. It
+            // requires `--call-tool <name>`: the operator must name the
+            // tool explicitly, since the server controls both the tool's
+            // name and description and could describe a destructive tool as
+            // "safe" to dodge an automatic keyword filter.
             let skip_exposure = rest.iter().any(|a| a == "--skip-exposure");
             let attempt_call = rest.iter().any(|a| a == "--attempt-call");
             let mode = if rest.iter().any(|a| a == "--json") {
@@ -122,6 +128,7 @@ async fn main() {
                 json_out_idx.map(|i| i + 1),
                 sarif_idx.map(|i| i + 1),
                 fail_on_idx.map(|i| i + 1),
+                call_tool_idx.map(|i| i + 1),
             ];
             let tools_path = rest
                 .iter()
@@ -136,6 +143,7 @@ async fn main() {
                 sarif_out,
                 skip_exposure,
                 attempt_call,
+                call_tool,
             };
             // Ok(report) on a completed scan; Err(()) when the scan could not
             // run (bad args, a run/parse error, or nothing to scan). The Err
@@ -156,9 +164,9 @@ async fn main() {
                     // silently ignoring a flag the caller took the trouble
                     // to pass, say so — a misused flag in a CI script should
                     // be visible, not a silent no-op.
-                    if opts.skip_exposure || opts.attempt_call {
+                    if opts.skip_exposure || opts.attempt_call || opts.call_tool.is_some() {
                         eprintln!(
-                            "mcp-scan: note: --skip-exposure/--attempt-call only apply to --url (live) scans; ignoring for file mode"
+                            "mcp-scan: note: --skip-exposure/--attempt-call/--call-tool only apply to --url (live) scans; ignoring for file mode"
                         );
                     }
                     tokenfuse_gateway::mcpcli::run(&p, &opts)
@@ -166,7 +174,7 @@ async fn main() {
                 }
                 (None, None) => {
                     eprintln!(
-                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call]"
+                        "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none]\n       tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock] [--json] [--json-out <file>] [--sarif <file>] [--fail-on <severity>|none] [--skip-exposure] [--attempt-call --call-tool <name>]"
                     );
                     Err(())
                 }

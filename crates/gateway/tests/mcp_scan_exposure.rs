@@ -13,7 +13,6 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use tokenfuse_core::mcp::McpTool;
 use tokenfuse_core::mcpexposure::{exposure_findings, CallAttempt};
 use tokenfuse_core::mcpreport::Severity;
 use tokenfuse_gateway::mcpcli::{run_live, OutputMode, ScanOptions};
@@ -21,13 +20,15 @@ use tokenfuse_gateway::mcpexposure_probe::run_exposure_probe;
 
 /// Stub server config: whether it demands an `authorization` header (401s
 /// without one), whether its `tools/list` response carries a wildcard CORS
-/// header, and a hit-counter for `tools/call` so tests can assert a call was
-/// (or wasn't) attempted.
+/// header, a hit-counter for `tools/call` so tests can assert a call was (or
+/// wasn't) attempted, and the name of the last tool actually invoked (so S3
+/// tests can assert *which* tool got called, not just that one did).
 #[derive(Clone, Default)]
 struct StubConfig {
     require_auth: bool,
     cors_wildcard: bool,
     call_hits: Arc<Mutex<usize>>,
+    called_tool: Arc<Mutex<Option<String>>>,
 }
 
 fn json_response(v: Value) -> Response {
@@ -90,6 +91,12 @@ async fn stub(
         }
         "tools/call" => {
             *cfg.call_hits.lock().unwrap() += 1;
+            let name = req
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
+            *cfg.called_tool.lock().unwrap() = name;
             json_response(json!({
                 "jsonrpc": "2.0", "id": id,
                 "result": { "content": [] }
@@ -117,7 +124,7 @@ async fn unauth_list_on_loopback_is_info_not_high() {
     let url = spawn(StubConfig::default()).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let outcome = run_exposure_probe(&url, &[], false).await;
+    let outcome = run_exposure_probe(&url, false, None).await;
     assert!(outcome.unauth_list_returned);
     assert_eq!(outcome.unauth_tool_count, 1);
 
@@ -147,7 +154,7 @@ async fn no_unauth_list_finding_when_server_requires_auth() {
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let outcome = run_exposure_probe(&url, &[], false).await;
+    let outcome = run_exposure_probe(&url, false, None).await;
     assert!(!outcome.unauth_list_returned);
     assert_eq!(outcome.unauth_tool_count, 0);
 
@@ -169,7 +176,7 @@ async fn cors_wildcard_response_header_flags_finding() {
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let outcome = run_exposure_probe(&url, &[], false).await;
+    let outcome = run_exposure_probe(&url, false, None).await;
     assert!(outcome.cors_wildcard);
 
     let findings = exposure_findings(&outcome);
@@ -180,69 +187,32 @@ async fn cors_wildcard_response_header_flags_finding() {
     assert_eq!(f.severity, Severity::Medium);
 }
 
-/// (d1) `--attempt-call` (i.e. `attempt_call: true`) against a stub, with a
-/// `get_*` tool advertised: the probe calls it unauthenticated, the stub
-/// returns a non-error result, and `exposure_unauth_call` fires Critical.
+/// (d1 / S3) `--attempt-call` with NO `--call-tool <name>` given: the probe
+/// must refuse to guess a target and skip the call entirely — the stub's
+/// `tools/call` handler is never hit. This is the core S3 regression: there
+/// is no more advertised-tool-list auto-selection to defeat, because there
+/// is no auto-selection at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn attempt_call_against_get_tool_succeeds_and_flags_critical() {
+async fn attempt_call_without_call_tool_is_skipped_and_makes_no_call() {
     let cfg = StubConfig::default();
     let call_hits = cfg.call_hits.clone();
     let url = spawn(cfg).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let tools = vec![McpTool {
-        name: "get_status".to_string(),
-        description: "Get the current server status".to_string(),
-        fingerprint: 0,
-    }];
-
-    let outcome = run_exposure_probe(&url, &tools, true).await;
-    assert_eq!(
-        outcome.call_attempt,
-        CallAttempt::Succeeded {
-            tool: "get_status".to_string()
-        }
-    );
-    assert_eq!(
-        *call_hits.lock().unwrap(),
-        1,
-        "the stub's tools/call must have been hit exactly once"
-    );
-
-    let findings = exposure_findings(&outcome);
-    let f = findings
-        .iter()
-        .find(|f| f.kind == "exposure_unauth_call")
-        .expect("expected an exposure_unauth_call finding");
-    assert_eq!(f.severity, Severity::Critical);
-    assert_eq!(f.tool.as_deref(), Some("get_status"));
-}
-
-/// (d2) `--attempt-call` against a stub advertising only a `delete_*` tool:
-/// no safe target exists, so the probe must skip the call entirely — the
-/// stub's `tools/call` handler is never hit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn attempt_call_skips_when_only_mutation_tool_is_advertised() {
-    let cfg = StubConfig::default();
-    let call_hits = cfg.call_hits.clone();
-    let url = spawn(cfg).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let tools = vec![McpTool {
-        name: "delete_project".to_string(),
-        description: "Deletes a project permanently".to_string(),
-        fingerprint: 0,
-    }];
-
-    let outcome = run_exposure_probe(&url, &tools, true).await;
+    let outcome = run_exposure_probe(&url, true, None).await;
     match &outcome.call_attempt {
-        CallAttempt::Skipped { .. } => {}
+        CallAttempt::Skipped { reason } => {
+            assert!(
+                reason.contains("--call-tool"),
+                "skip reason should point the operator at --call-tool: {reason:?}"
+            );
+        }
         other => panic!("expected Skipped, got {other:?}"),
     }
     assert_eq!(
         *call_hits.lock().unwrap(),
         0,
-        "no tools/call should ever reach the server when nothing looks safe"
+        "no tools/call should ever reach the server without an explicit --call-tool"
     );
 
     let findings = exposure_findings(&outcome);
@@ -252,8 +222,71 @@ async fn attempt_call_skips_when_only_mutation_tool_is_advertised() {
         .any(|f| f.kind == "exposure_unauth_call_skipped"));
 }
 
+/// (d2 / S3) `--attempt-call --call-tool weather`: exactly the named tool is
+/// invoked, unauthenticated, and `exposure_unauth_call` fires Critical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attempt_call_with_named_tool_calls_exactly_that_tool() {
+    let cfg = StubConfig::default();
+    let call_hits = cfg.call_hits.clone();
+    let called_tool = cfg.called_tool.clone();
+    let url = spawn(cfg).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let outcome = run_exposure_probe(&url, true, Some("weather")).await;
+    assert_eq!(
+        outcome.call_attempt,
+        CallAttempt::Succeeded {
+            tool: "weather".to_string()
+        }
+    );
+    assert_eq!(
+        *call_hits.lock().unwrap(),
+        1,
+        "the stub's tools/call must have been hit exactly once"
+    );
+    assert_eq!(
+        called_tool.lock().unwrap().as_deref(),
+        Some("weather"),
+        "the operator-named tool, and only it, must be the one invoked"
+    );
+
+    let findings = exposure_findings(&outcome);
+    let f = findings
+        .iter()
+        .find(|f| f.kind == "exposure_unauth_call")
+        .expect("expected an exposure_unauth_call finding");
+    assert_eq!(f.severity, Severity::Critical);
+    assert_eq!(f.tool.as_deref(), Some("weather"));
+}
+
+/// (S3) A server whose advertised `tools/list` describes a destructive tool
+/// with an innocuous-sounding name/description (the exact adversarial shape
+/// the old keyword-blocklist auto-picker was vulnerable to) can no longer get
+/// it auto-invoked: `--attempt-call` without `--call-tool` skips regardless
+/// of what the server advertises, because nothing is ever chosen from
+/// server-supplied metadata anymore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malicious_tool_description_cannot_get_itself_auto_invoked() {
+    let cfg = StubConfig::default();
+    let call_hits = cfg.call_hits.clone();
+    let url = spawn(cfg).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The stub always advertises a "search" tool (see `stub()` above); what
+    // matters here is that `run_exposure_probe` never looks at the tool list
+    // at all when picking a call target — it only obeys `call_tool`.
+    let outcome = run_exposure_probe(&url, true, None).await;
+    assert!(matches!(outcome.call_attempt, CallAttempt::Skipped { .. }));
+    assert_eq!(
+        *call_hits.lock().unwrap(),
+        0,
+        "a server's advertised tools must never get auto-invoked, no matter \
+         how their name/description reads"
+    );
+}
+
 /// `attempt_call: false` (the default) never touches `tools/call`, even with
-/// a perfectly safe tool advertised.
+/// `call_tool` set — the flag gate is checked first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attempt_call_off_by_default_never_calls() {
     let cfg = StubConfig::default();
@@ -261,13 +294,7 @@ async fn attempt_call_off_by_default_never_calls() {
     let url = spawn(cfg).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let tools = vec![McpTool {
-        name: "get_status".to_string(),
-        description: "Get the current server status".to_string(),
-        fingerprint: 0,
-    }];
-
-    let outcome = run_exposure_probe(&url, &tools, false).await;
+    let outcome = run_exposure_probe(&url, false, Some("get_status")).await;
     assert_eq!(outcome.call_attempt, CallAttempt::NotRequested);
     assert_eq!(*call_hits.lock().unwrap(), 0);
 }
