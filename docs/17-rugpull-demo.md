@@ -14,9 +14,11 @@ changes behavior on a later fetch: the description now instructs the model to
 do something it wasn't approved for (read a credentials file, exfiltrate
 data, call an unrelated API), or the input schema widens to accept
 parameters it shouldn't. Nothing forces a re-review, because nothing *looks*
-different to a human skimming a tool name in a UI. This is one of the
-supply-chain attack classes called out in the OWASP GenAI/agentic threat
-guidance and Anthropic's own MCP security writeups.
+different to a human skimming a tool name in a UI. This exact pattern is its
+own named risk category in OWASP's MCP-specific guidance —
+[MCP03:2025 · Tool Poisoning](https://owasp.org/www-project-mcp-top-10/),
+which explicitly names "rug pulls (malicious updates to trusted tools)" and
+schema poisoning as sub-techniques.
 
 The fix TokenFuse implements is **pin-then-diff**: fingerprint the approved
 `tools/list` response into a lockfile the first time you trust it

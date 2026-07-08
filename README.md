@@ -64,7 +64,7 @@ A chatbot makes **one** call to an LLM. An **agent** makes *hundreds*: it thinks
 
 ### 1. Cost runs away silently
 
-Agents burn tokens **10–100× faster** than a chatbot, and a single bad loop compounds fast. One documented code-review agent ballooned from **2,000 to 120,000 tokens** on a *single task* after a self-improvement loop. The failure mode that hurts most is that **nothing looks wrong**: a looping agent still returns `200 OK`, so your APM stays green while the meter spins. The bill is the first and only symptom, and by then the money is spent.
+Agents burn tokens dramatically faster than a single chatbot turn: one study of agentic **coding** tasks found they can consume up to **1,000× more tokens** than a single code-chat query — driven mostly by growing input context, not output — and that runs on the *same* task can vary by up to **30×** in total tokens depending on how the loop unfolds ([Bai et al., 2026](https://arxiv.org/abs/2604.22750)). The failure mode that hurts most is that **nothing looks wrong**: a looping agent still returns `200 OK`, so your APM stays green while the meter spins. The bill is the first and only symptom, and by then the money is spent.
 
 ### 2. "Per-key" limits don't understand agents
 
@@ -72,7 +72,7 @@ The unit that matters for an agent is the **run**: one whole task, start to fini
 
 ### 3. Agents are a new, live attack surface
 
-Autonomous agents read untrusted web pages, call external **MCP** tools, and hold credentials. **65%** of organizations reported an AI-agent security incident in the last year, and **82%** discovered a *shadow* agent they didn't know was running. Prompt injection, secret exfiltration, and tool "rug-pulls" (a tool that changes behavior silently after a human already approved it) are runtime problems, and they can't be fixed by a code review before deploy.
+Autonomous agents read untrusted web pages, call external **MCP** tools, and hold credentials. **65%** of organizations reported an AI-agent security incident in the last year, and **82%** discovered a *shadow* agent they didn't know was running ([Cloud Security Alliance / Token Security, "Autonomous but Not Controlled," Apr. 2026](https://cloudsecurityalliance.org/artifacts/autonomous-but-not-controlled-ai-agent-incidents-now-common-in-enterprises)). Prompt injection, secret exfiltration, and tool "rug-pulls" (a tool that changes behavior silently after a human already approved it) are runtime problems, and they can't be fixed by a code review before deploy.
 
 **TokenFuse addresses all three, in the request path, in real time**, by enforcing per-run budgets, detecting loops, and acting as a security boundary for what agents can spend and leak.
 
@@ -108,19 +108,19 @@ Every kill you can trigger from TokenFuse (the API, `tokenfuse top`, Slack, the 
 
 ### 3. Budgets that survive a crash
 
-A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** — a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing — and, in cluster mode, are replicated across nodes through a **raft** state machine with durable on-disk storage. The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and a budget outlives a node crash or a restart.
+A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** — a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing — and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and — with durable storage enabled — a budget outlives not just a node crash but a full process restart.
 
 ### 4. Provider-agnostic: one proxy, every LLM call
 
-Point `TOKENFUSE_UPSTREAM` at Anthropic, OpenAI, or any Anthropic/OpenAI-shaped endpoint — including a local Ollama or vLLM server — and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds about half a microsecond in-process.
+Point `TOKENFUSE_UPSTREAM` at Anthropic, OpenAI, or any Anthropic/OpenAI-shaped endpoint — including a local Ollama or vLLM server — and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 — see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ### 5. Catch a poisoned MCP tool for free, and gate CI on it
 
 `tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks tool descriptions for injection phrases and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch — exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
 
-Also worth knowing, in more detail under [What's inside](#-whats-inside): a semantic cache that serves repeated questions for $0, WASM policies you can **backtest** against real traffic before turning them on, eBPF-based shadow-agent discovery with zero application changes, and a hosted Cloud fleet view for when one gateway isn't enough.
+Also worth knowing, in more detail under [What's inside](#-whats-inside): a semantic cache that serves repeated questions for $0, budget/step policies you can **backtest** against real traffic before turning them on, eBPF-based shadow-agent discovery with zero application changes, and a hosted Cloud fleet view for when one gateway isn't enough.
 
-**Self-funding.** The runaway loop in the example above — one task ballooning from 2,000 to 120,000 tokens — is exactly what a per-run budget is built to catch on call one, not on the invoice three days later. Most teams don't need an ROI deck for this: the first runaway TokenFuse blocks tends to cover the bill.
+**Self-funding.** The token blowouts above — a single task's usage swinging by up to 30× depending on how the loop unfolds — are exactly what a per-run budget is built to catch on call one, not on the invoice three days later. Most teams don't need an ROI deck for this: the first runaway TokenFuse blocks tends to cover the bill.
 
 ---
 
@@ -154,7 +154,7 @@ Three properties make this safe in production:
 
 Because cost is *estimated* before the call and *settled* after it, TokenFuse's numbers are a fast pre-flight approximation reconciled against real usage, not a hard real-time guarantee — see the [FAQ](#-faq) for what that means in practice.
 
-**Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~1 ms p50 / ~2 ms p99** over a direct provider call, negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
+**Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~0.8 ms p50 / ~2 ms p99** over a direct provider call, negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -215,7 +215,8 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 - 💰 **Per-run budgets**: a hard cap for a whole task, with hierarchical roll-up so a sub-agent's spend counts against its parent.
 - 🔁 **Loop / runaway detection**: identical-call, ping-pong, and context-growth detectors.
 - 🛑 **Breaker**: hard-stop a run (kill-switch) from the API, the `tokenfuse top` TUI, Slack, or the Cloud dashboard.
-- 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed; **backtest** them over past traffic.
+- 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed.
+- 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
 
 **Also hardens your agents**
@@ -451,7 +452,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 ## ❓ FAQ
 
-**Will it slow my agent down?** Negligibly. ~1 ms p50 added on the wire, and responses stream straight through (no buffering). See [BENCHMARKS.md](BENCHMARKS.md).
+**Will it slow my agent down?** Negligibly. ~0.8 ms p50 added on the wire, and responses stream straight through (no buffering). See [BENCHMARKS.md](BENCHMARKS.md).
 
 **Do I have to change my code?** No. Change one base-URL env var so calls go through TokenFuse. An optional Python SDK adds nicer error handling.
 

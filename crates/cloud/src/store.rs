@@ -129,7 +129,9 @@ pub struct RunAgg {
     pub killed: bool,
 }
 
-/// Org-wide totals.
+/// Org-wide totals. `calls`/`spent_microusd` are exact across the org's
+/// entire ingest history; `runs` is the currently-retained distinct run
+/// count, bounded by `MAX_RUNS_PER_ORG` — see `Store::summary`.
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct Summary {
     pub runs: u64,
@@ -177,6 +179,22 @@ struct SavingsAcc {
     /// `budget_breaks` distinct-by-run even across restarts (it's persisted).
     #[serde(default)]
     breaks: HashSet<String>,
+}
+
+/// Per-org running totals, folded on EVERY ingested record — independent of
+/// which [`RunAgg`]s remain in [`Inner::orgs`] after LRU eviction (see
+/// [`MAX_RUNS_PER_ORG`]). [`Store::summary`] reads `calls`/`spent_microusd`
+/// from here (rather than summing the possibly-evicted run map) so eviction
+/// never undercounts an org's totals. Persisted so totals survive a restart;
+/// see [`Store::load`]'s backfill for snapshots that predate this field.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct OrgTotals {
+    /// Every ingested record increments this by one — mirrors `RunAgg::calls`
+    /// summed across ALL runs ever seen for the org, evicted or not.
+    calls: u64,
+    /// Real spend only (blocked/avoided-spend rows excluded — the same gate
+    /// `RunAgg::spent_microusd` uses; see `is_blocked`).
+    spent_microusd: i64,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -275,6 +293,26 @@ const SPIKE_WINDOW_MS: i64 = 60_000;
 /// the tracker without bound (the incident itself is the durable record).
 const INCIDENT_TRACKER_CAP: usize = 256;
 
+/// Hard cap on the number of distinct run_ids retained per org in
+/// [`Inner::orgs`]. `/v1/ingest` is intentionally ungated (ADR-3 — any
+/// authenticated org principal, including a read-only viewer key, may push a
+/// batch), so without this a low-privilege credential could grow this map
+/// without bound by posting records with unique `run_id`s. On overflow the
+/// least-recently-touched run is evicted (see [`RecencyIndex`]); eviction
+/// only drops that run's OWN per-run aggregate from `/v1/runs` — the org's
+/// running totals are unaffected (see [`OrgTotals`] / [`Store::summary`]).
+const MAX_RUNS_PER_ORG: usize = 50_000;
+
+/// Hard cap on the number of distinct keys retained in EACH of
+/// `incident_tracker` and `fanout_tracker` (enforced independently per
+/// tracker). Both are keyed by attacker-influenceable `run_id`/`agent_id`
+/// values reachable through the same ungated `/v1/ingest` path as
+/// [`MAX_RUNS_PER_ORG`]. These trackers are ephemeral detector state (not
+/// persisted); evicting a long-dormant key just means it won't
+/// retroactively re-trip a detector — the durable [`Incident`] record, once
+/// tripped, lives in a separate map and is never evicted by this.
+const MAX_TRACKER_KEYS: usize = 20_000;
+
 /// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
 /// to the right subscriber and is not sent in the payload.
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +367,57 @@ struct Sample {
     blocked: bool,
 }
 
+/// A least-recently-used index over a set of keys, used to bound the
+/// cardinality of a map: [`RecencyIndex::touch`] records/refreshes a key's
+/// recency in O(log n), and [`RecencyIndex::evict_oldest`] removes and
+/// returns the least-recently-touched key in O(log n). Kept as a small side
+/// index (rather than threading recency through the maps it bounds) so the
+/// same structure works for `Inner::orgs`' per-org run map and the flat
+/// `incident_tracker` / `fanout_tracker` maps alike. Not persisted — see call
+/// sites for how each user rebuilds or tolerates a cold index after a
+/// restart.
+struct RecencyIndex<K: Ord + Clone + std::hash::Hash + Eq> {
+    /// seq (monotonic touch order) → key, ascending — the front is the
+    /// least-recently-touched.
+    by_seq: BTreeMap<u64, K>,
+    /// key → its current seq, so a re-touch can find and drop its stale
+    /// `by_seq` entry before re-inserting at the back.
+    seq_of: HashMap<K, u64>,
+    next_seq: u64,
+}
+
+impl<K: Ord + Clone + std::hash::Hash + Eq> Default for RecencyIndex<K> {
+    fn default() -> Self {
+        Self {
+            by_seq: BTreeMap::new(),
+            seq_of: HashMap::new(),
+            next_seq: 0,
+        }
+    }
+}
+
+impl<K: Ord + Clone + std::hash::Hash + Eq> RecencyIndex<K> {
+    /// Record `key` as just-touched (most recent), moving it to the back of
+    /// the eviction order if already present.
+    fn touch(&mut self, key: K) {
+        if let Some(old_seq) = self.seq_of.remove(&key) {
+            self.by_seq.remove(&old_seq);
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_seq.insert(seq, key.clone());
+        self.seq_of.insert(key, seq);
+    }
+
+    /// Remove and return the least-recently-touched key, if any.
+    fn evict_oldest(&mut self) -> Option<K> {
+        let seq = *self.by_seq.keys().next()?;
+        let key = self.by_seq.remove(&seq)?;
+        self.seq_of.remove(&key);
+        Some(key)
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// org → run → aggregate
@@ -360,6 +449,20 @@ struct Inner {
     /// the windowed distinct-run count the detector thresholds against
     /// (ephemeral — the `Incident` is the durable record).
     fanout_tracker: HashMap<(String, String), VecDeque<(String, i64)>>,
+    /// org → running totals, unaffected by `orgs` eviction (persisted) — see
+    /// [`OrgTotals`].
+    org_totals: HashMap<String, OrgTotals>,
+    /// org → LRU recency index over `orgs[org]`'s run_ids, bounding it to
+    /// [`MAX_RUNS_PER_ORG`]. Ephemeral: best-effort rebuilt from each
+    /// `RunAgg::last_seen` on load (see `Store::load`), so recency across a
+    /// restart isn't exact, only a reasonable approximation.
+    run_recency: HashMap<String, RecencyIndex<String>>,
+    /// Recency index over `incident_tracker`'s keys, bounding it to
+    /// [`MAX_TRACKER_KEYS`]. Ephemeral, like the tracker itself.
+    tracker_recency: RecencyIndex<(String, String)>,
+    /// Recency index over `fanout_tracker`'s keys, bounding it to
+    /// [`MAX_TRACKER_KEYS`]. Ephemeral, like the tracker itself.
+    fanout_recency: RecencyIndex<(String, String)>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -384,6 +487,7 @@ struct SnapshotRef<'a> {
     decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
     audit: &'a HashMap<String, Vec<AuditEntry>>,
+    org_totals: &'a HashMap<String, OrgTotals>,
 }
 
 #[derive(Default, Deserialize)]
@@ -412,6 +516,13 @@ struct SnapshotOwned {
     /// [`audit::verify_chain`] treats as intact.
     #[serde(default)]
     audit: HashMap<String, Vec<AuditEntry>>,
+    /// Missing on snapshots that predate `MAX_RUNS_PER_ORG` eviction —
+    /// `default` loads empty, and [`Store::load`] backfills each org's totals
+    /// by summing its (never-evicted, on those old snapshots) `orgs` map, so
+    /// pre-existing installs recover EXACT historical totals rather than
+    /// zeros.
+    #[serde(default)]
+    org_totals: HashMap<String, OrgTotals>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -484,11 +595,31 @@ impl Store {
                 let runs = inner.orgs.entry(org.to_string()).or_default();
                 let sav = inner.savings.entry(org.to_string()).or_default();
                 let dc = inner.decision_counts.entry(org.to_string()).or_default();
+                let totals = inner.org_totals.entry(org.to_string()).or_default();
+                let recency = inner.run_recency.entry(org.to_string()).or_default();
                 for r in records {
+                    // Bound `runs`' cardinality (see `MAX_RUNS_PER_ORG`):
+                    // evict the least-recently-touched run before inserting a
+                    // genuinely NEW run_id that would exceed the cap. This
+                    // only drops that run's own `RunAgg` — `totals` below
+                    // already captured its contribution and is never
+                    // affected by eviction (see `Store::summary`).
+                    if !runs.contains_key(&r.run_id) && runs.len() >= MAX_RUNS_PER_ORG {
+                        if let Some(evict_id) = recency.evict_oldest() {
+                            runs.remove(&evict_id);
+                        } else if let Some(any_id) = runs.keys().next().cloned() {
+                            // Defensive fallback: `recency` and `runs` are
+                            // kept in lock-step below, so this should be
+                            // unreachable — but never let an out-of-sync
+                            // index leave the cap unenforced.
+                            runs.remove(&any_id);
+                        }
+                    }
                     let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
+                    recency.touch(r.run_id.clone());
                     // Compliance evidence: count every KNOWN record decision
                     // (see `is_known_decision`), including blocked ones (a
                     // block is a guard firing, not spend). `/v1/compliance`
@@ -500,11 +631,15 @@ impl Store {
                     }
                     // Blocked calls are stored and counted, but their
                     // cost_microusd (avoided spend, or 0 for security blocks)
-                    // must not inflate the org's real spend total.
+                    // must not inflate the org's real spend total. `totals`
+                    // mirrors the same gate so it stays exact regardless of
+                    // `runs` eviction.
                     if !is_blocked(&r.decision) {
                         agg.spent_microusd += r.cost_microusd;
+                        totals.spent_microusd += r.cost_microusd;
                     }
                     agg.calls += 1;
+                    totals.calls += 1;
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
                     }
@@ -576,6 +711,7 @@ impl Store {
                 {
                     let n = bump_tracker(
                         &mut inner.incident_tracker,
+                        &mut inner.tracker_recency,
                         org,
                         "budget_exhausted",
                         &r.run_id,
@@ -603,6 +739,7 @@ impl Store {
                 if is_known_decision(&r.decision) && r.decision == "loop_detected" {
                     let n = bump_tracker(
                         &mut inner.incident_tracker,
+                        &mut inner.tracker_recency,
                         org,
                         "sustained_loop",
                         &r.run_id,
@@ -630,6 +767,7 @@ impl Store {
                 if let Some(a) = &agent {
                     let n = bump_fanout_tracker(
                         &mut inner.fanout_tracker,
+                        &mut inner.fanout_recency,
                         org,
                         a,
                         &r.run_id,
@@ -750,16 +888,20 @@ impl Store {
         out
     }
 
-    /// Org-wide totals.
+    /// Org-wide totals. `calls`/`spent_microusd` are read from the running
+    /// [`OrgTotals`] accumulator (exact over the org's full ingest history,
+    /// unaffected by [`MAX_RUNS_PER_ORG`] eviction); `runs` reflects the
+    /// currently-RETAINED run count (bounded by the same cap — see
+    /// `Store::runs` for the live set).
     pub fn summary(&self, org: &str) -> Summary {
         let inner = self.inner.read().unwrap();
         let mut sum = Summary::default();
         if let Some(runs) = inner.orgs.get(org) {
-            for agg in runs.values() {
-                sum.runs += 1;
-                sum.calls += agg.calls;
-                sum.spent_microusd += agg.spent_microusd;
-            }
+            sum.runs = runs.len() as u64;
+        }
+        if let Some(totals) = inner.org_totals.get(org) {
+            sum.calls = totals.calls;
+            sum.spent_microusd = totals.spent_microusd;
         }
         sum
     }
@@ -1106,6 +1248,7 @@ impl Store {
                 decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
                 audit: &inner.audit,
+                org_totals: &inner.org_totals,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -1134,6 +1277,52 @@ impl Store {
         inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;
         inner.audit = snap.audit;
+
+        // Pre-existing snapshots (from before MAX_RUNS_PER_ORG eviction
+        // landed) have no `org_totals` entry for an org; since their `orgs`
+        // map was never evicted, summing it recovers EXACT historical totals
+        // — a strictly better default than zero. Post-fix snapshots already
+        // carry an accurate `org_totals` per org (accumulated independently
+        // of eviction, see `ingest_at`) and are used as-is.
+        let mut org_totals = snap.org_totals;
+        for (org, runs) in &inner.orgs {
+            org_totals.entry(org.clone()).or_insert_with(|| {
+                let mut t = OrgTotals::default();
+                for agg in runs.values() {
+                    t.calls += agg.calls;
+                    t.spent_microusd += agg.spent_microusd;
+                }
+                t
+            });
+        }
+        inner.org_totals = org_totals;
+
+        // Seed the run-recency index (ephemeral, not persisted) from the
+        // loaded runs, ordered by each RunAgg's own `last_seen`, so an
+        // eviction shortly after a restart still prefers the actually-oldest
+        // run rather than an arbitrary HashMap iteration order. Best effort:
+        // `last_seen` is the record's own (client-supplied) timestamp, not a
+        // perfect proxy for server-side touch order, but far better than no
+        // ordering at all.
+        let seed: Vec<(String, Vec<String>)> = inner
+            .orgs
+            .iter()
+            .map(|(org, runs)| {
+                let mut ids: Vec<(String, i64)> = runs
+                    .values()
+                    .map(|a| (a.run_id.clone(), a.last_seen))
+                    .collect();
+                ids.sort_by_key(|(_, last_seen)| *last_seen);
+                (org.clone(), ids.into_iter().map(|(id, _)| id).collect())
+            })
+            .collect();
+        inner.run_recency.clear();
+        for (org, ids) in seed {
+            let idx = inner.run_recency.entry(org).or_default();
+            for id in ids {
+                idx.touch(id);
+            }
+        }
         Ok(())
     }
 
@@ -1356,17 +1545,28 @@ fn incident_id(kind: &str, scope: &str) -> String {
 /// Push `ts` onto the per-(org,key) occurrence tracker, bound it, and — when a
 /// `(now, window_ms)` is given — drop timestamps older than the window. Returns
 /// the current count the detector thresholds against.
+///
+/// Also bounds the number of DISTINCT `(org,key)` entries in `tracker` to
+/// [`MAX_TRACKER_KEYS`], evicting the least-recently-touched entry (per
+/// `recency`) when a genuinely NEW key would exceed the cap — an existing
+/// key's repeat trigger is never dropped by this.
 fn bump_tracker(
     tracker: &mut HashMap<(String, String), VecDeque<i64>>,
+    recency: &mut RecencyIndex<(String, String)>,
     org: &str,
     kind: &str,
     scope: &str,
     ts: i64,
     window: Option<(i64, i64)>,
 ) -> u64 {
-    let dq = tracker
-        .entry((org.to_string(), incident_id(kind, scope)))
-        .or_default();
+    let key = (org.to_string(), incident_id(kind, scope));
+    if !tracker.contains_key(&key) && tracker.len() >= MAX_TRACKER_KEYS {
+        if let Some(evict_key) = recency.evict_oldest() {
+            tracker.remove(&evict_key);
+        }
+    }
+    recency.touch(key.clone());
+    let dq = tracker.entry(key).or_default();
     dq.push_back(ts);
     while dq.len() > INCIDENT_TRACKER_CAP {
         dq.pop_front();
@@ -1385,8 +1585,14 @@ fn bump_tracker(
 /// rather than logging a duplicate (so the deque holds distinct runs and a hot
 /// run can't evict its peers), bounds it to [`INCIDENT_TRACKER_CAP`], and drops
 /// entries older than `window_ms` before `now`.
+///
+/// Also bounds the number of DISTINCT `(org,agent)` entries in `tracker` to
+/// [`MAX_TRACKER_KEYS`], evicting the least-recently-touched entry (per
+/// `recency`) when a genuinely NEW key would exceed the cap.
+#[allow(clippy::too_many_arguments)]
 fn bump_fanout_tracker(
     tracker: &mut HashMap<(String, String), VecDeque<(String, i64)>>,
+    recency: &mut RecencyIndex<(String, String)>,
     org: &str,
     agent: &str,
     run_id: &str,
@@ -1394,9 +1600,14 @@ fn bump_fanout_tracker(
     now: i64,
     window_ms: i64,
 ) -> u64 {
-    let dq = tracker
-        .entry((org.to_string(), agent.to_string()))
-        .or_default();
+    let key = (org.to_string(), agent.to_string());
+    if !tracker.contains_key(&key) && tracker.len() >= MAX_TRACKER_KEYS {
+        if let Some(evict_key) = recency.evict_oldest() {
+            tracker.remove(&evict_key);
+        }
+    }
+    recency.touch(key.clone());
+    let dq = tracker.entry(key).or_default();
     dq.retain(|(r, _)| r != run_id);
     dq.push_back((run_id.to_string(), ts));
     while dq.len() > INCIDENT_TRACKER_CAP {
@@ -2626,5 +2837,179 @@ mod tests {
         // recomputed tip_hash no longer matches the signed manifest's.
         let after = s.audit_manifest("acme", &key, 2);
         assert_ne!(after.tip_hash, signed.tip_hash);
+    }
+
+    // ---- LRU bounds (MAX_RUNS_PER_ORG / MAX_TRACKER_KEYS) -------------------
+
+    /// A low-privilege credential POSTing records with unique `run_id`s
+    /// (`/v1/ingest` is intentionally ungated) must not be able to grow
+    /// `orgs[org]` without bound. Ingesting far more than `MAX_RUNS_PER_ORG`
+    /// distinct runs keeps the retained map capped AND retains the
+    /// most-recently-touched runs — but MUST NOT lose any spend: `summary()`
+    /// still reflects the full ingested total via the `OrgTotals`
+    /// accumulator, which eviction never touches.
+    #[test]
+    fn run_map_is_capped_but_totals_stay_exact() {
+        let s = Store::new();
+        let extra = 25;
+        let total_records = MAX_RUNS_PER_ORG + extra;
+        let mut expected_spend: i64 = 0;
+        let mut records: Vec<CallRecord> = Vec::with_capacity(total_records);
+        for i in 0..total_records {
+            let cost = (i % 7) as i64 + 1; // varied, small, nonzero cost
+            expected_spend += cost;
+            records.push(CallRecord {
+                run_id: format!("run-{i}"),
+                decision: "allow".into(),
+                cost_microusd: cost,
+                ts_millis: i as i64,
+                ..Default::default()
+            });
+        }
+        // One big batch, ingested in order — mirrors a burst from a gateway
+        // (or an attacker) pushing many distinct run_ids.
+        s.ingest_at("acme", &records, total_records as i64);
+
+        let runs = s.runs("acme");
+        assert!(
+            runs.len() <= MAX_RUNS_PER_ORG,
+            "run map must stay capped, got {}",
+            runs.len()
+        );
+
+        // Eviction did NOT lose any spend or calls: the summary total still
+        // reflects EVERY ingested record, even though most individual
+        // RunAggs were evicted.
+        let sum = s.summary("acme");
+        assert_eq!(sum.spent_microusd, expected_spend);
+        assert_eq!(sum.calls, total_records as u64);
+
+        // LRU: the most-recently-touched runs (the tail of the batch) are the
+        // ones retained; the oldest (the head) were evicted. Check via a
+        // HashSet rather than re-scanning `runs` per id — this loop covers
+        // `total_records` ids and a linear `.iter().any(..)` per id would be
+        // O(n^2) (n ~ 50,000, so ~2.5 billion comparisons).
+        let retained: HashSet<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        for i in extra..total_records {
+            let id = format!("run-{i}");
+            assert!(
+                retained.contains(id.as_str()),
+                "{id} should still be retained"
+            );
+        }
+        for i in 0..extra {
+            let id = format!("run-{i}");
+            assert!(
+                !retained.contains(id.as_str()),
+                "{id} should have been evicted"
+            );
+        }
+    }
+
+    /// `incident_tracker` and `fanout_tracker` are ephemeral detector state
+    /// keyed by attacker-influenceable `run_id`/`agent_id` values (same
+    /// ungated ingest path as `MAX_RUNS_PER_ORG`). Pushing far more than
+    /// `MAX_TRACKER_KEYS` distinct keys through each must keep both maps
+    /// bounded.
+    #[test]
+    fn trackers_are_bounded() {
+        let s = Store::new();
+        let now = 1_000_000;
+        let extra = 25;
+        let total = MAX_TRACKER_KEYS + extra;
+
+        // incident_tracker: one distinct (org, "budget_exhausted:run_id") key
+        // per record (a single budget-protection block each — not enough on
+        // its own to trip an incident, so this only exercises the tracker's
+        // key cardinality bound, not the detector).
+        let budget_records: Vec<CallRecord> = (0..total)
+            .map(|i| CallRecord {
+                run_id: format!("run-{i}"),
+                decision: "budget_exceeded".into(),
+                cost_microusd: 1,
+                ts_millis: now,
+                ..Default::default()
+            })
+            .collect();
+        s.ingest_at("acme", &budget_records, now);
+
+        // fanout_tracker: one distinct (org, agent_id) key per record.
+        let fanout_records: Vec<CallRecord> = (0..total)
+            .map(|i| CallRecord {
+                run_id: format!("fr-{i}"),
+                agent_id: format!("agent-{i}"),
+                decision: "allow".into(),
+                ts_millis: now,
+                ..Default::default()
+            })
+            .collect();
+        s.ingest_at("acme", &fanout_records, now);
+
+        let inner = s.inner.read().unwrap();
+        assert!(
+            inner.incident_tracker.len() <= MAX_TRACKER_KEYS,
+            "incident_tracker must stay bounded, got {}",
+            inner.incident_tracker.len()
+        );
+        assert!(
+            inner.fanout_tracker.len() <= MAX_TRACKER_KEYS,
+            "fanout_tracker must stay bounded, got {}",
+            inner.fanout_tracker.len()
+        );
+    }
+
+    /// The `OrgTotals` accumulator round-trips through save/load exactly, and
+    /// a snapshot from before this field existed (whose `orgs` map was, by
+    /// definition, never evicted) backfills sane — exact, not zero — totals
+    /// by summing that map.
+    #[test]
+    fn org_totals_persist_and_old_snapshots_backfill_from_runs() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-orgtotals.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 1000,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 2500,
+                    ..Default::default()
+                },
+            ],
+        );
+        s.save(&path).expect("save");
+
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let sum = s2.summary("acme");
+        assert_eq!(sum.spent_microusd, 3500);
+        assert_eq!(sum.calls, 2);
+
+        // A pre-existing snapshot with no `org_totals` field, but a
+        // populated (never-evicted, as every pre-fix snapshot's is) `orgs`
+        // map, backfills its totals by summing that map.
+        let old = dir.join(format!("tf-cloud-{}-oldorgtotals.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{"acme":{"r1":{"run_id":"r1","model":"","agent_id":"","spent_microusd":700,"calls":4,"cache_hits":0,"steps":0,"last_seen_millis":10,"killed":false}}},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        let sum3 = s3.summary("acme");
+        assert_eq!(sum3.spent_microusd, 700, "backfilled from the orgs map");
+        assert_eq!(sum3.calls, 4);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
     }
 }
