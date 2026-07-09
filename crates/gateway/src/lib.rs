@@ -18,6 +18,7 @@ pub mod mcpexposure_probe;
 pub mod obs;
 pub mod otel;
 pub mod outcomescli;
+pub mod pricebook;
 pub mod provider;
 pub mod proxy;
 #[cfg(feature = "cluster")]

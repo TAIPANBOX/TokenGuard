@@ -7,8 +7,9 @@
 //! - unset → the deterministic stub, so `cargo run` works offline.
 
 use std::sync::Arc;
-use tokenfuse_core::{AnomalyConfig, Growth, Ledger, Mode, ModelPrice, Policy, PriceBook, Window};
+use tokenfuse_core::{AnomalyConfig, Growth, Ledger, Mode, Policy, Window};
 use tokenfuse_gateway::app;
+use tokenfuse_gateway::pricebook::default_price_book;
 use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
 use tracing_subscriber::EnvFilter;
@@ -315,18 +316,10 @@ async fn serve() {
         )
         .init();
 
-    // Illustrative prices ($/Mtok). Real prices ship as a versioned price book.
-    let prices = PriceBook::new()
-        .with(
-            "claude-sonnet",
-            ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
-        )
-        .with(
-            "claude-haiku",
-            ModelPrice::per_mtok_usd(0.80, 4.0, 0.08, 1.0),
-        )
-        .with("gpt", ModelPrice::per_mtok_usd(2.5, 10.0, 0.25, 3.125))
-        .with_fallback(ModelPrice::per_mtok_usd(15.0, 75.0, 1.5, 18.75));
+    // Default price book: illustrative generic entries plus exact entries for
+    // the current Anthropic/OpenAI lineup. See pricebook.rs for the per-model
+    // rates and units notes. Real prices ship as a versioned price book.
+    let prices = default_price_book();
 
     let provider: Arc<dyn Provider> = match std::env::var("TOKENFUSE_UPSTREAM") {
         Ok(url) if !url.is_empty() => {
