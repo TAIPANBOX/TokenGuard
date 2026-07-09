@@ -422,6 +422,15 @@ async fn serve() {
         }
     }
 
+    // Wardryx enforcement hook (a PEP): TOKENFUSE_WARDRYX_MODE = off | shadow
+    // | enforce (default off), pointed at TOKENFUSE_WARDRYX_URL. An unset
+    // URL keeps the hook off no matter what mode says, so there is nothing
+    // to call and nothing to enforce. See wardryx.rs for the full contract
+    // (fail-open/closed, the decision cache, etc.).
+    let wardryx = tokenfuse_gateway::wardryx::Wardryx::from_env();
+    tracing::info!(mode = ?wardryx.mode, "wardryx enforcement hook");
+    state = state.with_wardryx(Arc::new(wardryx));
+
     // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
     // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.
     use tokenfuse_gateway::sink::{EventSink, NullSink, ParquetSink, TeeSink};

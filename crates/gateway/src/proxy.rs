@@ -14,6 +14,7 @@ use crate::router::RouterMode;
 use crate::settle::SettleGuard;
 use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
+use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -544,6 +545,87 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         }
     }
 
+    // Wardryx enforcement hook (a PEP): ask the Wardryx policy service (a
+    // PDP) whether this specific agent action should proceed, before
+    // anything below reserves or forwards it. Defensive only: this can only
+    // block/hold the operator's OWN call, it never acts on its behalf. Off
+    // (the default) is a true no-op, no allocation and no network call.
+    let mut wardryx_header: Option<String> = None;
+    if st.wardryx.mode != WardryxMode::Off {
+        let tool_names = taint::tool_names_in(&request);
+        let approval_token = header_str(&headers, "x-fuse-approval-token");
+        let attestation_method = header_str(&headers, "x-fuse-attestation-method");
+        let wardryx_outcome = st
+            .wardryx
+            .decide(DecideContext {
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                on_behalf_of: on_behalf_of_chain.clone(),
+                tool_names,
+                model: parsed.model.clone(),
+                est_cost_usd: estimate.as_usd(),
+                attestation_method,
+                approval_token,
+            })
+            .await;
+
+        if st.wardryx.mode == WardryxMode::Shadow {
+            // Shadow never blocks: just report what WOULD have happened.
+            wardryx_header = Some(format!("would-{}", wardryx_outcome.decision.as_wire_str()));
+        } else {
+            match wardryx_outcome.decision {
+                WardryxDecision::Allow => {
+                    wardryx_header = Some(wardryx_outcome.decision.as_wire_str().to_string());
+                }
+                WardryxDecision::Deny => {
+                    st.sink.record(CallRecord {
+                        ts_millis: now_millis(),
+                        run_id: run_id.clone(),
+                        model: parsed.model.clone(),
+                        // Distinct from the budget-family decisions: this is
+                        // an avoided-harm security block, not avoided spend,
+                        // so it must never be counted as budget savings.
+                        decision: "wardryx_deny".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microusd: 0,
+                        step: snapshot.steps + 1,
+                        agent_id: agent_id.clone(),
+                        saved_microusd: 0,
+                        parent_run_id: parent_run_id.clone(),
+                        on_behalf_of: on_behalf_of.clone(),
+                        outcome: outcome_tag.clone(),
+                    });
+                    // Wardryx already emits its own `source: wardryx` policy
+                    // event, so there is no `st.events.emit` call here (it
+                    // would be a duplicate).
+                    return wardryx_deny_response(&run_id, &wardryx_outcome);
+                }
+                WardryxDecision::Hold => {
+                    st.sink.record(CallRecord {
+                        ts_millis: now_millis(),
+                        run_id: run_id.clone(),
+                        model: parsed.model.clone(),
+                        decision: "wardryx_hold".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microusd: 0,
+                        step: snapshot.steps + 1,
+                        agent_id: agent_id.clone(),
+                        saved_microusd: 0,
+                        parent_run_id: parent_run_id.clone(),
+                        on_behalf_of: on_behalf_of.clone(),
+                        outcome: outcome_tag.clone(),
+                    });
+                    // Stateless: the connection is not parked. The caller is
+                    // expected to resubmit the same request later, carrying
+                    // x-fuse-approval-token, once approved out of band.
+                    return wardryx_hold_response(&run_id, &wardryx_outcome);
+                }
+            }
+        }
+    }
+
     // For shadow/warn, surface whichever signal tripped in the response header.
     let would_block = eval.violated.clone().or(loop_reason);
 
@@ -631,6 +713,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             on_behalf_of,
             outcome_tag,
             router_header,
+            wardryx_header,
         )
     } else {
         buffered_managed(
@@ -650,6 +733,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &outcome_tag,
             router_header,
             router_route,
+            wardryx_header,
         )
         .await
     }
@@ -671,6 +755,7 @@ fn stream_managed(
     on_behalf_of: String,
     outcome: String,
     router_header: Option<String>,
+    wardryx_header: Option<String>,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -727,6 +812,9 @@ fn stream_managed(
     if let Some(rh) = router_header {
         builder = builder.header("x-fuse-router", rh);
     }
+    if let Some(wh) = wardryx_header {
+        builder = builder.header("x-fuse-wardryx", wh);
+    }
     builder
         .body(Body::from_stream(wrapped))
         .expect("valid response")
@@ -752,6 +840,7 @@ async fn buffered_managed(
     outcome_tag: &str,
     router_header: Option<String>,
     router_route: Option<(String, String)>,
+    wardryx_header: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -918,6 +1007,9 @@ async fn buffered_managed(
     if let Some(rh) = router_header {
         builder = builder.header("x-fuse-router", rh);
     }
+    if let Some(wh) = wardryx_header {
+        builder = builder.header("x-fuse-wardryx", wh);
+    }
     builder.body(Body::from(bytes)).expect("valid response")
 }
 
@@ -957,6 +1049,61 @@ fn firewall_block(run_id: &str, reason: &str) -> Response {
         .header("x-fuse", "blocked")
         .header("x-fuse-run-id", run_id.to_string())
         .header("x-fuse-taint", format!("blocked: {reason}"))
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// Wardryx deny: the PDP denied this agent action outright. Mirrors
+/// `dlp_block`/`firewall_block`'s response shape (a 403, not the 402 budget
+/// breaker): this is a policy denial, not a budget one.
+fn wardryx_deny_response(run_id: &str, outcome: &WardryxOutcome) -> Response {
+    let reason = outcome.reason.as_deref().unwrap_or("denied by policy");
+    let body = serde_json::json!({
+        "error": {
+            "type": "wardryx_denied",
+            "run_id": run_id,
+            "reason": reason,
+            "policy_version": outcome.policy_version,
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-wardryx", "deny")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// Wardryx hold: the PDP wants this specific call approved (by a human, or
+/// some other out-of-band process) before it proceeds. Stateless: the
+/// gateway does not park the connection or poll for the approval. The
+/// caller is expected to resubmit the exact same request once approved,
+/// carrying the approval id via `x-fuse-approval-token`.
+fn wardryx_hold_response(run_id: &str, outcome: &WardryxOutcome) -> Response {
+    let approval_id = outcome.approval_id.as_deref().unwrap_or_default();
+    let reason = outcome.reason.as_deref().unwrap_or("held pending approval");
+    let body = serde_json::json!({
+        "error": {
+            "type": "wardryx_hold",
+            "run_id": run_id,
+            "reason": reason,
+            "approval_id": approval_id,
+            "approval_token_required": outcome.approval_token_required,
+            "policy_version": outcome.policy_version,
+            "detail": "resubmit this request with header x-fuse-approval-token after approval",
+            "retryable": true,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-wardryx", "hold")
+        .header("x-fuse-approval-id", approval_id.to_string())
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }
@@ -1816,6 +1963,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             None,
         );
         {

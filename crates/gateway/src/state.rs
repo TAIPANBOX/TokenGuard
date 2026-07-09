@@ -5,6 +5,7 @@ use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
 use crate::router::Router;
 use crate::sink::{EventSink, NullSink};
+use crate::wardryx::Wardryx;
 use crate::wasmpolicy::WasmEval;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -44,6 +45,9 @@ pub struct AppState {
     pub router: Arc<Router>,
     /// Optional custom WASM policy.
     pub wasm: Option<Arc<dyn WasmEval>>,
+    /// Wardryx enforcement hook (a PEP): enforces decisions made by the
+    /// Wardryx policy service (a PDP). Off by default. See `crate::wardryx`.
+    pub wardryx: Arc<Wardryx>,
     history: History,
     killed: Killed,
     /// Per-run accumulated taint labels.
@@ -82,6 +86,7 @@ impl AppState {
             dlp: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
+            wardryx: Arc::new(Wardryx::disabled()),
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
@@ -128,6 +133,12 @@ impl AppState {
     /// Attach a model router. Chainable.
     pub fn with_router(mut self, router: Arc<Router>) -> Self {
         self.router = router;
+        self
+    }
+
+    /// Attach the Wardryx enforcement hook. Chainable.
+    pub fn with_wardryx(mut self, wardryx: Arc<Wardryx>) -> Self {
+        self.wardryx = wardryx;
         self
     }
 

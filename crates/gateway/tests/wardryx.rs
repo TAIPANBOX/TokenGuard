@@ -1,0 +1,269 @@
+//! Integration test for the Wardryx enforcement hook (a PEP) wired into
+//! `proxy::messages`.
+//!
+//! `crates/gateway/src/wardryx.rs` has unit tests for the decision cache and
+//! the fail-open/closed fallback in isolation. This file proves the HTTP
+//! wiring end to end: a tiny stub Wardryx server stands in for the PDP, and
+//! a real (offline) gateway request is driven through `tokenfuse_gateway::app`
+//! against the in-process `StubProvider` upstream, mirroring the pattern
+//! `tests/router.rs` and `tests/mcp_broker.rs` already use.
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokenfuse_core::{Ledger, Mode, ModelPrice, Policy, PriceBook};
+use tokenfuse_gateway::provider::StubProvider;
+use tokenfuse_gateway::state::AppState;
+use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
+use tower::ServiceExt;
+
+/// A stub Wardryx PDP: always answers with whatever `response` it was
+/// configured with, and records every request body and call count so tests
+/// can assert on what the gateway actually sent (and how often).
+#[derive(Clone)]
+struct WardryxStub {
+    response: Arc<Mutex<Value>>,
+    last_request: Arc<Mutex<Option<Value>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl WardryxStub {
+    fn new(response: Value) -> Self {
+        WardryxStub {
+            response: Arc::new(Mutex::new(response)),
+            last_request: Arc::new(Mutex::new(None)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+async fn decide(State(stub): State<WardryxStub>, Json(body): Json<Value>) -> Json<Value> {
+    stub.calls.fetch_add(1, Ordering::SeqCst);
+    *stub.last_request.lock().unwrap() = Some(body);
+    Json(stub.response.lock().unwrap().clone())
+}
+
+fn wardryx_router(stub: WardryxStub) -> Router {
+    Router::new()
+        .route("/v1/decide", post(decide))
+        .with_state(stub)
+}
+
+async fn spawn_server(router: Router) -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(l, router).await;
+    });
+    format!("http://{addr}")
+}
+
+/// `AppState` wired to an offline (in-process) `StubProvider` upstream, so
+/// the "allow" path never makes a real network call either, and the given
+/// `Wardryx` hook.
+fn state(wardryx: Wardryx) -> AppState {
+    let prices = PriceBook::new().with(
+        "test-model",
+        ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
+    );
+    AppState::new(
+        Arc::new(Ledger::new()),
+        Arc::new(prices),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(StubProvider::default()),
+        "wardryx-test-policy",
+    )
+    .with_wardryx(Arc::new(wardryx))
+}
+
+fn body() -> String {
+    r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#
+        .to_string()
+}
+
+fn request_with_headers(body: &str, extra: &[(&str, &str)]) -> Request<Body> {
+    let mut builder = Request::post("/v1/messages")
+        .header("x-fuse-run-id", "wardryx-test-run")
+        .header("x-fuse-budget-usd", "5.0");
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+fn request(body: &str) -> Request<Body> {
+    request_with_headers(body, &[])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforce_blocks_on_deny() {
+    let stub = WardryxStub::new(json!({
+        "decision": "deny",
+        "reason": "policy says no",
+        "policy_version": "v1"
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "deny");
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforce_hold_returns_403_with_approval_id() {
+    let stub = WardryxStub::new(json!({
+        "decision": "hold",
+        "approval_id": "appr-42",
+        "reason": "needs a human"
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "hold");
+    assert_eq!(resp.headers().get("x-fuse-approval-id").unwrap(), "appr-42");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_mode_never_blocks() {
+    // The PDP says deny, but shadow mode must never act on it.
+    let stub = WardryxStub::new(json!({ "decision": "deny", "reason": "would deny" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "would-deny");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn off_mode_makes_no_decide_call() {
+    let stub = WardryxStub::new(json!({ "decision": "deny" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A real, reachable URL is configured, so a stray call would succeed
+    // (and be counted) if the `Off` gate in `proxy::messages` were broken.
+    let wardryx = Wardryx::new(
+        WardryxMode::Off,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-fuse-wardryx").is_none());
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failmode_open_allows_when_pdp_unreachable() {
+    // Nothing listens on this address: connections fail fast (refused), no
+    // real server needed to prove the fail-open fallback.
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        "http://127.0.0.1:1",
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "allow");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failmode_closed_denies_when_pdp_unreachable() {
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Closed,
+        "http://127.0.0.1:1",
+        None,
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "deny");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_token_header_is_forwarded_to_decide_call() {
+    let stub = WardryxStub::new(json!({ "decision": "allow" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+    let req = request_with_headers(&body(), &[("x-fuse-approval-token", "tok-abc123")]);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "allow");
+
+    let sent = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the decide endpoint was called");
+    assert_eq!(sent["approval_token"], json!("tok-abc123"));
+}

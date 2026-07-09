@@ -30,6 +30,7 @@ pub mod sink;
 pub mod sqlq;
 pub mod state;
 pub mod tui;
+pub mod wardryx;
 pub mod wasmpolicy;
 
 use axum::extract::DefaultBodyLimit;
