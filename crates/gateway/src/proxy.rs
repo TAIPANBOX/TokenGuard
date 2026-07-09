@@ -17,7 +17,7 @@ use crate::state::AppState;
 use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -248,13 +248,16 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 applied = true;
             }
         }
-        router_header = Some(
-            if applied || (st.router.mode == RouterMode::Shadow && decision.routed()) {
-                decision.header_value()
-            } else {
-                format!("{}=kept", parsed.model)
-            },
-        );
+        router_header = Some(if applied {
+            decision.header_value()
+        } else if st.router.mode == RouterMode::Shadow && decision.routed() {
+            // Shadow observed a cheaper route but did NOT rewrite the body.
+            // Mark it `would-...` so a consumer never mistakes a hypothetical
+            // for an applied rewrite, mirroring the Wardryx shadow convention.
+            format!("would-{}", decision.header_value())
+        } else {
+            format!("{}=kept", parsed.model)
+        });
     }
 
     // Operator kill is a hard stop in any mode.
@@ -1112,15 +1115,28 @@ fn wardryx_hold_response(run_id: &str, outcome: &WardryxOutcome) -> Response {
             "retryable": true,
         }
     });
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header("content-type", "application/json")
         .header("x-fuse", "blocked")
         .header("x-fuse-run-id", run_id.to_string())
-        .header("x-fuse-wardryx", "hold")
-        .header("x-fuse-approval-id", approval_id.to_string())
+        .header("x-fuse-wardryx", "hold");
+    // `approval_id` is echoed verbatim from the external Wardryx PDP. Only
+    // surface it as a header if it is a legal header value; a malformed id
+    // must never panic this request's task. The JSON body always carries the
+    // approval_id regardless, so no information is lost when the header is
+    // dropped.
+    if let Ok(v) = HeaderValue::from_str(approval_id) {
+        builder = builder.header("x-fuse-approval-id", v);
+    }
+    builder
         .body(Body::from(body.to_string()))
-        .expect("valid response")
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .expect("a static 403 with an empty body always builds")
+        })
 }
 
 /// Parse the `X-Fuse-Taint` header (comma-separated labels the caller declares).

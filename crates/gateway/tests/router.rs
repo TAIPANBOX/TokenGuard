@@ -204,7 +204,9 @@ async fn shadow_mode_reports_without_rewriting_body_or_price() {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(router_hdr, "claude-opus-4-5->claude-haiku-4-5");
+    // Shadow observed the cheaper route but did not apply it: the header is
+    // prefixed `would-` so it is never mistaken for an applied rewrite.
+    assert_eq!(router_hdr, "would-claude-opus-4-5->claude-haiku-4-5");
 
     // But the forwarded body and the settled price are untouched.
     assert_eq!(captured_model(&captured).await, "claude-opus-4-5");
