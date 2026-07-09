@@ -399,6 +399,15 @@ async fn serve() {
     tracing::info!(?dlp, "secret scanning (DLP)");
     state = state.with_dlp(dlp);
 
+    // Model router: TOKENFUSE_ROUTER = off | shadow | on (default off), rules
+    // from TOKENFUSE_ROUTER_RULES (optional JSON path; built-in default
+    // table otherwise). Picks the cheapest model that still meets a task's
+    // required quality tier before the request is priced and forwarded --
+    // see router.rs for the full contract.
+    let router = tokenfuse_gateway::router::Router::from_env();
+    tracing::info!(mode = ?router.mode, "model router");
+    state = state.with_router(Arc::new(router));
+
     // Custom WASM policy (built with --features wasm): TOKENFUSE_WASM_POLICY=<path>.
     #[cfg(feature = "wasm")]
     if let Ok(path) = std::env::var("TOKENFUSE_WASM_POLICY") {

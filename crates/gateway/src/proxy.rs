@@ -10,6 +10,7 @@
 
 use crate::estimate::estimate_cost;
 use crate::provider::{ProviderError, ProviderResponse};
+use crate::router::RouterMode;
 use crate::settle::SettleGuard;
 use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
@@ -165,7 +166,7 @@ pub async fn healthz() -> &'static str {
 pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: Bytes) -> Response {
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let parsed = parse_request(&request);
+    let mut parsed = parse_request(&request);
 
     // No run id → unmanaged pass-through (drop-in safe).
     let Some(run_id) = header_str(&headers, "x-fuse-run-id") else {
@@ -210,6 +211,50 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // already used locally for the agent-event emit result (see
     // `st.events.emit` below and in `buffered_managed`).
     let outcome_tag = outcome_header(&headers).unwrap_or_default();
+
+    // Model router (FinOps cost optimization): pick the cheapest model that
+    // still meets this task's required quality tier, before anything below
+    // prices, reserves, or forwards the request. Off is a true no-op:
+    // nothing is computed, nothing is added. Shadow computes and reports the
+    // decision without touching the request. On rewrites `parsed.model` and
+    // the outgoing body's `model` field together, so every downstream
+    // consumer (the kill-check's avoided-cost estimate, DLP, the cache
+    // partition key, the real estimate/reserve/forward, and settle) sees one
+    // consistent model identity for the rest of this request. Never routes a
+    // model up to something pricier than what was asked for, unless a rule
+    // explicitly requires a higher tier for the task's class -- see
+    // router.rs for the exact contract.
+    let mut router_header: Option<String> = None;
+    let mut router_route: Option<(String, String)> = None;
+    if st.router.mode != RouterMode::Off {
+        let task_class = header_str(&headers, "x-fuse-task-type").unwrap_or_default();
+        let decision = st.router.route(
+            &parsed.model,
+            &task_class,
+            &st.prices,
+            body.len(),
+            parsed.max_tokens,
+        );
+        let mut applied = false;
+        if st.router.mode == RouterMode::On && decision.routed() {
+            if let Some(new_body) = rewrite_model_field(&body, &decision.chosen_model) {
+                body = new_body;
+                parsed.model = decision.chosen_model.clone();
+                router_route = Some((
+                    decision.original_model.clone(),
+                    decision.chosen_model.clone(),
+                ));
+                applied = true;
+            }
+        }
+        router_header = Some(
+            if applied || (st.router.mode == RouterMode::Shadow && decision.routed()) {
+                decision.header_value()
+            } else {
+                format!("{}=kept", parsed.model)
+            },
+        );
+    }
 
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
@@ -332,8 +377,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         cost_microusd: 0,
                         step,
                         agent_id: agent_id.clone(),
-                        // The only non-zero `saved_microusd` site: a served cache
-                        // hit avoided this much real spend.
+                        // A served cache hit avoided this much real spend.
+                        // (`buffered_managed`'s "allow" row can also carry a
+                        // nonzero `saved_microusd` now, for router savings --
+                        // the two never collide, since a cache hit returns
+                        // here and never reaches that row.)
                         saved_microusd: hit.saved_microusd,
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
@@ -582,6 +630,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             parent_run_id,
             on_behalf_of,
             outcome_tag,
+            router_header,
         )
     } else {
         buffered_managed(
@@ -599,6 +648,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &on_behalf_of,
             &on_behalf_of_chain,
             &outcome_tag,
+            router_header,
+            router_route,
         )
         .await
     }
@@ -619,6 +670,7 @@ fn stream_managed(
     parent_run_id: String,
     on_behalf_of: String,
     outcome: String,
+    router_header: Option<String>,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -672,6 +724,9 @@ fn stream_managed(
     if let Some(note) = dlp_note {
         builder = builder.header("x-fuse-dlp", note);
     }
+    if let Some(rh) = router_header {
+        builder = builder.header("x-fuse-router", rh);
+    }
     builder
         .body(Body::from_stream(wrapped))
         .expect("valid response")
@@ -695,6 +750,8 @@ async fn buffered_managed(
     on_behalf_of: &str,
     on_behalf_of_chain: &[String],
     outcome_tag: &str,
+    router_header: Option<String>,
+    router_route: Option<(String, String)>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -723,6 +780,31 @@ async fn buffered_managed(
         .map(|s| s.spent)
         .unwrap_or(actual);
 
+    // Router savings (FinOps): when this call was actually routed to a
+    // cheaper model (see the router step in `messages`), the difference
+    // between what the originally requested model would have cost for this
+    // exact usage and what the chosen model actually cost is real avoided
+    // spend. Fold it into `saved_microusd` on this row so it rolls up
+    // through the same accounting path cache hits use, distinguishable by
+    // `decision == "allow"` (a cache hit records its own `cache_hit` row and
+    // returns before reaching here, so an "allow" row with nonzero
+    // `saved_microusd` can only come from the router). `saturating_sub`
+    // keeps this at zero rather than negative on the one case the router
+    // routes up (an explicit higher-tier requirement) -- there is no
+    // "savings" to report when the call ended up pricier than requested.
+    let router_saved = match (&router_route, usage.as_ref()) {
+        (Some((original_model, chosen_model)), Some(u)) => {
+            match (
+                st.prices.cost(original_model, u),
+                st.prices.cost(chosen_model, u),
+            ) {
+                (Some(would_have_cost), Some(did_cost)) => would_have_cost.saturating_sub(did_cost),
+                _ => Microusd::ZERO,
+            }
+        }
+        _ => Microusd::ZERO,
+    };
+
     let u = usage.unwrap_or_default();
     st.sink.record(CallRecord {
         ts_millis: now_millis(),
@@ -734,7 +816,7 @@ async fn buffered_managed(
         cost_microusd: actual.0,
         step: reservation.step,
         agent_id: agent_id.to_string(),
-        saved_microusd: 0,
+        saved_microusd: router_saved.0,
         parent_run_id: parent_run_id.to_string(),
         on_behalf_of: on_behalf_of.to_string(),
         outcome: outcome_tag.to_string(),
@@ -832,6 +914,9 @@ async fn buffered_managed(
     }
     if let Some(note) = dlp_note {
         builder = builder.header("x-fuse-dlp", note);
+    }
+    if let Some(rh) = router_header {
+        builder = builder.header("x-fuse-router", rh);
     }
     builder.body(Body::from(bytes)).expect("valid response")
 }
@@ -1001,6 +1086,22 @@ fn parse_request(value: &serde_json::Value) -> ParsedRequest {
             .and_then(|s| s.as_bool())
             .unwrap_or(false),
     }
+}
+
+/// Re-serialize `body` with its top-level `"model"` field set to `model`
+/// (the router's chosen candidate), the same "parse, mutate, re-serialize"
+/// shape the DLP mask path already uses to rewrite the outgoing body.
+/// Returns `None` if `body` is not a JSON object we can safely rewrite, so
+/// the caller can fail safe and leave the request untouched rather than
+/// forward a body/estimate mismatch.
+fn rewrite_model_field(body: &Bytes, model: &str) -> Option<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object_mut()?;
+    obj.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
 /// A request is cache-eligible only if it defines no tools (tool calls can have
@@ -1715,6 +1816,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
         );
         {
             // Consume a single chunk, then drop the stream (simulated cancel).

@@ -3,6 +3,7 @@
 use crate::firewall::FirewallConfig;
 use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
+use crate::router::Router;
 use crate::sink::{EventSink, NullSink};
 use crate::wasmpolicy::WasmEval;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,9 @@ pub struct AppState {
     pub firewall: Arc<FirewallConfig>,
     /// Secret-scanning (DLP) mode (Off by default).
     pub dlp: DlpMode,
+    /// Model router: picks the cheapest model that still meets a task's
+    /// required quality tier (Off by default). See `crate::router`.
+    pub router: Arc<Router>,
     /// Optional custom WASM policy.
     pub wasm: Option<Arc<dyn WasmEval>>,
     history: History,
@@ -76,6 +80,7 @@ impl AppState {
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
             dlp: DlpMode::Off,
+            router: Arc::new(Router::disabled()),
             wasm: None,
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
@@ -117,6 +122,12 @@ impl AppState {
     /// Attach an agent-firewall config. Chainable.
     pub fn with_firewall(mut self, firewall: Arc<FirewallConfig>) -> Self {
         self.firewall = firewall;
+        self
+    }
+
+    /// Attach a model router. Chainable.
+    pub fn with_router(mut self, router: Arc<Router>) -> Self {
+        self.router = router;
         self
     }
 
