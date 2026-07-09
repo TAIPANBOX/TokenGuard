@@ -562,6 +562,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 run_id: run_id.clone(),
                 on_behalf_of: on_behalf_of_chain.clone(),
                 tool_names,
+                // Best-effort, declared-only: domains this request's tools
+                // explicitly name as an http(s) URL. Full runtime
+                // tool-egress enforcement (blocking a tool from actually
+                // reaching an undeclared domain when it is called) is the
+                // MCP broker's job, not this hook's -- see
+                // `referenced_domains`'s doc comment.
+                domains: referenced_domains(&request),
+                steps: snapshot.steps,
                 model: parsed.model.clone(),
                 est_cost_usd: estimate.as_usd(),
                 attestation_method,
@@ -1276,6 +1284,77 @@ fn tools_text(request: &serde_json::Value) -> String {
         .get("tools")
         .map(|t| t.to_string())
         .unwrap_or_default()
+}
+
+/// Best-effort extraction of domains this request's declared tools
+/// reference, for Wardryx's `domains` field (see `wardryx::DecideContext`).
+/// Walks every string value nested anywhere under the top-level `"tools"`
+/// field -- any depth, since Anthropic native tools, OpenAI functions, and
+/// MCP tool wrappers all shape a tool definition differently -- and keeps
+/// the ones that parse as an absolute http(s) URL, collecting each one's
+/// lowercased host, deduplicated. Returns an empty vec when the request has
+/// no `"tools"` field, an empty `"tools"` array, or no URL-shaped string
+/// anywhere in it: a plain LLM call with no URL-bearing tools declares
+/// nothing to restrict, which Wardryx treats as a no-op, never a denial.
+///
+/// Deliberately narrow: a string has to BE a URL (the whole value parses
+/// with `reqwest::Url`, scheme http/https), not merely mention one --
+/// this never regex-searches prose (a tool description, a system prompt)
+/// for an embedded URL. That keeps it bounded and simple, at the cost of
+/// missing a URL a tool schema only names in free text; the task this
+/// serves is "what did the request explicitly declare," not "find every
+/// URL anywhere."
+///
+/// This only covers domains DECLARED in the request. Full runtime
+/// tool-egress enforcement (stopping a tool from actually reaching a URL
+/// at call time, declared or not) is the MCP broker's responsibility, not
+/// this gateway hook's.
+fn referenced_domains(request: &serde_json::Value) -> Vec<String> {
+    let Some(tools) = request.get("tools") else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    collect_url_hosts(tools, 0, &mut hosts);
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// A tool schema is never more than a handful of levels deep in practice
+/// (array -> tool object -> input_schema -> properties -> property object),
+/// so this is a generous hard stop against a pathologically nested request
+/// body, not a realistic limit.
+const MAX_DOMAIN_SCAN_DEPTH: usize = 12;
+
+/// Recursive walk backing [`referenced_domains`]: collects the lowercased
+/// host of every string value, at any depth under `value`, that parses as
+/// an absolute http(s) URL.
+fn collect_url_hosts(value: &serde_json::Value, depth: usize, out: &mut Vec<String>) {
+    if depth > MAX_DOMAIN_SCAN_DEPTH {
+        return;
+    }
+    match value {
+        serde_json::Value::String(s) => {
+            if let Ok(url) = reqwest::Url::parse(s) {
+                if url.scheme() == "http" || url.scheme() == "https" {
+                    if let Some(host) = url.host_str() {
+                        out.push(host.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_url_hosts(item, depth + 1, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_url_hosts(v, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The "semantic core" of a request: the last user message's text, truncated.
@@ -2112,5 +2191,102 @@ mod tests {
             let new_bytes = to_bytes(new.into_body(), usize::MAX).await.unwrap();
             assert_eq!(new_bytes, old_bytes, "body bytes mismatch for {kind}");
         }
+    }
+
+    // --- referenced_domains (Wardryx `domains` extraction) ---
+
+    #[test]
+    fn referenced_domains_empty_when_no_tools_field() {
+        let request = serde_json::json!({ "model": "m", "messages": [] });
+        assert!(referenced_domains(&request).is_empty());
+    }
+
+    #[test]
+    fn referenced_domains_empty_when_tools_array_is_empty() {
+        let request = serde_json::json!({ "tools": [] });
+        assert!(referenced_domains(&request).is_empty());
+    }
+
+    #[test]
+    fn referenced_domains_extracts_host_from_an_explicit_url_string() {
+        let request = serde_json::json!({
+            "tools": [{
+                "name": "fetch_invoice",
+                "url": "https://api.acme.example/v1/invoices"
+            }]
+        });
+        assert_eq!(referenced_domains(&request), vec!["api.acme.example"]);
+    }
+
+    #[test]
+    fn referenced_domains_walks_nested_input_schema() {
+        // A URL a few levels deep under a JSON-schema-shaped tool
+        // definition (array -> tool object -> input_schema -> properties ->
+        // property object -> "default") must still be found: real tool
+        // schemas nest a URL at exactly this kind of depth.
+        let request = serde_json::json!({
+            "tools": [{
+                "name": "call_webhook",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "endpoint": {
+                            "type": "string",
+                            "default": "https://hooks.acme.example/deploy"
+                        }
+                    }
+                }
+            }]
+        });
+        assert_eq!(referenced_domains(&request), vec!["hooks.acme.example"]);
+    }
+
+    #[test]
+    fn referenced_domains_lowercases_dedupes_and_sorts() {
+        let request = serde_json::json!({
+            "tools": [
+                { "url": "HTTPS://API.acme.example/a" },
+                { "url": "https://api.acme.example/b" },
+                { "url": "http://other.example/c" }
+            ]
+        });
+        assert_eq!(
+            referenced_domains(&request),
+            vec!["api.acme.example", "other.example"]
+        );
+    }
+
+    #[test]
+    fn referenced_domains_ignores_prose_that_merely_mentions_a_url() {
+        // The task this serves is "what did the request explicitly
+        // declare as a URL," not "find every URL-shaped substring in any
+        // text anywhere" -- a description that mentions a URL in a
+        // sentence must not be treated as a declared domain.
+        let request = serde_json::json!({
+            "tools": [{
+                "name": "help",
+                "description": "For details see https://sneaky.example.com/docs before calling."
+            }]
+        });
+        assert!(referenced_domains(&request).is_empty());
+    }
+
+    #[test]
+    fn referenced_domains_ignores_non_http_schemes() {
+        let request = serde_json::json!({
+            "tools": [{ "url": "ftp://files.acme.example/drop" }]
+        });
+        assert!(referenced_domains(&request).is_empty());
+    }
+
+    #[test]
+    fn referenced_domains_ignores_tools_outside_the_tools_field() {
+        // A URL living in "system" or "messages" is out of scope: only
+        // strings nested under "tools" are ever scanned.
+        let request = serde_json::json!({
+            "system": "reach https://unrelated.example.com if needed",
+            "tools": [{ "name": "noop" }]
+        });
+        assert!(referenced_domains(&request).is_empty());
     }
 }

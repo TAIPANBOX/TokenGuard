@@ -267,3 +267,107 @@ async fn approval_token_header_is_forwarded_to_decide_call() {
         .expect("the decide endpoint was called");
     assert_eq!(sent["approval_token"], json!("tok-abc123"));
 }
+
+/// A request whose `tools` array declares one URL-bearing tool, so
+/// `referenced_domains` has something to extract.
+fn body_with_tool_url() -> String {
+    r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}],
+        "tools":[{"name":"fetch","description":"fetch a resource","server_url":"https://api.acme.example/v1/data"}]}"#
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steps_and_domains_are_sent_to_decide_call() {
+    let stub = WardryxStub::new(json!({ "decision": "allow" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        // Zero TTL: both calls below share the same (agent_id, tool_names)
+        // cache key, and a real cache hit on the second call would serve
+        // the cached decision without ever reaching the stub again -- which
+        // would hide the very thing this test exists to prove (that the
+        // second call's "steps" reflects the first call's completed
+        // reservation). Keep caching out of the way entirely.
+        Duration::from_millis(0),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+    let tool_body = body_with_tool_url();
+
+    // First call on a fresh run: no prior action has been reserved yet, so
+    // the run's accumulated step count is zero.
+    let resp1 = app.clone().oneshot(request(&tool_body)).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let sent1 = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("first decide call was made");
+    assert_eq!(sent1["steps"], json!(0));
+    assert_eq!(sent1["domains"], json!(["api.acme.example"]));
+
+    // Second call, same run: the first call's reserve() already bumped the
+    // ledger's step count by one, so this call's "steps" must reflect it.
+    let resp2 = app.oneshot(request(&tool_body)).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let sent2 = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second decide call was made");
+    assert_eq!(sent2["steps"], json!(1));
+    assert_eq!(sent2["domains"], json!(["api.acme.example"]));
+
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_from_a_step_or_domain_rule_still_maps_to_403() {
+    // Wardryx's own max_steps/allow_domains rules are exercised by the
+    // wardryx repo's decision-table test; this only proves the gateway's
+    // enforcement mapping doesn't need to know or care *why* Wardryx
+    // denied. A deny is a deny -- whether it came from a step-budget rule,
+    // a domain rule, deny_tool, or anything else -- and it maps to the same
+    // 403 path `enforce_blocks_on_deny` already covers generically. This
+    // uses a step/domain-flavored `reason` to make that connection explicit
+    // for this feature, and doubles as one more check that the request this
+    // hook actually sends carries the "steps"/"domains" a real PDP would
+    // have decided against.
+    let stub = WardryxStub::new(json!({
+        "decision": "deny",
+        "reason": "policy \"finance-guardrail\" step budget exhausted: 5 >= max_steps 5",
+        "policy_version": "v1"
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app.oneshot(request(&body_with_tool_url())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "deny");
+
+    let sent = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the decide endpoint was called");
+    assert_eq!(sent["domains"], json!(["api.acme.example"]));
+    assert_eq!(sent["steps"], json!(0));
+}

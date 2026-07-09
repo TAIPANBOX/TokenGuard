@@ -36,6 +36,20 @@
 //! is a documented future enhancement, not required for this wave. `hold`
 //! decisions are never cached, since a cached one would let a caller replay
 //! a stale `approval_id`.
+//!
+//! The cache key is coarser than the full `DecideContext`: `est_cost_usd`,
+//! `steps`, and `domains` all vary call to call and are deliberately NOT
+//! part of the key, so a cache hit inside the TTL window reuses a decision
+//! made against an earlier value of all three, not the current one. This is
+//! the same known, pre-existing tradeoff the policy_version note above
+//! already accepts, now also covering `max_steps`/`allow_domains`: a burst
+//! of calls faster than the TTL (default 3s) can reuse an `allow` cached
+//! before a step count crossed a policy's `max_steps`. Operators for whom
+//! that precision matters more than the round-trip savings should lower
+//! `TOKENFUSE_WARDRYX_CACHE_TTL_MS` (0 disables reuse entirely); making the
+//! cache key `DecideContext`-complete is a larger change than this wave's
+//! scope and would need to weigh the resulting near-zero hit rate on any
+//! run past its first call, since `steps` changes on every call within it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -123,6 +137,17 @@ pub struct DecideContext {
     pub run_id: String,
     pub on_behalf_of: Vec<String>,
     pub tool_names: Vec<String>,
+    /// The run's accumulated step count *before* this action, i.e.
+    /// `snapshot.steps` at the insertion point: how many prior actions on
+    /// this run have already been reserved. Checked by Wardryx against a
+    /// matched policy's `max_steps`; once this reaches or exceeds that cap,
+    /// Wardryx denies. Zero for a run's first action.
+    pub steps: u32,
+    /// Best-effort domains this action's declared tools reference (see
+    /// `proxy::referenced_domains`). Empty for a plain LLM call with no
+    /// URL-bearing tools, which Wardryx treats as "nothing declared to
+    /// restrict," never as a denial.
+    pub domains: Vec<String>,
     pub model: String,
     pub est_cost_usd: f64,
     pub attestation_method: Option<String>,
@@ -135,6 +160,8 @@ struct DecideWireRequest<'a> {
     run_id: &'a str,
     on_behalf_of: &'a [String],
     tool_names: &'a [String],
+    domains: &'a [String],
+    steps: u32,
     model: &'a str,
     est_cost_usd: f64,
     attestation_method: Option<&'a str>,
@@ -397,6 +424,8 @@ impl Wardryx {
             run_id: &ctx.run_id,
             on_behalf_of: &ctx.on_behalf_of,
             tool_names: &ctx.tool_names,
+            domains: &ctx.domains,
+            steps: ctx.steps,
             model: &ctx.model,
             est_cost_usd: ctx.est_cost_usd,
             attestation_method: ctx.attestation_method.as_deref(),
@@ -531,6 +560,8 @@ mod tests {
                 run_id: "r".into(),
                 on_behalf_of: vec![],
                 tool_names: vec![],
+                domains: vec![],
+                steps: 0,
                 model: "m".into(),
                 est_cost_usd: 0.0,
                 attestation_method: None,
@@ -550,6 +581,8 @@ mod tests {
                 run_id: "r".into(),
                 on_behalf_of: vec![],
                 tool_names: vec![],
+                domains: vec![],
+                steps: 0,
                 model: "m".into(),
                 est_cost_usd: 0.0,
                 attestation_method: None,
