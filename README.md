@@ -218,6 +218,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 - 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed.
 - 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
+- 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call — blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend.
 
 **Also hardens your agents**
 - 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
@@ -229,8 +230,11 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 - 🧬 **HA raft cluster**: replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
 - 📱 **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
-- 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export.
+- 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export; a separate opt-in NDJSON event stream sits alongside it (next bullet).
+- 📨 **Agent-event NDJSON export** *(opt-in)*: set `TOKENFUSE_EVENTS_PATH=<file>` and every breaker trip, DLP/taint block, and MCP rug-pull is appended as one NDJSON line in the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) event envelope (`taipanbox.dev/agent-event/v0.1`). Unset by default: zero hot-path cost, no file handle opened. Writes are fail-open (a write error is logged, never a request failure), and an event with no `x-fuse-agent-id` on the request is skipped and counted, never fabricated.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images, and published npm / crates.io / PyPI packages.
+
+**Agent Passport.** TokenFuse's `x-fuse-agent-id` / `x-fuse-run-id` / `x-fuse-parent-run-id` headers, the new `x-fuse-on-behalf-of` delegation-chain header (a comma-separated, ordered, root-first list of `agent://` / `user://` URIs, capped at 4 KiB and captured to the trace verbatim, never truncated when forwarded), `parent_run_id` (now its own persisted Parquet trace column, not just an in-memory budget-hierarchy key), and the agent-event envelope above all follow one shared spec — [Agent Passport](https://github.com/TAIPANBOX/agent-passport) — used across the TAIPANBOX agent-governance stack (TokenFuse for spend, Engram for memory, Idryx for access, Qryx for crypto), so the same agent identifier and delegation chain read the same way in every product's traces and events. Idryx, specifically, ingests TokenFuse's agent-events as a behavioral source for identity-graph correlation.
 
 ---
 
@@ -398,7 +402,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-Since v0.3.0, **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, the web dashboard has been restyled to share the app's "fuse" identity, and the MCP scanner gained a live `--url` mode, JSON reports, `--fail-on` exit codes, and a composite GitHub Action so it can gate CI.
+Since v0.3.0, **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, the web dashboard has been restyled to share the app's "fuse" identity, and the MCP scanner gained a live `--url` mode, JSON reports, `--fail-on` exit codes, and a composite GitHub Action so it can gate CI. Since then, `tokenfuse focus-export` has shipped (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), along with an opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header — TokenFuse's first pieces of the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec. None of this has shipped in a tagged release yet; it's on `main`.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
@@ -447,6 +451,8 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | **MCP** | A standard for agents to call external tools/servers; powerful, and a new security surface. |
 | **Rug pull** | A previously approved MCP tool that silently changes its description or schema on a later fetch. |
 | **Prompt injection** | A hidden instruction smuggled into data the agent reads, hijacking its behavior. |
+| **FOCUS** | The FinOps Open Cost & Usage Specification — a standard CSV shape for cloud/service spend; `tokenfuse focus-export` puts LLM spend into it. |
+| **Agent Passport** | A shared spec (identifier format + delegation chain + event envelope) that TokenFuse and the rest of the TAIPANBOX stack use so an agent's identity reads the same way everywhere. |
 
 ---
 
