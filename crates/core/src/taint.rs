@@ -63,6 +63,34 @@ pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Tool names a request DECLARES as available (the top-level `tools[]` array),
+/// as opposed to tools already invoked ([`tool_names_in`] reads `tool_use` /
+/// `tool_calls`). A request-path PEP (the Wardryx enforcement hook) must gate
+/// on declared tools too: a `deny_tool` policy has to fire when a forbidden
+/// tool is merely offered to the model, because the proxy decides *before* the
+/// model can emit the `tool_use` that would otherwise reveal the call. Anthropic
+/// names a tool at `tools[].name`; OpenAI at `tools[].function.name`.
+pub fn declared_tool_names_in(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        for t in tools {
+            // Anthropic: tools[].name
+            if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                out.push(name.to_string());
+            }
+            // OpenAI: tools[].function.name
+            if let Some(name) = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn push_tool_use_from_content(content: Option<&serde_json::Value>, out: &mut Vec<String>) {
     if let Some(blocks) = content.and_then(|c| c.as_array()) {
         for b in blocks {
@@ -191,6 +219,45 @@ mod tests {
         let resp =
             json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"send_email"}}]}}]});
         assert_eq!(tool_names_in(&resp), vec!["send_email"]);
+    }
+
+    #[test]
+    fn declares_anthropic_tools() {
+        let req = json!({"tools":[
+            {"name":"wire_transfer","description":"move money","input_schema":{}},
+            {"name":"lookup","description":"read","input_schema":{}}
+        ]});
+        assert_eq!(
+            declared_tool_names_in(&req),
+            vec!["wire_transfer", "lookup"]
+        );
+    }
+
+    #[test]
+    fn declares_openai_tools() {
+        let req = json!({"tools":[{"type":"function","function":{"name":"shell_exec"}}]});
+        assert_eq!(declared_tool_names_in(&req), vec!["shell_exec"]);
+    }
+
+    #[test]
+    fn no_tools_declared_is_empty() {
+        let req = json!({"messages":[{"role":"user","content":"hi"}]});
+        assert!(declared_tool_names_in(&req).is_empty());
+    }
+
+    /// The bypass this function closes: a first-turn request that only DECLARES
+    /// a forbidden tool (no tool_use block yet) is invisible to `tool_names_in`,
+    /// so a PEP that consulted only the latter would let a `deny_tool` policy be
+    /// evaded. `declared_tool_names_in` surfaces it so the PEP can deny.
+    #[test]
+    fn declared_tool_is_invisible_to_invoked_scan() {
+        let req = json!({
+            "model":"claude-haiku-4-5","max_tokens":50,
+            "messages":[{"role":"user","content":"refund by wire"}],
+            "tools":[{"name":"wire_transfer","description":"move money","input_schema":{}}]
+        });
+        assert!(tool_names_in(&req).is_empty());
+        assert_eq!(declared_tool_names_in(&req), vec!["wire_transfer"]);
     }
 
     #[test]

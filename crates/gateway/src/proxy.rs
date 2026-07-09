@@ -552,7 +552,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // (the default) is a true no-op, no allocation and no network call.
     let mut wardryx_header: Option<String> = None;
     if st.wardryx.mode != WardryxMode::Off {
-        let tool_names = taint::tool_names_in(&request);
+        let mut tool_names = taint::tool_names_in(&request);
+        // A request-path PEP must also gate on tools the request DECLARES
+        // (offered to the model), not only tools already invoked: a deny_tool
+        // policy has to fire before the model can emit the tool_use that would
+        // reveal the forbidden call. See taint::declared_tool_names_in.
+        tool_names.extend(taint::declared_tool_names_in(&request));
+        tool_names.sort();
+        tool_names.dedup();
         let approval_token = header_str(&headers, "x-fuse-approval-token");
         let attestation_method = header_str(&headers, "x-fuse-attestation-method");
         let wardryx_outcome = st

@@ -455,3 +455,45 @@ async fn cacheable_true_is_served_from_cache_within_ttl() {
         "cacheable: true should be cached after the first call: only one upstream hit for {REQUESTS} requests"
     );
 }
+
+/// Regression: a request that only DECLARES a tool (Anthropic `tools[]`, no
+/// `tool_use` block yet) must still surface that tool name to the PDP, so a
+/// `deny_tool` policy fires before the model is ever given the chance to invoke
+/// it. Previously the PEP consulted only *invoked* tools, so `tool_names` here
+/// was empty and a first-turn `deny_tool` could be bypassed by declaring the
+/// forbidden tool without calling it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_tool_is_forwarded_to_pdp() {
+    let stub = WardryxStub::new(json!({ "decision": "allow" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let body = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"refund by wire"}],"tools":[{"name":"wire_transfer","description":"move money","input_schema":{"type":"object"}}]}"#;
+    let resp = app.oneshot(request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK); // the stub allows; we assert on what was sent
+
+    let sent = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("PDP received a decide request");
+    let tools = sent
+        .get("tool_names")
+        .and_then(|t| t.as_array())
+        .expect("decide request carries tool_names");
+    assert!(
+        tools.iter().any(|t| t.as_str() == Some("wire_transfer")),
+        "a declared-but-not-invoked tool must be forwarded to the PDP, got {tools:?}"
+    );
+}
