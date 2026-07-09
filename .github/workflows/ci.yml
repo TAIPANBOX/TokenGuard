@@ -15,12 +15,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Free runner disk
+        # This job builds three full profiles (clippy --all-features, debug
+        # tests, and the cluster-feature test graph); with a warm cache the
+        # 14 GB runner disk runs dry mid-link (ld dies with SIGBUS). Drop the
+        # preinstalled bundles we never use (~25 GB) instead of a third-party
+        # cleanup action.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+          df -h /
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # v1: fresh namespace after the 2026-07-09 poisoned-cache SIGBUS;
+          # bump to invalidate if link-time disk pressure recurs.
+          prefix-key: v1
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
