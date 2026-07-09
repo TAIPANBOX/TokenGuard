@@ -61,10 +61,20 @@ async fn main() {
         fanout_window_ms: defaults.fanout_window_ms,
     };
 
+    // Agent-event NDJSON export (agent-passport SPEC.md §6): TOKENFUSE_EVENTS_PATH,
+    // read once here at startup (the control plane is its own process,
+    // separate from any gateway that might also have it set) — absent/empty
+    // keeps the exporter disabled (zero cost on the ingest hot path).
+    let event_exporter = Arc::new(tokenfuse_core::agent_event::Exporter::from_env());
+    if event_exporter.is_enabled() {
+        tracing::info!("agent-event NDJSON export enabled");
+    }
+
     // `alert_pct` is passed to the store too (not just `AppState`/
     // `PushPipeline`): C5's `MAX_RUNS_PER_ORG` eviction policy needs the SAME
     // threshold `/v1/alerts` uses to decide which runs it must not evict.
-    let store = Arc::new(Store::with_config(incident_cfg, alert_pct));
+    let store =
+        Arc::new(Store::with_config(incident_cfg, alert_pct).with_event_exporter(event_exporter));
 
     // Durable persistence: load a snapshot on startup and autosave every 2s.
     if let Ok(path) = std::env::var("TOKENFUSE_CLOUD_DATA") {

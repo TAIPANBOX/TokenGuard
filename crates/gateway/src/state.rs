@@ -7,6 +7,7 @@ use crate::sink::{EventSink, NullSink};
 use crate::wasmpolicy::WasmEval;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tokenfuse_core::agent_event::Exporter as EventExporter;
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
 use tokenfuse_core::taint::Labels;
 use tokenfuse_core::{DlpMode, Ledger, Microusd, Policy, PriceBook, SemanticCache};
@@ -46,6 +47,10 @@ pub struct AppState {
     /// Per-run budgets pushed from the Cloud control plane (override the
     /// client-supplied budget). Empty unless cloud mode is on.
     cloud_budgets: Arc<Mutex<HashMap<String, Microusd>>>,
+    /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled
+    /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
+    /// startup — see `crate::events`.
+    pub events: Arc<EventExporter>,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(Mutex::new(HashMap::new())),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
+            events: Arc::new(EventExporter::disabled()),
         }
     }
 
@@ -125,6 +131,12 @@ impl AppState {
     /// Attach an event sink (e.g. the Parquet trace). Chainable.
     pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.sink = sink;
+        self
+    }
+
+    /// Attach the agent-event NDJSON exporter. Chainable.
+    pub fn with_events(mut self, events: Arc<EventExporter>) -> Self {
+        self.events = events;
         self
     }
 

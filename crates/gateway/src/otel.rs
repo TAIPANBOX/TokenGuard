@@ -128,6 +128,8 @@ mod tests {
             step: 2,
             agent_id: String::new(),
             saved_microusd: 0,
+            parent_run_id: String::new(),
+            on_behalf_of: String::new(),
         }
     }
 

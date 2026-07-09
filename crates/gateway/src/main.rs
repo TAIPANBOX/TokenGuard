@@ -266,6 +266,10 @@ async fn mcp_broker() {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     });
+    // Agent-event NDJSON export (agent-passport SPEC.md §6): the mcp-broker is
+    // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
+    // startup, same as the gateway does in `serve()`.
+    let events = Arc::new(tokenfuse_gateway::events::from_env());
     let state = Arc::new(BrokerState {
         upstream: upstream.clone(),
         vault,
@@ -273,6 +277,7 @@ async fn mcp_broker() {
         dlp,
         lock,
         client: reqwest::Client::new(),
+        events,
     });
     if stdio {
         tracing::info!(%upstream, "mcp credential-broker on stdio");
@@ -474,6 +479,11 @@ async fn serve() {
         }
     }
     state = state.with_sink(sink);
+
+    // Agent-event NDJSON export (agent-passport SPEC.md §6): TOKENFUSE_EVENTS_PATH,
+    // read once here at startup — absent/empty keeps the exporter disabled
+    // (zero per-request cost, see `tokenfuse_core::agent_event::Exporter`).
+    state = state.with_events(Arc::new(tokenfuse_gateway::events::from_env()));
 
     // HA: replace the in-process ledger with a raft-replicated one shared across
     // gateways (built with --features cluster; configured via TOKENFUSE_CLUSTER_*).

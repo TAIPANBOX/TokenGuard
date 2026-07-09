@@ -68,6 +68,7 @@ fn broker_full(
         dlp,
         lock,
         client: reqwest::Client::new(),
+        events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
     }))
 }
 

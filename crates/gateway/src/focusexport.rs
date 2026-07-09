@@ -14,10 +14,13 @@
 //! ([`crate::sink::ParquetSink`]) — nothing is invented. A few FOCUS-shaped
 //! columns have no matching source field today and are always emitted empty,
 //! rather than synthesized:
-//!   - `x_parent_run_id`: `CallRecord` has no parent-run column (the parent
-//!     link lives only in the ledger's in-memory hierarchy via
-//!     `X-Fuse-Parent-Run-Id`, never written to the trace), so this column is
-//!     always `""`.
+//!   - `x_parent_run_id`: sourced from `CallRecord.parent_run_id` (P3,
+//!     agent-passport SPEC.md §3.2) — the run's `X-Fuse-Parent-Run-Id`
+//!     header, now written to the trace (see `crate::sink::CallRecord`).
+//!     `COALESCE(parent_run_id, '')` in [`load_records`] keeps this `""` for
+//!     rows from a pre-P3 trace file that lacks the column (schema
+//!     evolution, same pattern as `agent_id` below) as well as for rows that
+//!     genuinely had no parent.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -50,6 +53,7 @@
 
 use crate::sqlq::{query, str_at};
 use datafusion::arrow::array::Int64Array;
+use tokenfuse_core::timefmt::{days_from_civil, ts_millis_to_rfc3339};
 use tokenfuse_core::{BreakerReason, Microusd};
 
 /// Parsed `tokenfuse focus-export` flags.
@@ -89,6 +93,7 @@ struct FocusRecord {
     output_tokens: u64,
     cost_microusd: i64,
     agent_id: String,
+    parent_run_id: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
@@ -177,7 +182,8 @@ async fn load_records(
          cast(input_tokens as bigint) as input_tokens, \
          cast(output_tokens as bigint) as output_tokens, \
          cast(cost_microusd as bigint) as cost_microusd, \
-         coalesce(agent_id, '') as agent_id \
+         coalesce(agent_id, '') as agent_id, \
+         coalesce(parent_run_id, '') as parent_run_id \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -226,6 +232,7 @@ async fn load_records(
                 output_tokens: output_tokens.value(i).max(0) as u64,
                 cost_microusd: cost.value(i),
                 agent_id: str_at(b.column(7).as_ref(), i),
+                parent_run_id: str_at(b.column(8).as_ref(), i),
             });
         }
     }
@@ -312,7 +319,7 @@ fn to_row(rec: &FocusRecord) -> [String; 23] {
         rec.run_id.clone(),                      // SubAccountId
         rec.run_id.clone(),                      // SubAccountName
         rec.run_id.clone(),                      // x_run_id
-        String::new(),                           // x_parent_run_id — not in the trace schema
+        rec.parent_run_id.clone(),               // x_parent_run_id
         rec.agent_id.clone(),                    // x_agent_id
         rec.model.clone(),                       // x_model
         rec.input_tokens.to_string(),            // x_tokens_in
@@ -350,48 +357,6 @@ fn render_csv(records: &[FocusRecord]) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Format epoch milliseconds as an RFC 3339 UTC timestamp at second precision
-/// (`YYYY-MM-DDTHH:MM:SSZ`). No date-library dependency: a small, well-known
-/// civil-calendar algorithm (Howard Hinnant's `civil_from_days`,
-/// <http://howardhinnant.github.io/date_algorithms.html>) turns days-since-epoch
-/// into y/m/d.
-fn ts_millis_to_rfc3339(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let hour = secs_of_day / 3600;
-    let min = (secs_of_day % 3600) / 60;
-    let sec = secs_of_day % 60;
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
-}
-
-/// Days-since-epoch (1970-01-01 = 0) -> (year, month, day). See module doc.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097); // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-/// The inverse of [`civil_from_days`]: (year, month, day) -> days-since-epoch.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400); // [0, 399]
-    let mp = (m as i64 + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
 }
 
 /// Parse a minimal RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) into
@@ -535,6 +500,7 @@ mod tests {
 
     #[test]
     fn rfc3339_round_trips_over_a_range_of_days() {
+        use tokenfuse_core::timefmt::civil_from_days;
         // civil_from_days / days_from_civil must be exact inverses across a
         // span that includes multiple leap years and century boundaries.
         for days in -1000..1000 {
@@ -556,6 +522,34 @@ mod tests {
         cost_microusd: i64,
         agent_id: &str,
     ) -> CallRecord {
+        rec_with_parent(
+            ts_millis,
+            run_id,
+            model,
+            decision,
+            input_tokens,
+            output_tokens,
+            cost_microusd,
+            agent_id,
+            "",
+        )
+    }
+
+    /// Like [`rec`], but also sets `parent_run_id` — exercises P3's
+    /// `x_parent_run_id` sourcing (see
+    /// `exports_a_fixture_trace_to_the_exact_expected_csv`).
+    #[allow(clippy::too_many_arguments)]
+    fn rec_with_parent(
+        ts_millis: i64,
+        run_id: &str,
+        model: &str,
+        decision: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_microusd: i64,
+        agent_id: &str,
+        parent_run_id: &str,
+    ) -> CallRecord {
         CallRecord {
             ts_millis,
             run_id: run_id.into(),
@@ -567,6 +561,8 @@ mod tests {
             step: 1,
             agent_id: agent_id.into(),
             saved_microusd: 0,
+            parent_run_id: parent_run_id.into(),
+            on_behalf_of: String::new(),
         }
     }
 
@@ -578,8 +574,9 @@ mod tests {
 
         {
             let sink = ParquetSink::new(&dir, 1).unwrap();
-            // A: a normal settled allow (real parsed usage).
-            sink.record(rec(
+            // A: a normal settled allow (real parsed usage), WITH a parent run
+            // — exercises P3's x_parent_run_id sourcing.
+            sink.record(rec_with_parent(
                 0,
                 "run-a",
                 "claude-sonnet",
@@ -588,6 +585,7 @@ mod tests {
                 50,
                 345_000,
                 "agent-1",
+                "run-parent-a",
             ));
             // B: SettleGuard-drop-without-complete edge case — allow, zero
             // tokens, non-zero cost (the reserved fallback) -> "estimated".
@@ -633,8 +631,8 @@ mod tests {
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
-            "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,,agent-1,claude-sonnet,",
-            "100,50,false,settled\n",
+            "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
+            "claude-sonnet,100,50,false,settled\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
             ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated\n",

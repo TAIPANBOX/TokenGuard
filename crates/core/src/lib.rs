@@ -2,6 +2,7 @@
 //! evaluation. Pure logic with no I/O — the gateway and future packs build on
 //! this. See `docs/02-architecture.md` for the design and ADRs.
 
+pub mod agent_event;
 pub mod audit;
 pub mod backtest;
 pub mod breaker;
@@ -19,6 +20,7 @@ pub mod pricing;
 pub mod savings;
 pub mod secretbroker;
 pub mod taint;
+pub mod timefmt;
 
 pub use audit::AuditEntry;
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};

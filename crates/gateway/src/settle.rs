@@ -25,6 +25,12 @@ pub struct SettleGuard {
     reservation: Option<Reservation>,
     /// Request-scoped attribution carried into the settled `CallRecord`.
     agent_id: String,
+    /// Request-scoped `X-Fuse-Parent-Run-Id`, carried into the settled
+    /// `CallRecord` (agent-passport SPEC.md §3.2). `""` when unset.
+    parent_run_id: String,
+    /// Request-scoped raw `X-Fuse-On-Behalf-Of` value, carried into the
+    /// settled `CallRecord` (agent-passport SPEC.md §5). `""` when unset.
+    on_behalf_of: String,
 }
 
 impl SettleGuard {
@@ -38,6 +44,8 @@ impl SettleGuard {
         fallback: Microusd,
         reservation: Reservation,
         agent_id: String,
+        parent_run_id: String,
+        on_behalf_of: String,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -48,6 +56,8 @@ impl SettleGuard {
             fallback,
             reservation: Some(reservation),
             agent_id,
+            parent_run_id,
+            on_behalf_of,
         }
     }
 
@@ -75,6 +85,8 @@ impl SettleGuard {
             agent_id: self.agent_id.clone(),
             // Streaming allows never serve from cache — no savings to record.
             saved_microusd: 0,
+            parent_run_id: self.parent_run_id.clone(),
+            on_behalf_of: self.on_behalf_of.clone(),
         });
     }
 
@@ -126,6 +138,8 @@ mod tests {
             Microusd::from_usd(1.0),
             reservation,
             String::new(),
+            String::new(),
+            String::new(),
         );
         guard.complete();
 
@@ -148,6 +162,8 @@ mod tests {
                 usage,
                 fallback,
                 reservation,
+                String::new(),
+                String::new(),
                 String::new(),
             );
             // dropped here without complete()

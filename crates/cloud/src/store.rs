@@ -10,6 +10,8 @@ use std::sync::RwLock;
 
 use p256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokenfuse_core::agent_event::{EventType, Exporter as EventExporter};
 use tokenfuse_core::audit::{self, AuditEntry};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
@@ -619,6 +621,56 @@ pub struct Store {
     /// so `MAX_RUNS_PER_ORG` eviction never evicts a run that `/v1/alerts`
     /// would currently report (C5).
     alert_pct: f64,
+    /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
+    /// default; see `crate::main`'s wiring of `TOKENFUSE_EVENTS_PATH` and
+    /// [`Store::with_event_exporter`]. Emits the four P2 incident kinds
+    /// (`budget_exhausted`/`sustained_loop`/`spend_spike`/`fanout_explosion`)
+    /// from the SAME `fired` loop that already broadcasts `StreamEvent::Incident`
+    /// (see `ingest_at`) — this is the one place all four converge.
+    event_exporter: Arc<EventExporter>,
+}
+
+/// Map an `Incident.kind` string to the corresponding agent-event
+/// [`EventType`] — the four P2 incident kinds, verbatim (agent-passport
+/// SPEC.md §6.2). `None` for anything else (defensive: a future incident
+/// kind added here without updating this map is silently NOT exported,
+/// rather than panicking or guessing — see the `unknown_kind` test).
+fn agent_event_type_for_incident_kind(kind: &str) -> Option<EventType> {
+    match kind {
+        "budget_exhausted" => Some(EventType::BudgetExhausted),
+        "sustained_loop" => Some(EventType::SustainedLoop),
+        "spend_spike" => Some(EventType::SpendSpike),
+        "fanout_explosion" => Some(EventType::FanoutExplosion),
+        _ => None,
+    }
+}
+
+/// Log the outcome of an [`EventExporter::emit`] call (this crate has
+/// `tracing`; `tokenfuse-core` deliberately does not — mirrors
+/// `crate::events::log_outcome` in the gateway crate, which cannot be reused
+/// here directly since `cloud` and `gateway` are sibling crates).
+fn log_event_outcome(event_type: EventType, outcome: tokenfuse_core::agent_event::EmitOutcome) {
+    use tokenfuse_core::agent_event::EmitOutcome;
+    match outcome {
+        EmitOutcome::Disabled | EmitOutcome::Written => {}
+        EmitOutcome::SkippedNoAgentId { skipped_total } => {
+            tracing::warn!(
+                event = event_type.as_wire_str(),
+                skipped_total,
+                "agent-event skipped: incident has no attributed agent_id"
+            );
+        }
+        EmitOutcome::WriteError {
+            errors_total,
+            message,
+        } => {
+            tracing::warn!(
+                event = event_type.as_wire_str(),
+                errors_total,
+                "agent-event NDJSON write failed: {message}"
+            );
+        }
+    }
 }
 
 impl Default for Store {
@@ -653,7 +705,15 @@ impl Store {
             events,
             incident_cfg,
             alert_pct,
+            event_exporter: Arc::new(EventExporter::disabled()),
         }
+    }
+
+    /// Attach the agent-event NDJSON exporter. Chainable — call before
+    /// wrapping the store in an `Arc` (see `main.rs`).
+    pub fn with_event_exporter(mut self, event_exporter: Arc<EventExporter>) -> Self {
+        self.event_exporter = event_exporter;
+        self
     }
 
     /// Subscribe to live change events (per-org filtering is the caller's job).
@@ -983,6 +1043,29 @@ impl Store {
             });
         }
         for (_, inc) in fired {
+            // Agent-event NDJSON export (agent-passport SPEC.md §6): the four
+            // P2 incident kinds map 1:1 onto the taxonomy's existing entries
+            // (SPEC.md §6.2 — zero renaming). `inc.agent_id` is `None` for an
+            // unattributed run (`budget_exhausted`/`sustained_loop`) or an
+            // org-scoped incident (`spend_spike` is always unattributed) —
+            // those events are skipped (not fabricated) and counted by
+            // `Exporter::emit` itself; see `crate::events::log_outcome`-style
+            // handling below (this crate has `tracing` too).
+            if let Some(event_type) = agent_event_type_for_incident_kind(&inc.kind) {
+                let outcome = self.event_exporter.emit(
+                    event_type,
+                    inc.last_seen_millis,
+                    inc.agent_id.as_deref(),
+                    inc.run_id.as_deref(),
+                    None, // on_behalf_of: not tracked by the incident aggregator
+                    serde_json::json!({
+                        "org": inc.org,
+                        "occurrences": inc.occurrences,
+                    }),
+                    None, // prev_hash: see module doc / phase report
+                );
+                log_event_outcome(event_type, outcome);
+            }
             let _ = self.events.send(StreamEvent::Incident(inc));
         }
     }
@@ -3000,6 +3083,82 @@ mod tests {
         assert_eq!(fanouts.len(), 1, "same incident, not a duplicate");
         assert_eq!(fanouts[0].occurrences, 2);
         assert_eq!(fanouts[0].last_seen_millis, now + 1);
+    }
+
+    /// A tripped `fanout_explosion` incident (which always carries an
+    /// `agent_id` — see the detector above) is exported as an agent-event
+    /// NDJSON line when an exporter is attached (agent-passport SPEC.md §6).
+    #[test]
+    fn fanout_explosion_is_exported_as_an_agent_event() {
+        let dir = std::env::temp_dir().join(format!("tf-cloud-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+
+        let cfg = IncidentConfig {
+            fanout_runs: 2,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg).with_event_exporter(exporter);
+        let now = 1_000_000;
+        let fan = |agent: &str, run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.ingest_at(
+            "acme",
+            &[fan("agent://acme.example/orchestrator", "r1", now - 1)],
+            now,
+        );
+        s.ingest_at(
+            "acme",
+            &[fan("agent://acme.example/orchestrator", "r2", now)],
+            now,
+        );
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one fanout_explosion event");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.1");
+        assert_eq!(v["source"], "tokenfuse");
+        assert_eq!(v["type"], "fanout_explosion");
+        assert_eq!(v["severity"], "high");
+        assert_eq!(v["agent_id"], "agent://acme.example/orchestrator");
+        assert_eq!(v["data"]["org"], "acme");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `spend_spike` incident is always org-scoped with no attributed
+    /// agent (see the detector above) — it must be SKIPPED, not fabricated,
+    /// when exported (agent-passport SPEC.md §6.1 requires `agent_id`).
+    #[test]
+    fn spend_spike_has_no_agent_and_is_skipped_not_fabricated() {
+        let dir =
+            std::env::temp_dir().join(format!("tf-cloud-events-spike-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+
+        let cfg = IncidentConfig {
+            spend_per_min_micros: 1_000_000, // $1/min
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg).with_event_exporter(exporter.clone());
+        let now = 1_000_000;
+        s.ingest_at("acme", &[block_at("r1", "allow", 2_000_000, now)], now);
+        assert!(s.incidents("acme").iter().any(|i| i.kind == "spend_spike"));
+
+        // Nothing written — the incident has no agent_id to export.
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(contents, "", "spend_spike has no agent_id; must be skipped");
+        assert_eq!(exporter.skipped_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Distinct runs older than `fanout_window_ms` are pruned and don't count

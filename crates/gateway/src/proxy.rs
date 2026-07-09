@@ -18,6 +18,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokenfuse_core::agent_event::EventType;
 use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
@@ -33,6 +35,87 @@ struct CacheCtx {
 
 /// Default per-run budget when neither the request nor the policy sets one.
 const DEFAULT_RUN_BUDGET: Microusd = Microusd(5_000_000); // $5.00
+
+/// Sanity cap on the raw `X-Fuse-On-Behalf-Of` header (agent-passport
+/// SPEC.md §5): a chain deep enough to exceed this is almost certainly
+/// abuse/misconfiguration, not a real delegation chain. Over-cap does NOT
+/// reject the request or truncate the chain (SPEC.md §5: "Products MUST NOT
+/// truncate the chain when forwarding") — it ignores the header entirely, as
+/// if it were absent, and counts the occurrence (see `ON_BEHALF_OF_OVERCAP`).
+const ON_BEHALF_OF_MAX_BYTES: usize = 4096;
+
+/// Count of `X-Fuse-On-Behalf-Of` headers ignored for exceeding
+/// [`ON_BEHALF_OF_MAX_BYTES`]. There is no metrics registry in this crate
+/// yet, so this is the "metric" the task calls for — logged on every
+/// occurrence via `tracing::warn!` in [`on_behalf_of_header`] and readable in
+/// tests via the same counter.
+static ON_BEHALF_OF_OVERCAP: AtomicU64 = AtomicU64::new(0);
+
+/// Parse the raw `X-Fuse-On-Behalf-Of` header (agent-passport SPEC.md §5): a
+/// comma-separated, root-first delegation chain of opaque `agent://`/
+/// `user://` URIs. Capture-only this phase — entries are NOT validated,
+/// parsed into a structured chain, or truncated; the raw string rides into
+/// the trace verbatim (see `sink::CallRecord::on_behalf_of`). Returns `None`
+/// for an absent, empty, or over-cap header (fail-open: an over-cap header is
+/// ignored, never a request failure).
+fn on_behalf_of_header(headers: &HeaderMap) -> Option<String> {
+    let raw = header_str(headers, "x-fuse-on-behalf-of")?;
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.len() > ON_BEHALF_OF_MAX_BYTES {
+        let n = ON_BEHALF_OF_OVERCAP.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            len = raw.len(),
+            cap = ON_BEHALF_OF_MAX_BYTES,
+            overcap_total = n,
+            "x-fuse-on-behalf-of exceeds sanity cap; ignoring header"
+        );
+        return None;
+    }
+    Some(raw)
+}
+
+/// Split a captured `on_behalf_of` raw header value into the ordered,
+/// root-first chain the agent-event envelope's `on_behalf_of` array wants
+/// (agent-passport SPEC.md §6.1). Pure string splitting — entries are still
+/// opaque strings, not validated URIs (no enforcement semantics this phase).
+fn split_on_behalf_of(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Emit a `breaker_tripped` agent-event for a Breaker 402 (agent-passport
+/// SPEC.md §6.2). Separate from [`breaker_error_response`] so that function
+/// stays byte-for-byte untouched (its wire contract is pinned by
+/// `breaker_error_response_matches_budget_error_byte_for_byte`) — this is
+/// purely an added side-channel at each of the five call sites.
+fn emit_breaker_event(
+    st: &AppState,
+    run_id: &str,
+    agent_id: &str,
+    on_behalf_of: &[String],
+    verdict: &BreakerVerdict,
+) {
+    let outcome = st.events.emit(
+        EventType::BreakerTripped,
+        now_millis(),
+        Some(agent_id),
+        Some(run_id),
+        (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+        serde_json::json!({
+            "reason": verdict.reason.map(BreakerReason::as_wire_str),
+            "budget_usd": verdict.budget_usd,
+            "spent_usd": verdict.spent_usd,
+            "policy_id": verdict.policy_id,
+            "detail": verdict.detail,
+        }),
+        None,
+    );
+    crate::events::log_outcome(EventType::BreakerTripped, outcome);
+}
 
 pub async fn healthz() -> &'static str {
     "ok"
@@ -63,11 +146,24 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // A sub-agent's run rolls up into its parent's budget (hierarchical budgets).
     let parent = header_str(&headers, "x-fuse-parent-run-id");
     st.ledger.open_run(&run_id, budget, parent.as_deref()).await;
+    // Now also recorded on the trace (agent-passport SPEC.md §3.2) — before
+    // this it lived only in the ledger's in-memory hierarchy above.
+    let parent_run_id = parent.clone().unwrap_or_default();
 
     // Attribution only: which logical agent made this call. Request-scoped like
     // `model` — it rides along into every CallRecord and never touches the
     // ledger/budget. Defaults to "" when the header is absent.
     let agent_id = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+
+    // Delegation chain (agent-passport SPEC.md §5): captured raw for the
+    // trace, and split into an ordered list for agent-event envelopes. No
+    // enforcement semantics this phase — capture only.
+    let on_behalf_of_captured = on_behalf_of_header(&headers);
+    let on_behalf_of = on_behalf_of_captured.clone().unwrap_or_default();
+    let on_behalf_of_chain: Vec<String> = on_behalf_of_captured
+        .as_deref()
+        .map(split_on_behalf_of)
+        .unwrap_or_default();
 
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
@@ -90,6 +186,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             step,
             agent_id: agent_id.clone(),
             saved_microusd: 0,
+            parent_run_id: parent_run_id.clone(),
+            on_behalf_of: on_behalf_of.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -98,6 +196,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &st.policy_id,
             "run killed by operator",
         );
+        emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
         return breaker_error_response(&run_id, &verdict);
     }
 
@@ -127,7 +226,19 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         step,
                         agent_id: agent_id.clone(),
                         saved_microusd: 0,
+                        parent_run_id: parent_run_id.clone(),
+                        on_behalf_of: on_behalf_of.clone(),
                     });
+                    let outcome = st.events.emit(
+                        EventType::DlpBlock,
+                        now_millis(),
+                        Some(&agent_id),
+                        Some(&run_id),
+                        (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
+                        serde_json::json!({ "summary": summary }),
+                        None,
+                    );
+                    crate::events::log_outcome(EventType::DlpBlock, outcome);
                     return dlp_block(&run_id, &summary);
                 }
                 DlpMode::Mask => {
@@ -176,6 +287,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         // The only non-zero `saved_microusd` site: a served cache
                         // hit avoided this much real spend.
                         saved_microusd: hit.saved_microusd,
+                        parent_run_id: parent_run_id.clone(),
+                        on_behalf_of: on_behalf_of.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -223,6 +336,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 step: snapshot.steps + 1,
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
+                parent_run_id: parent_run_id.clone(),
+                on_behalf_of: on_behalf_of.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -231,6 +346,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 &eval.violated.clone().unwrap_or_default(),
             );
+            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
             return breaker_error_response(&run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
@@ -245,6 +361,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 step: snapshot.steps + 1,
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
+                parent_run_id: parent_run_id.clone(),
+                on_behalf_of: on_behalf_of.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -253,6 +371,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 reason,
             );
+            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -286,6 +405,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 step: snapshot.steps + 1,
                 agent_id: agent_id.clone(),
                 saved_microusd: 0,
+                parent_run_id: parent_run_id.clone(),
+                on_behalf_of: on_behalf_of.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -294,6 +415,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 "blocked by custom wasm policy",
             );
+            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -328,6 +450,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     step: snapshot.steps + 1,
                     agent_id: agent_id.clone(),
                     saved_microusd: 0,
+                    parent_run_id: parent_run_id.clone(),
+                    on_behalf_of: on_behalf_of.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -336,6 +460,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &st.policy_id,
                     &reason,
                 );
+                emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
                 return breaker_error_response(&run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
@@ -377,6 +502,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &parsed.model,
             &st,
             agent_id,
+            parent_run_id,
+            on_behalf_of,
         )
     } else {
         buffered_managed(
@@ -390,6 +517,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             cache_note,
             firewall_labels,
             &agent_id,
+            &parent_run_id,
+            &on_behalf_of,
+            &on_behalf_of_chain,
         )
         .await
     }
@@ -407,6 +537,8 @@ fn stream_managed(
     model: &str,
     st: &AppState,
     agent_id: String,
+    parent_run_id: String,
+    on_behalf_of: String,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -421,6 +553,8 @@ fn stream_managed(
         reservation.amount,
         reservation,
         agent_id,
+        parent_run_id,
+        on_behalf_of,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -476,6 +610,9 @@ async fn buffered_managed(
     cache_note: Option<String>,
     firewall_labels: Labels,
     agent_id: &str,
+    parent_run_id: &str,
+    on_behalf_of: &str,
+    on_behalf_of_chain: &[String],
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -516,6 +653,8 @@ async fn buffered_managed(
         step: reservation.step,
         agent_id: agent_id.to_string(),
         saved_microusd: 0,
+        parent_run_id: parent_run_id.to_string(),
+        on_behalf_of: on_behalf_of.to_string(),
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -543,7 +682,19 @@ async fn buffered_managed(
                     step: reservation.step,
                     agent_id: agent_id.to_string(),
                     saved_microusd: 0,
+                    parent_run_id: parent_run_id.to_string(),
+                    on_behalf_of: on_behalf_of.to_string(),
                 });
+                let outcome = st.events.emit(
+                    EventType::TaintBlock,
+                    now_millis(),
+                    Some(agent_id),
+                    Some(&reservation.run_id),
+                    (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
+                    serde_json::json!({ "reason": reason }),
+                    None,
+                );
+                crate::events::log_outcome(EventType::TaintBlock, outcome);
                 return firewall_block(&reservation.run_id, &reason);
             }
             firewall_note = Some(reason);
@@ -1296,6 +1447,8 @@ mod tests {
             None,
             "test-model",
             &st,
+            String::new(),
+            String::new(),
             String::new(),
         );
         {

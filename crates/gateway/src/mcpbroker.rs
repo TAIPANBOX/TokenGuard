@@ -23,6 +23,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use tokenfuse_core::agent_event::{EventType, Exporter as EventExporter};
 use tokenfuse_core::mcp::{self, Lock};
 use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
@@ -44,6 +45,10 @@ pub struct BrokerState {
     /// `tools/list` is a rug-pull. `None` disables the check.
     pub lock: Option<Lock>,
     pub client: reqwest::Client,
+    /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
+    /// default; see `crate::events::from_env`. `mcp_drift` is the only event
+    /// this broker emits — see [`process`].
+    pub events: Arc<EventExporter>,
 }
 
 pub fn app(state: Arc<BrokerState>) -> Router {
@@ -69,14 +74,32 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-/// HTTP handler — delegates to the transport-agnostic [`process`].
-async fn handle(State(st): State<Arc<BrokerState>>, Json(req): Json<Value>) -> Json<Value> {
-    Json(process(&st, req).await)
+/// HTTP handler — delegates to the transport-agnostic [`process`]. Extracts
+/// `X-Fuse-Agent-Id` (agent-passport SPEC.md §3.2) so a `mcp_drift` event
+/// raised for this request can carry the required `agent_id` (see
+/// `process`'s doc — without this header the event is skipped, not
+/// fabricated).
+async fn handle(
+    State(st): State<Arc<BrokerState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<Value>,
+) -> Json<Value> {
+    let agent_id = headers.get("x-fuse-agent-id").and_then(|v| v.to_str().ok());
+    Json(process(&st, req, agent_id).await)
 }
 
 /// Broker a single JSON-RPC request and return the response — shared by the HTTP
 /// and stdio transports. Injects secrets, scans, forwards, and redacts.
-pub async fn process(st: &BrokerState, mut req: Value) -> Value {
+///
+/// `agent_id`: the caller's `X-Fuse-Agent-Id`, when known — the HTTP
+/// transport ([`handle`]) reads it off the request headers; the stdio
+/// transport ([`run_stdio`]) has no per-message header channel and always
+/// passes `None`, so a stdio-transport rug-pull is detected and logged
+/// (`tracing::warn!`, unchanged) but its `mcp_drift` agent-event is skipped
+/// (agent-passport SPEC.md §6.1 requires `agent_id`; see
+/// `tokenfuse_core::agent_event::build`) and counted — a known, documented
+/// gap rather than a fabricated identity.
+pub async fn process(st: &BrokerState, mut req: Value, agent_id: Option<&str>) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
         .get("method")
@@ -159,6 +182,16 @@ pub async fn process(st: &BrokerState, mut req: Value) -> Value {
                 .collect();
             if !changed.is_empty() {
                 tracing::warn!(tools = ?changed, "mcp broker: rug-pull (tool definition changed)");
+                let outcome = st.events.emit(
+                    EventType::McpDrift,
+                    crate::sink::now_millis(),
+                    agent_id,
+                    None,
+                    None,
+                    json!({ "tools_changed": changed }),
+                    None,
+                );
+                crate::events::log_outcome(EventType::McpDrift, outcome);
                 if st.scan == ScanMode::Block {
                     return rpc_error(
                         &id,
@@ -222,7 +255,10 @@ pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
             continue;
         }
         let resp = match serde_json::from_str::<Value>(line) {
-            Ok(req) => process(&state, req).await,
+            // stdio has no per-message header channel, so no agent_id is
+            // available here — see `process`'s doc for what that means for
+            // `mcp_drift` on this transport.
+            Ok(req) => process(&state, req, None).await,
             Err(e) => rpc_error(&Value::Null, -32700, &format!("parse error: {e}")),
         };
         let mut buf = serde_json::to_vec(&resp).unwrap_or_default();

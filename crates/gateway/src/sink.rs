@@ -19,11 +19,13 @@ use datafusion::parquet::arrow::ArrowWriter;
 
 /// One settled call, the unit of the trace.
 ///
-/// Schema evolution note (P2): `agent_id` and `saved_microusd` were appended
-/// after the first files were written. New fields go at the END and the Parquet
-/// schema keeps a stable order (see [`ParquetSink::schema`]); old files simply
-/// lack the trailing columns and read back as defaults (see `sqlq`). Never
-/// reorder or remove a field — that breaks backward-compatible reads.
+/// Schema evolution note (P2 → P3/agent-passport): `agent_id` and
+/// `saved_microusd` were appended after the first files were written (P2);
+/// `parent_run_id` and `on_behalf_of` follow the exact same pattern (P3). New
+/// fields go at the END and the Parquet schema keeps a stable order (see
+/// [`ParquetSink::schema`]); old files simply lack the trailing columns and
+/// read back as defaults (see `sqlq`). Never reorder or remove a field — that
+/// breaks backward-compatible reads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
     pub ts_millis: i64,
@@ -41,6 +43,18 @@ pub struct CallRecord {
     /// Dollars a semantic-cache hit avoided (microdollars). Non-zero only on
     /// `cache_hit` rows; `0` on every other record.
     pub saved_microusd: i64,
+    /// The run's parent, from `X-Fuse-Parent-Run-Id` (agent-passport SPEC.md
+    /// §3.2 — TokenFuse's existing hierarchical-budget header, now also
+    /// recorded on the trace). `""` when the run has no parent. Before this
+    /// field, the value lived only in the ledger's in-memory hierarchy (see
+    /// `crate::proxy::messages`) and was never written to the trace.
+    pub parent_run_id: String,
+    /// Raw, unparsed value of `X-Fuse-On-Behalf-Of` (agent-passport SPEC.md
+    /// §5): a comma-separated, root-first delegation chain of `agent://`/
+    /// `user://` URIs. `""` when unset. Captured verbatim — this phase does
+    /// not validate, parse, or truncate entries; see `crate::proxy` for the
+    /// header's cap/ignore behavior.
+    pub on_behalf_of: String,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -116,6 +130,10 @@ impl ParquetSink {
             // written before/after the change stay mutually readable.
             Field::new("agent_id", DataType::Utf8, false),
             Field::new("saved_microusd", DataType::Int64, false),
+            // Appended P3 (agent-passport) columns — same rule: LAST, in this
+            // order. See [`CallRecord`]'s doc for what each carries.
+            Field::new("parent_run_id", DataType::Utf8, false),
+            Field::new("on_behalf_of", DataType::Utf8, false),
         ]))
     }
 
@@ -146,6 +164,11 @@ impl ParquetSink {
             Field::new("step", DataType::UInt32, false),
             Field::new("agent_id", DataType::Utf8, true),
             Field::new("saved_microusd", DataType::Int64, true),
+            // P3 (agent-passport): same schema-evolution treatment as the P2
+            // columns above — nullable here so an old (pre-P3) file's missing
+            // columns null-fill legally; queries `COALESCE` to `''`.
+            Field::new("parent_run_id", DataType::Utf8, true),
+            Field::new("on_behalf_of", DataType::Utf8, true),
         ]))
     }
 
@@ -192,6 +215,18 @@ impl ParquetSink {
                 )),
                 Arc::new(Int64Array::from(
                     records.iter().map(|r| r.saved_microusd).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.parent_run_id.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.on_behalf_of.clone())
+                        .collect::<Vec<_>>(),
                 )),
             ],
         )?;
@@ -255,6 +290,8 @@ mod tests {
             step: 1,
             agent_id: String::new(),
             saved_microusd: 0,
+            parent_run_id: String::new(),
+            on_behalf_of: String::new(),
         }
     }
 

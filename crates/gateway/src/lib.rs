@@ -7,6 +7,7 @@ pub mod cloudsink;
 pub mod compliancecli;
 pub mod embedder;
 pub mod estimate;
+pub mod events;
 pub mod firewall;
 pub mod focusexport;
 pub mod ledger_backend;
