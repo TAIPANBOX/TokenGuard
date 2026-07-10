@@ -162,6 +162,12 @@ Also worth knowing, in more detail under [What's inside](#-whats-inside): a sema
 
 ## ⚙️ How it works
 
+<div align="center">
+<img src="docs/assets/enforcement.png" alt="TokenFuse enforcement path: budget check, loop detector, and agent firewall gate every call in-line, with a Wardryx PDP call and CallRecords to Cloud" width="900">
+
+<sub>The money diagram: every call is priced and gated in-line, before it reaches the provider. Enforcement, not observability.</sub>
+</div>
+
 Every request flows through TokenFuse. It estimates the cost *before* the call, reserves it against the run's budget, forwards it only if it's safe, then reconciles the real cost from the streamed response.
 
 ```mermaid
@@ -236,6 +242,12 @@ TokenFuse is **complementary** to observability and gateways; many teams will ru
 ---
 
 ## 🧩 What's inside
+
+<div align="center">
+<img src="docs/assets/capability-packs.png" alt="TokenFuse capability packs: FinOps, Cache, Security, and Data, all on one shared Rust core, plus the optional Cloud and HA raft cluster" width="900">
+
+<sub>One shared core, enabled as config-gated capability packs.</sub>
+</div>
 
 Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
 
@@ -403,6 +415,12 @@ Its plan & wire protocol and the shared design system still live here: [docs/14]
 ---
 
 ## 🏗️ Architecture
+
+<div align="center">
+<img src="docs/assets/architecture.png" alt="TokenFuse architecture: the tokenfuse-gateway hot path, the dependency-minimal tokenfuse-core, the optional tokenfuse-cluster HA raft, and tokenfuse-cloud plus the Next.js dashboard" width="900">
+
+<sub>One Rust workspace: a hot-path gateway, a dependency-minimal core, an optional HA cluster, and the hosted Cloud.</sub>
+</div>
 
 One fast **Rust** binary in the request path, a **Rust** control plane for the Cloud, a **Next.js** dashboard. Telemetry lives in open **Parquet** files instead of a heavy database.
 
