@@ -1470,6 +1470,20 @@ mod tests {
     use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
     use tower::ServiceExt;
 
+    /// Test-only serialization lock for the shared `OUTCOME_OVERCAP` process
+    /// global (test-isolation only, not a production concern). `cargo test`
+    /// runs tests in parallel threads within one process, and every test
+    /// that pushes an over-cap `x-fuse-outcome` header through
+    /// `outcome_header` increments the same counter. Without this lock,
+    /// `outcome_header_over_cap_is_ignored_not_rejected`'s
+    /// before/increment/assert window can be interleaved by another test's
+    /// increment landing in between, making the observed delta more than 1
+    /// and the assert fail intermittently. Every test that reads or
+    /// increments `OUTCOME_OVERCAP` must hold this for its full body.
+    /// `unwrap_or_else(|e| e.into_inner())` (not `unwrap()`) so a panic in
+    /// one guarded test does not poison-cascade the rest into failing too.
+    static OVERCAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// An in-memory `EventSink` test double. Cheap to clone — the clone shares
     /// the same underlying buffer — so a handle can be kept in the test while
     /// the sink itself is moved into `AppState`.
@@ -1787,6 +1801,11 @@ mod tests {
 
     #[test]
     fn outcome_header_over_cap_is_ignored_not_rejected() {
+        // Serialize against every other test that increments OUTCOME_OVERCAP
+        // (a process-global static) so this before/increment/assert window
+        // can't observe another test's concurrent increment (test isolation
+        // only, see OVERCAP_TEST_LOCK doc comment above).
+        let _overcap_guard = OVERCAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = OUTCOME_OVERCAP.load(Ordering::Relaxed);
         let tag = "a".repeat(OUTCOME_MAX_BYTES + 1);
         let mut headers = HeaderMap::new();
@@ -1818,7 +1837,18 @@ mod tests {
     }
 
     #[tokio::test]
+    // `#[tokio::test]` gives each test its own single-threaded runtime and
+    // drives it with `block_on` (not `spawn`), so this guard is never handed
+    // to another thread or contended by another task while held: safe to
+    // hold across the `.await` below despite the lint.
+    #[allow(clippy::await_holding_lock)]
     async fn outcome_header_over_cap_is_dropped_not_recorded() {
+        // Same OUTCOME_OVERCAP race as
+        // `outcome_header_over_cap_is_ignored_not_rejected`: this test also
+        // drives the over-cap increment path (via the full request handler),
+        // so it must hold the same lock for its whole body to keep that
+        // test's before/after snapshot race-free.
+        let _overcap_guard = OVERCAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sink = RecordingSink::default();
         let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
         let req = Request::post("/v1/messages")
