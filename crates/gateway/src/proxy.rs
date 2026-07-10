@@ -17,7 +17,7 @@ use crate::state::AppState;
 use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{response::Builder, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -757,6 +757,36 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     }
 }
 
+/// Add `name: value` to `builder`, but only if `value` is representable as a
+/// legal HTTP header value (no CR, LF, or other control bytes). Some header
+/// values are built from client-controlled strings with no header-safety
+/// guarantee of their own: `x-fuse-router`'s value embeds the request
+/// body's `model` field verbatim (see `RouteDecision::header_value` in
+/// `router.rs`), so a request like `{"model":"foo\nbar"}` must never reach
+/// the `.expect("valid response")` at the end of a response-builder chain
+/// unguarded. Dropping the header on a malformed value is correct and
+/// lossless: every header this helper guards is purely informational,
+/// unlike the enforcement-path status/body/headers pinned by
+/// `breaker_error_response_matches_budget_error_byte_for_byte` (that path
+/// never calls this helper, see invariant #2 in CLAUDE.md).
+///
+/// Mirrors the `x-fuse-approval-id` guard added to `wardryx_hold_response`
+/// in PR #104 for the same panic class on the Wardryx PDP's echoed approval
+/// id: this generalizes that fix to the router header's vector, a
+/// client-supplied model name instead of a PDP response field.
+fn set_header_checked(builder: Builder, name: &'static str, value: &str) -> Builder {
+    match HeaderValue::from_str(value) {
+        Ok(v) => builder.header(name, v),
+        Err(_) => {
+            tracing::debug!(
+                header = name,
+                "dropping header value illegal for HTTP (client-controlled string contained a disallowed byte)"
+            );
+            builder
+        }
+    }
+}
+
 /// Streaming managed response: pass chunks through and settle at end-of-stream.
 /// Cost headers are omitted because headers are sent before the body — the
 /// settled figures go to the ledger (and, later, the event sink).
@@ -828,7 +858,7 @@ fn stream_managed(
         builder = builder.header("x-fuse-dlp", note);
     }
     if let Some(rh) = router_header {
-        builder = builder.header("x-fuse-router", rh);
+        builder = set_header_checked(builder, "x-fuse-router", &rh);
     }
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
@@ -1023,7 +1053,7 @@ async fn buffered_managed(
         builder = builder.header("x-fuse-dlp", note);
     }
     if let Some(rh) = router_header {
-        builder = builder.header("x-fuse-router", rh);
+        builder = set_header_checked(builder, "x-fuse-router", &rh);
     }
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
@@ -2311,5 +2341,47 @@ mod tests {
             "tools": [{ "name": "noop" }]
         });
         assert!(referenced_domains(&request).is_empty());
+    }
+
+    // --- set_header_checked ---
+
+    #[test]
+    fn set_header_checked_adds_a_legal_header_value() {
+        let builder = Response::builder().status(StatusCode::OK);
+        let builder = set_header_checked(
+            builder,
+            "x-fuse-router",
+            "claude-opus-4-5->claude-haiku-4-5",
+        );
+        let resp = builder.body(Body::empty()).expect("valid response");
+        assert_eq!(
+            resp.headers().get("x-fuse-router").unwrap(),
+            "claude-opus-4-5->claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn set_header_checked_drops_a_value_with_an_illegal_byte_instead_of_panicking() {
+        // A newline is illegal in an HTTP header value, so `HeaderValue::from_str`
+        // rejects it. The helper must fail open (skip the header) rather than let
+        // a malformed value reach `.expect("valid response")` downstream, where it
+        // would panic the request's task.
+        let builder = Response::builder().status(StatusCode::OK);
+        let builder = set_header_checked(
+            builder,
+            "x-fuse-router",
+            "claude-opus-4-5\nX-Injected: evil",
+        );
+        let resp = builder.body(Body::empty()).expect("valid response");
+        assert!(resp.headers().get("x-fuse-router").is_none());
+    }
+
+    #[test]
+    fn set_header_checked_drops_a_value_containing_a_carriage_return() {
+        // CR alone (not just CRLF) is also illegal in a header value.
+        let builder = Response::builder().status(StatusCode::OK);
+        let builder = set_header_checked(builder, "x-fuse-router", "foo\rbar");
+        let resp = builder.body(Body::empty()).expect("valid response");
+        assert!(resp.headers().get("x-fuse-router").is_none());
     }
 }
