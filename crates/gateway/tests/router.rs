@@ -410,3 +410,62 @@ async fn streaming_request_carries_the_router_header_too() {
     let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(captured_model(&captured).await, "claude-haiku-4-5");
 }
+
+#[tokio::test]
+async fn model_with_header_illegal_byte_drops_router_header_instead_of_panicking() {
+    // `x-fuse-router`'s value embeds the client-supplied `model` field
+    // verbatim (see `RouteDecision::header_value`). A model string
+    // containing a byte illegal in an HTTP header value (here, a newline via
+    // the JSON escape `\n`) must not panic the request's task when that
+    // value reaches the response builder's `.expect("valid response")` in
+    // `buffered_managed` -- it must simply drop the header and otherwise
+    // serve a completely normal response.
+    let captured = CapturedBody::default();
+    let sink = RecordingSink::default();
+    let st = state(RouterMode::On, captured.clone(), sink.clone());
+
+    let body = r#"{"model":"claude-opus-4-5\nX-Injected: evil","max_tokens":1000,"messages":[{"role":"user","content":"hi"}]}"#;
+    let req = request(body, "cheap");
+    let resp = tokenfuse_gateway::app(st).oneshot(req).await.unwrap();
+
+    // No panic: the request completes normally, with the fallback price
+    // making the malformed original model expensive enough that the router
+    // still finds a cheaper candidate and rewrites the body (the same
+    // `->` path as `on_mode_rewrites_the_forwarded_body_and_prices_the_chosen_model`).
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
+
+    // The router header is dropped rather than crashing the task -- the
+    // illegal byte lived in the *original* model name embedded in the
+    // `->` value, not in the rewritten one.
+    assert!(resp.headers().get("x-fuse-router").is_none());
+
+    // Everything else about the managed response is unaffected: the guard
+    // only touches this one header.
+    assert!(resp.headers().get("x-fuse-cost-usd").is_some());
+    assert_eq!(captured_model(&captured).await, "claude-haiku-4-5");
+}
+
+#[tokio::test]
+async fn streaming_model_with_header_illegal_byte_drops_router_header_instead_of_panicking() {
+    // Same vector as `model_with_header_illegal_byte_drops_router_header_instead_of_panicking`,
+    // but through `stream_managed`'s separate response-builder chain (the
+    // streaming path builds headers before the body, in a different
+    // function than the buffered path, and needed its own guarded call site).
+    let captured = CapturedBody::default();
+    let sink = RecordingSink::default();
+    let st = state(RouterMode::On, captured.clone(), sink.clone());
+
+    let body = r#"{"model":"claude-opus-4-5\nX-Injected: evil","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let req = request(body, "cheap");
+    let resp = tokenfuse_gateway::app(st).oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse-stream").unwrap(), "passthrough");
+    assert!(resp.headers().get("x-fuse-router").is_none());
+
+    // Draining the body proves the streaming settle path also completes
+    // without a panic.
+    let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(captured_model(&captured).await, "claude-haiku-4-5");
+}
