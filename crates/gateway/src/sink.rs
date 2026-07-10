@@ -116,17 +116,32 @@ pub struct ParquetSink {
     buffer: Mutex<Vec<CallRecord>>,
     threshold: usize,
     seq: AtomicU64,
+    /// Per-instance token woven into every segment filename. `seq` is
+    /// per-process and restarts at 0, and `File::create` truncates, so two
+    /// gateways sharing one `TOKENFUSE_DATA_DIR` (an HA cluster's nodes, or a
+    /// restarted process meeting the previous run's files) would otherwise
+    /// both write `calls-00000000.parquet` and clobber each other's trace. A
+    /// pid + start-nanos token makes each writer's segment names unique, so
+    /// concurrent processes and restarts never collide. Readers enumerate by
+    /// `.parquet` extension, not by exact name, so the wider name is
+    /// transparent to `focus-export` / `outcomes` / `sqlq`.
+    instance: String,
 }
 
 impl ParquetSink {
     pub fn new(dir: impl Into<PathBuf>, threshold: usize) -> std::io::Result<Self> {
         let dir = dir.into();
         create_dir_all(&dir)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Ok(ParquetSink {
             dir,
             buffer: Mutex::new(Vec::new()),
             threshold: threshold.max(1),
             seq: AtomicU64::new(0),
+            instance: format!("{:x}-{:x}", std::process::id(), nanos),
         })
     }
 
@@ -259,7 +274,9 @@ impl ParquetSink {
         )?;
 
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let path = self.dir.join(format!("calls-{seq:08}.parquet"));
+        let path = self
+            .dir
+            .join(format!("calls-{}-{seq:08}.parquet", self.instance));
         let file = File::create(path)?;
         let mut writer = ArrowWriter::try_new(file, schema, None)?;
         writer.write(&batch)?;
@@ -365,6 +382,49 @@ mod tests {
             })
             .count();
         assert_eq!(count, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression: two sinks sharing one dir (HA cluster nodes, or a restart
+    // meeting the previous run's files) must NOT clobber each other's segments.
+    // Before per-instance filenames both wrote calls-00000000.parquet and one
+    // truncated the other; this asserts both segments survive and are readable.
+    #[test]
+    fn two_sinks_sharing_a_dir_do_not_clobber() {
+        let dir = std::env::temp_dir().join(format!("tf-sink-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let a = ParquetSink::new(&dir, 1).unwrap();
+        let b = ParquetSink::new(&dir, 1).unwrap();
+        assert_ne!(a.instance, b.instance, "each sink gets a unique instance");
+        a.record(rec("run-a", 10));
+        b.record(rec("run-b", 20));
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| x == "parquet")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(files.len(), 2, "both sinks' segments survive");
+        // Every segment is an intact, self-contained Parquet file: the format
+        // brackets each file with the 4-byte `PAR1` magic. A clobbered /
+        // interleaved write would fail this. (A shared-name collision would
+        // also have left only one file, already caught by the count above.)
+        for f in &files {
+            let bytes = std::fs::read(f.path()).unwrap();
+            assert!(bytes.len() > 8, "segment is non-empty");
+            assert_eq!(&bytes[..4], b"PAR1", "starts with the parquet magic");
+            assert_eq!(
+                &bytes[bytes.len() - 4..],
+                b"PAR1",
+                "ends with the parquet magic"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

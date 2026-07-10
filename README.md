@@ -506,6 +506,46 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 ---
 
+## ⚙️ Wave-2 configuration (router, policy, incidents)
+
+Wave 2 added three opt-in integrations, each **off by default** and each a true no-op until you set its env var. Full design notes: [docs/19-wave2-governance.md](docs/19-wave2-governance.md).
+
+**Model router** (route each call to the cheapest model that still clears the task's quality tier):
+
+| Env var | Values / default | Meaning |
+|---|---|---|
+| `TOKENFUSE_ROUTER` | `off` (default) · `shadow` · `on` | `shadow` reports the route it would take without rewriting the request; `on` rewrites the model. |
+| `TOKENFUSE_ROUTER_RULES` | path to a JSON rules file (optional) | Task-class → required tier + candidate models. Unset, unreadable, or malformed falls open to the built-in defaults (logged). |
+
+Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). Response header `x-fuse-router` reports the decision: `<model>=kept`, `<from>-><to>` when a route was applied, or `would-<from>-><to>` in shadow mode. Router savings are booked as their own dimension, separate from cache savings.
+
+**Wardryx policy hook** (a PEP calling an external [Wardryx](https://github.com/TAIPANBOX/wardryx) PDP for allow / deny / hold decisions):
+
+| Env var | Values / default | Meaning |
+|---|---|---|
+| `TOKENFUSE_WARDRYX_URL` | URL (unset ⇒ hook off) | The PDP's `/v1/decide` base URL. Unset forces `off` regardless of mode. |
+| `TOKENFUSE_WARDRYX_MODE` | `off` (default) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
+| `TOKENFUSE_WARDRYX_FAILMODE` | `open` (default) · `closed` | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. |
+| `TOKENFUSE_WARDRYX_KEY` | bearer token (optional) | Sent to the PDP. |
+| `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout. |
+| `TOKENFUSE_WARDRYX_CACHE_TTL_MS` | default `3000` (`0` disables) | Short-TTL decision cache; only decisions the PDP marks `cacheable` are ever cached (a `hold` never is). |
+
+A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with `x-fuse-wardryx: hold` plus `x-fuse-approval-id`; obtain an approval out of band, then resubmit the identical request carrying `x-fuse-approval-token`.
+
+**Cloud incident thresholds** (`tokenfuse-cloud`; the gateway itself needs none of these):
+
+| Env var | Default | Trips when |
+|---|---|---|
+| `TOKENFUSE_CLOUD_REPLAY_EVENTS` | unset | Path to an agent-event NDJSON file the control plane reads (never writes) to reconstruct a run for `/v1/replay/{run}`. Unset ⇒ replay reports `configured:false`. |
+| `TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS` | `3` | A run hits ≥ this many budget-protection blocks (`budget_exhausted`). |
+| `TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS` | `3` | ≥ this many `loop_detected` decisions for one run (`sustained_loop`). |
+| `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD` | `5.0` | An org's last-minute burn reaches this rate (`spend_spike`). |
+| `TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS` | `20` | One `agent_id` drives ≥ this many distinct runs in the window (`fanout_explosion`). |
+
+**Trace + unit-economics** (already present, documented here for completeness): set `TOKENFUSE_DATA_DIR` to write Parquet trace segments (read back by `focus-export` / `outcomes` / `sql`). Request header `x-fuse-outcome` tags a call's result with an **opaque** string, captured verbatim and never validated against a fixed vocabulary; the illustrative values TokenFuse and [Verdryx](https://github.com/TAIPANBOX/verdryx) both use are `case_resolved`, `escalated`, `abandoned`.
+
+---
+
 ## 📚 Documentation
 
 | Document | What's inside |
