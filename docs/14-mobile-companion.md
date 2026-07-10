@@ -5,7 +5,7 @@
 > This document is the original plan and wire protocol; paths like `mobile/ios/…`
 > below are now `ios/…` in that repo.
 
-**Status:** built — iPhone app + Apple Watch app (see the app repo) · **Written:** 2026-07-03 (architecture session)
+**Status:** built: iPhone app + Apple Watch app (see the app repo) · **Written:** 2026-07-03 (architecture session) · **Updated:** 2026-07-10 (app brought to parity with the current control plane: FinOps savings and per-agent spend, an incidents feed with a signed acknowledge, and read-only governance surfaces for compliance evidence, the audit trail, and replay; `openapi.json` regenerated from the live contract)
 **Supersedes:** the "Go — Cloud control plane" decision in [02-architecture.md](02-architecture.md)
 (see ADR-14.1 below).
 
@@ -153,9 +153,10 @@ crypto layer must be a protocol (`SigningKey`) with two impls: `EnclaveKey`
 
 ### 4.4 New read endpoints
 
-- `GET /v1/stream` (SSE, viewer): events `run_update`, `alert`, `kill`,
-  heartbeat every 25 s. Replaces polling in the app; dashboard/TUI may adopt
-  later.
+- `GET /v1/stream` (SSE, viewer): events `run_update`, `kill`, `budget`,
+  `incident`, heartbeat (`ping`) every 25 s. Intended to replace polling.
+  Shipped on the server; the current app still polls the reads, and adopting
+  SSE on the client is a pending follow-up (not in the OpenAPI, by design).
 - `GET /v1/series?run=…|org&window=1h|24h&step=60s` (viewer): burn-rate
   buckets `[{t, cost_microusd, calls, blocked}]` aggregated from the durable
   store. Feeds Swift Charts.
@@ -235,9 +236,14 @@ Phase B exit: internal TestFlight build.
 
 ## 8. Deferred (explicitly out of MVP)
 
-v1.1: watchOS target (complication + kill), App Intents (Siri / Action Button),
-interactive widgets, approve/deny inbox (**requires a gateway pause-run
-mechanism — separate design doc before implementation**), incident history.
+v1.1: App Intents (Siri / Action Button), interactive widgets. **Shipped since
+this plan:** the watchOS target (complication + kill), the **incident history**
+(now the Incidents tab, with a signed acknowledge), and read-only governance
+(compliance evidence, audit trail, replay). **Still deferred: the approve/deny
+inbox**: Wardryx `hold` is stateless server-side (the caller obtains approval
+out-of-band and resubmits with `x-fuse-approval-token`); there is no
+`/v1/approvals` endpoint for a phone to act on, so this needs a gateway
+pause-run mechanism and its own design doc before any app work.
 v2: on-device incident explain (Foundation Models framework) + opt-in Claude
 API deep analysis with Engram-backed incident memory server-side; Agent
 Inventory screen (Idryx-style NHI model for agents/keys/MCP servers); App
