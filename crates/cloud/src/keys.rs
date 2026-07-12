@@ -2,6 +2,13 @@
 //! defaulting to `admin` (`viewer` can read but not mutate) and the plan
 //! defaulting to `Paid` (full access). Ported from the Go plane's `parseKeys`,
 //! extended with a plan tier for the P2 entitlements gate.
+//!
+//! **Fails closed by default.** An unset/empty/all-malformed spec yields an
+//! *empty* map: every request then gets `401`, nobody authenticates. The
+//! insecure `devkey → default/admin/paid` convenience credential exists only
+//! for local dev and is inserted **only** when the caller explicitly opts in
+//! (see [`parse_keys`]'s `allow_devkey` parameter). It is never a silent
+//! default. See `TOKENFUSE_CLOUD_ALLOW_DEVKEY` in `main.rs`.
 
 use std::collections::HashMap;
 
@@ -47,10 +54,18 @@ pub struct Principal {
 /// skipped. Segments are positional: the 3rd is the role (default `admin`) and
 /// the **4th is the plan** (`free` | `paid`, default `paid`) — so 3-segment
 /// `key:org:role` specs parse exactly as before and only gain a plan when a
-/// 4th segment is present. With no valid entries, a single dev key
-/// `devkey → default/admin/paid` is returned so the plane is usable out of the
-/// box.
-pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
+/// 4th segment is present.
+///
+/// With no valid entries, this **fails closed**: an empty map is returned, so
+/// every request gets `401` (nobody authenticates) instead of silently
+/// granting admin. Passing `allow_devkey = true` opts into the old
+/// dev-convenience fallback instead: a single `devkey → default/admin/paid`
+/// entry, so a local/demo deployment is usable without minting a real key.
+/// Callers must only ever set `allow_devkey` from an explicit operator opt-in
+/// (an env var, a CLI flag), never as a silent default: an empty
+/// `TOKENFUSE_CLOUD_KEYS` in production must not quietly authenticate anyone
+/// who sends `Authorization: Bearer devkey` as an admin.
+pub fn parse_keys(spec: &str, allow_devkey: bool) -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     for pair in spec.split(',') {
         let pair = pair.trim();
@@ -81,7 +96,7 @@ pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
             },
         );
     }
-    if keys.is_empty() {
+    if keys.is_empty() && allow_devkey {
         keys.insert(
             "devkey".to_string(),
             Principal {
@@ -100,7 +115,7 @@ mod tests {
 
     #[test]
     fn parses_org_and_role() {
-        let k = parse_keys("a:acme,b:globex:viewer");
+        let k = parse_keys("a:acme,b:globex:viewer", false);
         assert_eq!(
             k["a"],
             Principal {
@@ -121,7 +136,7 @@ mod tests {
 
     #[test]
     fn plan_defaults_to_paid_when_absent() {
-        let k = parse_keys("a:acme,b:globex:viewer");
+        let k = parse_keys("a:acme,b:globex:viewer", false);
         // No plan segment on either → full (paid) access, so existing
         // deployments are never gated.
         assert_eq!(k["a"].plan, Plan::Paid);
@@ -130,7 +145,7 @@ mod tests {
 
     #[test]
     fn explicit_free_downgrades_plan() {
-        let k = parse_keys("a:acme:admin:free");
+        let k = parse_keys("a:acme:admin:free", false);
         assert_eq!(
             k["a"],
             Principal {
@@ -143,7 +158,7 @@ mod tests {
 
     #[test]
     fn plan_segment_is_case_insensitive() {
-        let k = parse_keys("a:acme:admin:FREE,b:globex:viewer:Paid");
+        let k = parse_keys("a:acme:admin:FREE,b:globex:viewer:Paid", false);
         assert_eq!(k["a"].plan, Plan::Free);
         assert_eq!(k["b"].plan, Plan::Paid);
         assert_eq!(k["b"].role, "viewer");
@@ -152,23 +167,60 @@ mod tests {
     #[test]
     fn unknown_plan_segment_fails_open_to_paid() {
         // A typo'd/unknown plan must never silently lock an org out.
-        let k = parse_keys("a:acme:admin:bogus");
+        let k = parse_keys("a:acme:admin:bogus", false);
         assert_eq!(k["a"].plan, Plan::Paid);
     }
 
     #[test]
-    fn empty_spec_yields_dev_key() {
-        let k = parse_keys("");
+    fn skips_malformed_entries() {
+        let k = parse_keys("nokey, :noorg , good:org", false);
+        assert_eq!(k.len(), 1);
+        assert!(k.contains_key("good"));
+    }
+
+    // -- devkey fallback: fails closed unless explicitly opted in ----------
+
+    #[test]
+    fn empty_spec_fails_closed_without_opt_in() {
+        // The security-critical case: an unset/empty TOKENFUSE_CLOUD_KEYS
+        // must NOT silently grant a hardcoded admin credential. With
+        // allow_devkey=false the map must be empty, so every request gets
+        // 401 (nobody authenticates).
+        let k = parse_keys("", false);
+        assert!(
+            k.is_empty(),
+            "expected no keys when devkey is not explicitly allowed, got {k:?}"
+        );
+        assert!(!k.contains_key("devkey"));
+    }
+
+    #[test]
+    fn all_malformed_spec_fails_closed_without_opt_in() {
+        // Same fail-closed guarantee when every entry is malformed (missing
+        // key or org) rather than the spec being literally empty.
+        let k = parse_keys("nokey, :noorg ,   ", false);
+        assert!(k.is_empty());
+    }
+
+    #[test]
+    fn empty_spec_with_explicit_opt_in_yields_dev_key() {
+        // Only when the caller explicitly opts in does the dev fallback
+        // appear.
+        let k = parse_keys("", true);
+        assert_eq!(k.len(), 1);
         assert_eq!(k["devkey"].org, "default");
         assert_eq!(k["devkey"].role, "admin");
-        // The dev fallback keeps full access out of the box.
         assert_eq!(k["devkey"].plan, Plan::Paid);
     }
 
     #[test]
-    fn skips_malformed_entries() {
-        let k = parse_keys("nokey, :noorg , good:org");
+    fn normal_spec_unaffected_by_allow_devkey_flag() {
+        // A real, non-empty spec parses identically regardless of
+        // allow_devkey: the flag must only ever affect the empty case, and
+        // must never inject an extra "devkey" entry alongside real keys.
+        let k = parse_keys("a:acme", true);
         assert_eq!(k.len(), 1);
-        assert!(k.contains_key("good"));
+        assert!(!k.contains_key("devkey"));
+        assert_eq!(k["a"].org, "acme");
     }
 }

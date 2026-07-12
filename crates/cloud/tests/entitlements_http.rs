@@ -15,7 +15,9 @@ use tokenfuse_cloud::{app, parse_keys, AppState, Store};
 /// `freekey` → org `free-co` explicitly `:free`; `paidkey` → org `acme` with no
 /// plan segment (defaults to Paid, exactly like every pre-entitlements key).
 fn test_state() -> AppState {
-    let keys = parse_keys("freekey:free-co:admin:free,paidkey:acme:admin");
+    // allow_devkey=false: this spec has real entries, so the fallback is
+    // never consulted either way, passed false to make that explicit.
+    let keys = parse_keys("freekey:free-co:admin:free,paidkey:acme:admin", false);
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)
 }
 
@@ -125,7 +127,10 @@ async fn paid_key_is_served_normally() {
 /// downgrade a paid key's access (and vice versa).
 #[tokio::test]
 async fn plan_gate_keys_off_the_calling_principal_not_a_sibling_key() {
-    let keys = parse_keys("freekey:mixed-co:admin:free,paidkey:mixed-co:admin:paid");
+    let keys = parse_keys(
+        "freekey:mixed-co:admin:free,paidkey:mixed-co:admin:paid",
+        false,
+    );
     let state = AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8);
 
     // The paid key on this org is served normally...

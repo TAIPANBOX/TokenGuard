@@ -47,11 +47,17 @@ backend (Postgres/ClickHouse) for scale + retention is a drop-in behind the same
 `Store` methods.
 
 **Auth + RBAC.** Org API keys come from
-`TOKENFUSE_CLOUD_KEYS="key:org[:role],…"` (dev default: `devkey`). The optional
-role is `admin` (default) or `viewer`. Reads (`/v1/runs`, `/v1/summary`,
-`/v1/kills`, `/v1/budgets`, `/v1/alerts`, ingest) work for any valid key of the
-org; **mutations** (`POST …/kill`, `POST …/budget`) require `admin` — a viewer
-key gets `403`. A missing/unknown key gets `401`. Keys never cross orgs.
+`TOKENFUSE_CLOUD_KEYS="key:org[:role][:plan],…"`. The optional role is `admin`
+(default) or `viewer`. Reads (`/v1/runs`, `/v1/summary`, `/v1/kills`,
+`/v1/budgets`, `/v1/alerts`, ingest) work for any valid key of the org;
+**mutations** (`POST …/kill`, `POST …/budget`) require `admin`: a viewer key
+gets `403`. A missing/unknown key gets `401`. Keys never cross orgs.
+
+**Fails closed when unconfigured.** If `TOKENFUSE_CLOUD_KEYS` is unset, empty,
+or every entry is malformed, the control plane starts with **no valid keys**,
+so every request gets `401`. It does **not** fall back to a default credential.
+For local dev/demo only, set `TOKENFUSE_CLOUD_ALLOW_DEVKEY=1` to opt into a
+single insecure `devkey → default/admin` key; never set that in production.
 
 - **`GET /v1/alerts`** — runs that have spent ≥ a fraction of their central
   budget. Threshold defaults to `0.8`, overridable per-deploy with

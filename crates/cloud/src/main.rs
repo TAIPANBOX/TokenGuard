@@ -29,8 +29,36 @@ async fn main() {
         .init();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let keys = parse_keys(&std::env::var("TOKENFUSE_CLOUD_KEYS").unwrap_or_default());
+
+    // Auth keys. Fails CLOSED by default: an unset/empty/all-malformed
+    // TOKENFUSE_CLOUD_KEYS yields an EMPTY key map (every request gets `401`,
+    // nobody authenticates), rather than silently granting the hardcoded
+    // `devkey` admin credential. That dev-convenience fallback exists only
+    // for local/demo use and requires an explicit operator opt-in via
+    // TOKENFUSE_CLOUD_ALLOW_DEVKEY=1 (see keys::parse_keys and
+    // docs/13-security-hardening.md).
+    let keys_spec = std::env::var("TOKENFUSE_CLOUD_KEYS").unwrap_or_default();
+    let allow_devkey = env_flag("TOKENFUSE_CLOUD_ALLOW_DEVKEY");
+    let keys = parse_keys(&keys_spec, allow_devkey);
     let key_count = keys.len();
+    if key_count == 0 {
+        tracing::error!(
+            "no valid TOKENFUSE_CLOUD_KEYS configured and TOKENFUSE_CLOUD_ALLOW_DEVKEY not set: \
+             the control plane will authenticate no one (every request gets 401). Set \
+             TOKENFUSE_CLOUD_KEYS to a real key spec, or TOKENFUSE_CLOUD_ALLOW_DEVKEY=1 for \
+             local dev only"
+        );
+    } else if allow_devkey && parse_keys(&keys_spec, false).is_empty() {
+        // The insecure fallback only actually fired when the spec itself had
+        // no valid entries: this check (re-parsed with the flag forced off)
+        // distinguishes that from an operator who happens to have a real key
+        // literally named "devkey" configured alongside the opt-in flag.
+        tracing::warn!(
+            "TOKENFUSE_CLOUD_ALLOW_DEVKEY is set and TOKENFUSE_CLOUD_KEYS has no valid entries: \
+             the insecure `devkey` credential (org=default, role=admin) is ACTIVE. This must \
+             never be used outside local dev"
+        );
+    }
 
     let alert_pct = std::env::var("TOKENFUSE_CLOUD_ALERT_PCT")
         .ok()
@@ -153,6 +181,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// Truthy env-var opt-in check: only `"1"` or `"true"` (case-insensitive)
+/// count. Unset, empty, `"0"`, `"false"`, or a typo all fail closed (`false`):
+/// a malformed opt-in must never silently enable the insecure `devkey`
+/// fallback.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
 }
 
 /// The APNs sender, if the `apns` feature is built and the environment is
