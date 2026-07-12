@@ -122,10 +122,10 @@ build)`, `cloud apns (feature build)`.
   link failures recur, bump the `Swatinem/rust-cache` `prefix-key` (currently
   `v1`, bumped 2026-07-09 after a poisoned-cache SIGBUS) to force a fresh
   cache namespace.
-- `core.fileMode` is already set to `false` in this repo's git config — don't
+- `core.fileMode` is already set to `false` in this repo's git config, don't
   re-set it or chase phantom mode-only diffs.
-- **Docs are numbered 01–18** (`docs/`); new design docs continue the
-  sequence (next is 19). `docs/09-product-strategy.md` is the one to read
+- **Docs are numbered 01-19** (`docs/`); new design docs continue the
+  sequence (next is 20). `docs/09-product-strategy.md` is the one to read
   before touching product framing or positioning.
 
 ## Model escalation — tell the user, don't just push through
