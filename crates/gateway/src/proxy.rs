@@ -1323,12 +1323,36 @@ fn cache_eligible(request: &serde_json::Value) -> bool {
 }
 
 /// The system prompt text (Anthropic `system` field), for the partition key.
+/// Handles both shapes Anthropic's API accepts: a plain string, and an array
+/// of content blocks (the shape used with `cache_control` for prompt
+/// caching, e.g. `[{"type":"text","text":"..."}]`). Two requests with
+/// different array-shaped system prompts must produce different output here
+/// -- otherwise they'd land in the same cache partition and one tenant/agent
+/// could be served another's response generated under a different system
+/// prompt, violating the hard-partition guarantee documented on
+/// `SemanticCache::partition_key` (crates/core/src/cache.rs).
 fn system_text(request: &serde_json::Value) -> String {
-    request
-        .get("system")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string()
+    match request.get("system") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => concat_text_blocks(blocks),
+        _ => String::new(),
+    }
+}
+
+/// Concatenates the `text` field of each text-shaped content block in an
+/// Anthropic content-block array (e.g. `[{"type":"text","text":"..."}]`),
+/// space-separated and trimmed. Shared by `system_text` (the `system`
+/// field) and `semantic_core` (a message's `content` field) -- both accept
+/// this same array shape from the Anthropic API.
+fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
+    let mut buf = String::new();
+    for b in blocks {
+        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+            buf.push_str(t);
+            buf.push(' ');
+        }
+    }
+    buf.trim().to_string()
 }
 
 /// A stable string for the tools schema, for the partition key.
@@ -1421,16 +1445,7 @@ fn semantic_core(request: &serde_json::Value) -> String {
             }
             match msg.get("content") {
                 Some(serde_json::Value::String(s)) => text = s.clone(),
-                Some(serde_json::Value::Array(blocks)) => {
-                    let mut buf = String::new();
-                    for b in blocks {
-                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            buf.push_str(t);
-                            buf.push(' ');
-                        }
-                    }
-                    text = buf.trim().to_string();
-                }
+                Some(serde_json::Value::Array(blocks)) => text = concat_text_blocks(blocks),
                 _ => {}
             }
             break;
@@ -2371,6 +2386,84 @@ mod tests {
             "tools": [{ "name": "noop" }]
         });
         assert!(referenced_domains(&request).is_empty());
+    }
+
+    // --- system_text (semantic cache partition key) ---
+
+    #[test]
+    fn system_text_extracts_a_plain_string() {
+        let request = serde_json::json!({ "system": "You are a helpful assistant." });
+        assert_eq!(system_text(&request), "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn system_text_extracts_an_array_shaped_system_prompt() {
+        // Anthropic's API also accepts `system` as an array of content
+        // blocks (the shape used with `cache_control` for prompt caching).
+        // This must not collapse to "" the way it used to -- see
+        // `system_text_different_array_systems_land_in_different_partitions`
+        // for why that was a cross-tenant isolation bug.
+        let request = serde_json::json!({
+            "system": [{"type": "text", "text": "prompt A"}]
+        });
+        assert_eq!(system_text(&request), "prompt A");
+    }
+
+    #[test]
+    fn system_text_concatenates_multiple_text_blocks() {
+        let request = serde_json::json!({
+            "system": [
+                {"type": "text", "text": "block one"},
+                {"type": "text", "text": "block two"}
+            ]
+        });
+        assert_eq!(system_text(&request), "block one block two");
+    }
+
+    #[test]
+    fn system_text_array_and_string_shapes_of_the_same_prompt_agree() {
+        // The same prompt text, encoded either way, must land in the same
+        // partition -- a client switching to the array shape (e.g. to add
+        // `cache_control`) must not silently fragment its cache.
+        let string_shaped = serde_json::json!({ "system": "X" });
+        let array_shaped = serde_json::json!({ "system": [{"type": "text", "text": "X"}] });
+        assert_eq!(system_text(&string_shaped), system_text(&array_shaped));
+    }
+
+    #[test]
+    fn system_text_is_empty_when_system_field_is_absent() {
+        let request = serde_json::json!({ "model": "m" });
+        assert_eq!(system_text(&request), "");
+    }
+
+    #[test]
+    fn system_text_different_array_systems_land_in_different_partitions() {
+        // The core regression: two requests with DIFFERENT array-shaped
+        // `system` fields must never collapse to the same partition key --
+        // that would let one tenant/agent be served another's cached
+        // response generated under a different system prompt, violating
+        // the cache's hard-partition guarantee (crates/core/src/cache.rs
+        // doc: "Similarity is only compared within an identical (model,
+        // system prompt, tools, task_type, tenant) partition").
+        let request_a = serde_json::json!({
+            "system": [{"type": "text", "text": "prompt A"}]
+        });
+        let request_b = serde_json::json!({
+            "system": [{"type": "text", "text": "prompt B"}]
+        });
+        let text_a = system_text(&request_a);
+        let text_b = system_text(&request_b);
+        assert_ne!(
+            text_a, text_b,
+            "different array-shaped system prompts must produce different system_text"
+        );
+
+        let partition_a = SemanticCache::partition_key("m", &text_a, "", "qa", "default");
+        let partition_b = SemanticCache::partition_key("m", &text_b, "", "qa", "default");
+        assert_ne!(
+            partition_a, partition_b,
+            "different array-shaped system prompts must land in different cache partitions"
+        );
     }
 
     // --- set_header_checked ---
