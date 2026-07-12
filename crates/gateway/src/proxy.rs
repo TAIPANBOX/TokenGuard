@@ -360,6 +360,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &system_text(&request),
             &tools_text(&request),
             &task_type,
+            // Fixed single-tenant value: this gateway process serves one
+            // tenant/deployment today, so there is no per-request tenant id
+            // to pass here yet. See docs/06-semantic-cache.md ("Current
+            // implementation note") before wiring a real tenant id in for a
+            // shared/hosted multi-tenant gateway mode.
             "default",
         );
         if let Some(hit) = st.cache.get(partition, &core, now_millis()) {
@@ -689,7 +694,42 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 return breaker_error_response(&run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
-                st.ledger.reserve_unchecked(&run_id, estimate).await
+                // Unreachable today on both backends: the in-process ledger's
+                // `open_run` (above, before this match) always registers
+                // this exact `run_id` before `reserve` runs, and the raft
+                // backend's `reserve` never returns `UnknownRun` at all (an
+                // unknown/rejected run folds into `BudgetError::Exceeded`
+                // there instead; see `RaftLedger::reserve` in
+                // `raft_ledger.rs`). Kept explicit rather than deleted so a
+                // future backend change can't quietly reopen this as a
+                // budget-check bypass: fail CLOSED (deny) here, not the
+                // `reserve_unchecked` bypass this arm used to call.
+                st.sink.record(CallRecord {
+                    ts_millis: now_millis(),
+                    run_id: run_id.clone(),
+                    model: parsed.model.clone(),
+                    decision: "budget_exceeded".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microusd: estimate.0,
+                    step: snapshot.steps + 1,
+                    agent_id: agent_id.clone(),
+                    saved_microusd: 0,
+                    parent_run_id: parent_run_id.clone(),
+                    on_behalf_of: on_behalf_of.clone(),
+                    outcome: outcome_tag.clone(),
+                });
+                let verdict = budget_verdict(
+                    BreakerReason::BudgetExceeded,
+                    Microusd::ZERO,
+                    Microusd::ZERO,
+                    &st.policy_id,
+                    &format!(
+                        "run '{run_id}' has no ledger reservation; denying instead of bypassing the budget check"
+                    ),
+                );
+                emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+                return breaker_error_response(&run_id, &verdict);
             }
         },
         Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate).await,

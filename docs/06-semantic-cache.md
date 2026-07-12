@@ -19,7 +19,9 @@ Key = [hard part, exact match]
          embedding(semantic core of the request)
 ```
 
-Semantic core = the last user message + task instruction (excluding retrieval context, ≤512 tokens). The partition always includes tenant_id; optionally user_id.
+Semantic core = the last user message + task instruction (excluding retrieval context, ≤512 tokens). The partition always includes a tenant slot; optionally user_id.
+
+**Current implementation note (2026-07-12):** the shipped gateway is single-tenant per process today (one gateway deployment serves one tenant), so the `tenant_id` slot above is not yet wired to a real per-request identity. `crates/gateway/src/proxy.rs` calls `SemanticCache::partition_key` with a fixed literal `"default"` in the tenant slot for every request that process handles. That is not a cross-tenant leak in the shipped topology, since a single process never serves more than one tenant. It is, however, a landmine for the future: before any shared/hosted multi-tenant gateway mode ships (one process serving multiple tenants), a real per-request tenant id MUST be threaded from the request into `partition_key`, or requests from different tenants sharing that process would land in the same cache partition.
 
 ## A.3. Thresholds + guard rails
 
