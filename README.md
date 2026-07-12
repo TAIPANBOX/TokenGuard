@@ -249,7 +249,7 @@ TokenFuse is **complementary** to observability and gateways; many teams will ru
 <sub>One shared core, enabled as config-gated capability packs.</sub>
 </div>
 
-Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests).
+Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v0.3.0** release versus landed on `main` since.
 
 <div align="center">
 
@@ -277,6 +277,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 **Ops & platform**
 - 🧬 **HA raft cluster**: replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
+- 📋 **Compliance evidence pack + audit trail**: `tokenfuse compliance` (CLI, free) and the Cloud `/v1/compliance` / `/v1/compliance/evidence` endpoints project real decision, incident, and MCP-scan evidence onto EU AI Act, US Fed SR 11-7, and SOC 2 controls, each graded `enforced` / `partial` / `documented` rather than over-claimed (a green catalog is not a certification). Every control-plane mutation (kill, budget change, device pairing, incident ack) lands in a hash-chained, ES256-signed audit trail (`/v1/audit`, `/v1/audit/verify`, `/v1/audit/manifest`).
 - 📱 **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
 - 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export; a separate opt-in NDJSON event stream sits alongside it (next bullet).
 - 📨 **Agent-event NDJSON export** *(opt-in)*: set `TOKENFUSE_EVENTS_PATH=<file>` and every breaker trip, DLP/taint block, and MCP rug-pull is appended as one NDJSON line in the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) event envelope (`taipanbox.dev/agent-event/v0.1`). Unset by default: zero hot-path cost, no file handle opened. Writes are fail-open (a write error is logged, never a request failure), and an event with no `x-fuse-agent-id` on the request is skipped and counted, never fabricated.
@@ -562,6 +563,8 @@ A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with 
 | `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD` | `5.0` | An org's last-minute burn reaches this rate (`spend_spike`). |
 | `TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS` | `20` | One `agent_id` drives ≥ this many distinct runs in the window (`fanout_explosion`). |
 
+Shipped in the same change as replay: the Cloud **regulator evidence pack** (`/v1/compliance/evidence`: EU AI Act / SR 11-7 / SOC 2 sections, each control graded from this org's live decision + incident data, not the replay file itself). Full picture, including the hash-chained audit trail and the free CLI: [What's inside](#-whats-inside).
+
 **Trace + unit-economics** (already present, documented here for completeness): set `TOKENFUSE_DATA_DIR` to write Parquet trace segments (read back by `focus-export` / `outcomes` / `sql`). Request header `x-fuse-outcome` tags a call's result with an **opaque** string, captured verbatim and never validated against a fixed vocabulary; the illustrative values TokenFuse and [Verdryx](https://github.com/TAIPANBOX/verdryx) both use are `case_resolved`, `escalated`, `abandoned`.
 
 ---
@@ -581,6 +584,7 @@ A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with 
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
 | [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
 | [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` — a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
+| [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
 
 ---
 
