@@ -76,6 +76,21 @@ flowchart TB
 
 The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan.
 
+## Live infrastructure validation
+
+Before any public launch, TokenFuse was run on real Linux infrastructure with a real Anthropic key: a
+4-node raft cluster across two datacenters (no double-spend, no split-brain), real enforcement under a
+34-agent concurrent burst, and a matched-protocol cost-accounting run on Hetzner, AWS, and GCP.
+
+![TokenFuse enforcement dashboard: fleet summary, live breaker circuit-open, incidents, savings breakdown](assets/05-tokenfuse.png)
+
+![Hetzner vs AWS vs GCP head-to-head: cost per allowed call, latency, and the apples-to-apples caveat](assets/20-cloud-headtohead.png)
+
+Full write-up, all numbers, and the real bugs live testing found (and fixed): [`VALIDATION.md`](VALIDATION.md).
+
+---
+
+
 ## 📑 Table of contents
 
 - [The problem TokenFuse solves](#-the-problem-tokenfuse-solves)
