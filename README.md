@@ -10,7 +10,7 @@
 
 > The kill-switch isn't just an API call — it's signed on-device by your iPhone's Secure Enclave, so a stolen API token alone can't stop (or fake-stop) your agents.
 
-![release](https://img.shields.io/badge/release-v0.3.0-brightgreen)
+![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
