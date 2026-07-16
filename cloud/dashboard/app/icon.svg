@@ -1,0 +1,50 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- control-room dark background, matches the site ink and panel tones -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0C1118"/>
+      <stop offset="0.5" stop-color="#0A0E13"/>
+      <stop offset="1" stop-color="#090C11"/>
+    </linearGradient>
+    <!-- signature amber ambient wash, top-left, like body::before -->
+    <radialGradient id="wash" cx="18%" cy="6%" r="80%">
+      <stop offset="0" stop-color="#F4B23E" stop-opacity="0.20"/>
+      <stop offset="0.55" stop-color="#F4B23E" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#F4B23E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="iris" cx="104%" cy="2%" r="70%">
+      <stop offset="0" stop-color="#6C7BFF" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#6C7BFF" stop-opacity="0"/>
+    </radialGradient>
+    <!-- the bolt fill: warm amber gradient -->
+    <linearGradient id="bolt" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#FBD07A"/>
+      <stop offset="0.45" stop-color="#F4B23E"/>
+      <stop offset="1" stop-color="#E7912A"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- rounded app-icon tile -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#wash)"/>
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#iris)"/>
+  <rect x="3" y="3" width="506" height="506" rx="109" fill="none" stroke="#FFFFFF" stroke-opacity="0.13" stroke-width="2"/>
+
+  <!-- faint control-room grid, very low opacity -->
+  <g stroke="#FFFFFF" stroke-opacity="0.035" stroke-width="1.5">
+    <line x1="0" y1="171" x2="512" y2="171"/>
+    <line x1="0" y1="341" x2="512" y2="341"/>
+    <line x1="171" y1="0" x2="171" y2="512"/>
+    <line x1="341" y1="0" x2="341" y2="512"/>
+  </g>
+
+  <!-- the brand bolt, scaled from the topbar glyph (viewBox 0 0 24 24),
+       path M13.5 2 5 13.2h5.1L9.4 22l9-11.8h-5.3L13.5 2Z, centered ~x18 -->
+  <g filter="url(#glow)" transform="translate(96 66) scale(14)">
+    <path d="M13.5 2 5 13.2h5.1L9.4 22l9-11.8h-5.3L13.5 2Z" fill="url(#bolt)"/>
+  </g>
+</svg>
