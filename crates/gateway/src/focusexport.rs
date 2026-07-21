@@ -580,6 +580,7 @@ mod tests {
             parent_run_id: parent_run_id.into(),
             on_behalf_of: String::new(),
             outcome: outcome.into(),
+            key_id: String::new(),
         }
     }
 

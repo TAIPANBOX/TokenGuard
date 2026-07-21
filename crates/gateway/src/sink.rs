@@ -19,10 +19,11 @@ use datafusion::parquet::arrow::ArrowWriter;
 
 /// One settled call, the unit of the trace.
 ///
-/// Schema evolution note (P2 → P3/agent-passport → P4/outcome-tags): `agent_id`
-/// and `saved_microusd` were appended after the first files were written (P2);
-/// `parent_run_id` and `on_behalf_of` follow the exact same pattern (P3);
-/// `outcome` follows it again (P4). New fields go at the END and the Parquet
+/// Schema evolution note (P2 → P3/agent-passport → P4/outcome-tags → key
+/// identity): `agent_id` and `saved_microusd` were appended after the first
+/// files were written (P2); `parent_run_id` and `on_behalf_of` follow the exact
+/// same pattern (P3); `outcome` follows it again (P4); `key_id` follows it once
+/// more. New fields go at the END and the Parquet
 /// schema keeps a stable order (see [`ParquetSink::schema`]); old files simply
 /// lack the trailing columns and read back as defaults (see `sqlq`). Never
 /// reorder or remove a field — that breaks backward-compatible reads.
@@ -69,6 +70,20 @@ pub struct CallRecord {
     /// aggregation (see `tokenfuse_core::outcomes`), not something recorded
     /// here.
     pub outcome: String,
+    /// The stable identity of the CLIENT CREDENTIAL this call was made with,
+    /// resolved server-side by `crate::clientkeys` from the `x-fuse-key`
+    /// header. `""` when client keys are not configured, which is every
+    /// deployment that has not opted in.
+    ///
+    /// Unlike `agent_id`, this is NOT client-supplied, and that difference is
+    /// the whole reason it exists: `agent_id` is a header the caller writes, so
+    /// it is sound for attribution a cooperating fleet reports about itself and
+    /// unsound as the key of a budget, which a caller could then move off simply
+    /// by sending a different one. A budget above the run keys on this instead.
+    ///
+    /// Still attribution-only HERE: this field records identity, it does not
+    /// enforce anything. Enforcement is a later slice.
+    pub key_id: String,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -166,6 +181,10 @@ impl ParquetSink {
             // Appended P4 (outcome-tags) column — same rule: LAST. See
             // [`CallRecord::outcome`] for what it carries.
             Field::new("outcome", DataType::Utf8, false),
+            // Appended key-identity column — same rule: LAST. See
+            // [`CallRecord::key_id`]; this is the first column on the trace
+            // that the caller cannot choose.
+            Field::new("key_id", DataType::Utf8, false),
         ]))
     }
 
@@ -205,6 +224,9 @@ impl ParquetSink {
             // nullable here so a pre-P4 file's missing column null-fills
             // legally; queries `COALESCE` to `''`.
             Field::new("outcome", DataType::Utf8, true),
+            // Key identity: same treatment once more, so every trace written
+            // before client keys existed still reads back.
+            Field::new("key_id", DataType::Utf8, true),
         ]))
     }
 
@@ -269,6 +291,9 @@ impl ParquetSink {
                         .iter()
                         .map(|r| r.outcome.clone())
                         .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records.iter().map(|r| r.key_id.clone()).collect::<Vec<_>>(),
                 )),
             ],
         )?;
@@ -337,6 +362,7 @@ mod tests {
             parent_run_id: String::new(),
             on_behalf_of: String::new(),
             outcome: String::new(),
+            key_id: String::new(),
         }
     }
 

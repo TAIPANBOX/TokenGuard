@@ -131,6 +131,7 @@ mod tests {
             parent_run_id: String::new(),
             on_behalf_of: String::new(),
             outcome: String::new(),
+            key_id: String::new(),
         }
     }
 

@@ -582,6 +582,22 @@ Shipped in the same change as replay: the Cloud **regulator evidence pack** (`/v
 
 **Trace + unit-economics** (already present, documented here for completeness): set `TOKENFUSE_DATA_DIR` to write Parquet trace segments (read back by `focus-export` / `outcomes` / `sql`). Request header `x-fuse-outcome` tags a call's result with an **opaque** string, captured verbatim and never validated against a fixed vocabulary; the illustrative values TokenFuse and [Verdryx](https://github.com/TAIPANBOX/verdryx) both use are `case_resolved`, `escalated`, `abandoned`.
 
+**Client credentials** (opt-in, off by default):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOKENFUSE_CLIENT_KEYS` | unset ⇒ **off** | `secret:key_id,…`. Set it and every call to `/v1/messages` must present a known secret in the `x-fuse-key` header or get `401`; each call's trace then records the resolved `key_id`. |
+
+Until now the gateway authenticated nobody, and every identity on a call was a header the caller wrote (`x-fuse-run-id`, `x-fuse-agent-id`). That is honest for attribution a cooperating fleet reports about itself, and it is why `agent_id` is documented as attribution-only. It is not enough to key a budget on: anything a caller can choose, a caller can change, so a per-agent cap keyed on `x-fuse-agent-id` is bypassed by sending a different one, and someone else's agent id can be burned on purpose. `key_id` is the first identity on the trace the caller cannot choose.
+
+Notes, because the details matter more than the flag:
+
+- **Unset changes nothing.** No credential is required and `key_id` is empty. A drop-in proxy has to stay drop-in on upgrade.
+- **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
+- **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
+- **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
+- **Scope, stated plainly:** this is `/v1/messages` only. `/v1/runs` and `/v1/runs/{id}/kill` on the gateway are unauthenticated today and stay that way in this change; if that matters to you, do not expose the gateway's admin surface. This adds identity, it does not yet enforce a budget against it.
+
 ---
 
 ## 📚 Documentation
