@@ -77,9 +77,9 @@ functional and CI-tested, but no external security audit yet. Default mode is
 you can evaluate it risk-free and flip to enforce when the numbers convince
 you.
 
-The proxy and CLI are Apache-2.0, self-hosted, free forever, including the
-scanner and the CI action. The hosted fleet dashboard is the paid part
-(flat monthly, unlimited seats; pricing not final).
+Everything is Apache-2.0, self-hosted, and free forever: the proxy, the CLI,
+the scanner and the CI action, and the Cloud control plane with the fleet
+dashboard. No seat limits, no time limit, no paid tier.
 
 Try it (offline, no signup — built-in fake provider):
 
@@ -116,11 +116,12 @@ mitigation is workflow: shadow mode logs what would have been blocked, and
 traffic before you enforce anything. You see your false-positive rate on your
 own workload first.
 
-**"What's the catch on 'free'?"** The local binary does everything described
-above with no account. The paid product is the hosted Cloud (fleet dashboard,
-central budgets, Slack/mobile kill) for teams running many gateways. Flat
-monthly, not a % of spend — a cost-control tool taking a % of spend has bad
-incentives.
+**"What's the catch on 'free'?"** There is no catch: the whole thing is free
+and self-hosted, including the Cloud control plane (fleet dashboard, central
+budgets, Slack/mobile kill). No seat limits, no time limit, no paid tier. The
+commercial product is separate: a secured, managed enterprise control room
+over the whole agent-governance stack, for companies that want the stack run
+for them. TokenFuse itself stays free and open.
 
 **"Secure Enclave kill switch sounds like a gimmick."** It's the answer to a
 specific threat: the host running your agents is compromised or looping so

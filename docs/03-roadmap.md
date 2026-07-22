@@ -52,6 +52,13 @@ A stranger goes from README to their first blocked runaway run in 15 minutes.
 
 ## Monetization
 
+> **Historical note (2026-07-22).** This section records the original
+> monetization plan and is kept as an archive of that thinking. The flat-monthly
+> Cloud plan below was never shipped: since v0.4.0 there is no paid TokenFuse
+> tier, and the Cloud control plane and dashboard are free like everything else
+> here. The only commercial product is a separate secured, managed enterprise
+> control room over the whole stack, not a paid tier of TokenFuse.
+
 - OSS self-host — free forever (Apache-2.0)
 - CLI + local proxy — free forever, no seat limit, no time limit
 - Cloud (fleet dashboard, Slack/mobile kill-switch, central budgets) — a single **flat monthly price, unlimited seats** (Aikido-style). Not usage-based, not a % of spend under management.
