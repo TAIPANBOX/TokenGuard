@@ -909,14 +909,10 @@ async fn external_findings(
     Query(params): Query<ExternalFindingParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    let Mutator { org, actor, plan } =
-        match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-            Ok(m) => m,
-            Err(e) => return e.into_response(),
-        };
-    if let Err(d) = gate(plan, Feature::Incidents) {
-        return plan_required(&org, d.feature);
-    }
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
     let findings: Vec<ExternalFinding> = match serde_json::from_slice(&body) {
         Ok(f) => f,
         Err(e) => {
