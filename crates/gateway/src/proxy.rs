@@ -165,6 +165,18 @@ pub async fn healthz() -> &'static str {
 /// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
 /// as-is once the budget check passes.
 pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: Bytes) -> Response {
+    // Who is calling, resolved from the credential they presented rather than
+    // from anything they can write. Empty when client keys are not configured,
+    // which is every deployment that has not opted in.
+    //
+    // Checked FIRST, before the unmanaged pass-through below: an unmanaged call
+    // still reaches the provider and still spends the operator's provider
+    // credential, so an operator who turned this on to control who may use the
+    // gateway would be surprised to find "omit the run id" is a way around it.
+    let Some(key_id) = resolve_client_key(&st, &headers) else {
+        return unauthorized();
+    };
+
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let mut parsed = parse_request(&request);
@@ -284,6 +296,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             parent_run_id: parent_run_id.clone(),
             on_behalf_of: on_behalf_of.clone(),
             outcome: outcome_tag.clone(),
+            key_id: key_id.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -325,6 +338,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
+                        key_id: key_id.clone(),
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -395,6 +409,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
+                        key_id: key_id.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -469,6 +484,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
+                key_id: key_id.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -495,6 +511,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
+                key_id: key_id.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -540,6 +557,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
+                key_id: key_id.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -618,6 +636,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
+                        key_id: key_id.clone(),
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -639,6 +658,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
+                        key_id: key_id.clone(),
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -682,6 +702,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     parent_run_id: parent_run_id.clone(),
                     on_behalf_of: on_behalf_of.clone(),
                     outcome: outcome_tag.clone(),
+                    key_id: key_id.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -718,6 +739,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     parent_run_id: parent_run_id.clone(),
                     on_behalf_of: on_behalf_of.clone(),
                     outcome: outcome_tag.clone(),
+                    key_id: key_id.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -770,6 +792,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             parent_run_id,
             on_behalf_of,
             outcome_tag,
+            key_id,
             router_header,
             wardryx_header,
         )
@@ -789,6 +812,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &on_behalf_of,
             &on_behalf_of_chain,
             &outcome_tag,
+            &key_id,
             router_header,
             router_route,
             wardryx_header,
@@ -842,6 +866,7 @@ fn stream_managed(
     parent_run_id: String,
     on_behalf_of: String,
     outcome: String,
+    key_id: String,
     router_header: Option<String>,
     wardryx_header: Option<String>,
 ) -> Response {
@@ -861,6 +886,7 @@ fn stream_managed(
         parent_run_id,
         on_behalf_of,
         outcome,
+        key_id,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -926,6 +952,7 @@ async fn buffered_managed(
     on_behalf_of: &str,
     on_behalf_of_chain: &[String],
     outcome_tag: &str,
+    key_id: &str,
     router_header: Option<String>,
     router_route: Option<(String, String)>,
     wardryx_header: Option<String>,
@@ -997,6 +1024,7 @@ async fn buffered_managed(
         parent_run_id: parent_run_id.to_string(),
         on_behalf_of: on_behalf_of.to_string(),
         outcome: outcome_tag.to_string(),
+        key_id: key_id.to_string(),
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -1027,6 +1055,7 @@ async fn buffered_managed(
                     parent_run_id: parent_run_id.to_string(),
                     on_behalf_of: on_behalf_of.to_string(),
                     outcome: outcome_tag.to_string(),
+                    key_id: key_id.to_string(),
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
@@ -1102,6 +1131,49 @@ async fn buffered_managed(
 }
 
 /// DLP block: a secret was found in the outgoing prompt.
+/// The caller's `key_id`, or `None` if their credential does not admit them.
+///
+/// `Some("")` when client keys are not configured: the gateway then behaves
+/// exactly as it did before this existed, which is what keeps a drop-in proxy
+/// drop-in on upgrade. So `Some` means "allowed, with this identity" and the
+/// identity is allowed to be empty; only `None` refuses.
+///
+/// When keys ARE configured this fails closed, and a missing header and an
+/// unknown secret both yield `None` - deliberately indistinguishable, since
+/// telling the caller which of the two they got wrong tells an attacker
+/// whether a secret exists.
+fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
+    if !st.client_keys.enabled() {
+        return Some(String::new());
+    }
+    let presented = header_str(headers, crate::clientkeys::CLIENT_KEY_HEADER).unwrap_or_default();
+    st.client_keys
+        .resolve(presented.trim())
+        .map(ToString::to_string)
+}
+
+/// `401` for a metered call with no usable client credential. Never echoes the
+/// presented secret back, not even truncated: an error body is exactly the
+/// place a credential ends up in someone's log aggregator.
+fn unauthorized() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "unauthorized",
+            "reason": format!(
+                "this gateway requires a client credential in the `{}` header",
+                crate::clientkeys::CLIENT_KEY_HEADER
+            ),
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-fuse", "unauthorized")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
 fn dlp_block(run_id: &str, summary: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1774,6 +1846,135 @@ mod tests {
         assert!(resp.headers().contains_key("x-fuse-would-block"));
     }
 
+    // ---- client credentials (key identity) --------------------------------
+
+    fn with_keys(st: AppState, spec: &str) -> AppState {
+        st.with_client_keys(Arc::new(
+            crate::clientkeys::ClientKeys::from_spec(spec).expect("valid spec"),
+        ))
+    }
+
+    const KEYS: &str = "sk-live-abc:billing-agent";
+
+    #[tokio::test]
+    async fn without_client_keys_nothing_changes_and_key_id_is_empty() {
+        // The upgrade path for every existing deployment: no credential is
+        // required, and the new trace column is simply empty.
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "no-keys")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].key_id, "",
+            "no credential configured means no identity to record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unknown_credential_is_refused_identically() {
+        // Identical responses on purpose: telling the caller WHICH of the two
+        // they got wrong tells an attacker whether a secret exists.
+        let mut bodies = Vec::new();
+        for header in [None, Some("sk-live-wrong")] {
+            let st = with_keys(state(Mode::Enforce, StubProvider::default()), KEYS);
+            let mut req = Request::post("/v1/messages")
+                .header("x-fuse-run-id", "auth")
+                .header("x-fuse-budget-usd", "5.0");
+            if let Some(h) = header {
+                req = req.header(crate::clientkeys::CLIENT_KEY_HEADER, h);
+            }
+            let resp = call(st, req.body(Body::from(body(100))).unwrap()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "header = {header:?}"
+            );
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            bodies.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the two refusals must be indistinguishable"
+        );
+        assert!(
+            !bodies[1].contains("sk-live-wrong"),
+            "the presented secret must never be echoed into an error body: {}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_call_cannot_walk_around_the_credential() {
+        // No run id would take the drop-in pass-through, which still reaches
+        // the provider and still spends the operator's provider credential. An
+        // operator who turned client keys on to control who may use this
+        // gateway would not expect "omit a header" to be the way around it.
+        let st = with_keys(state(Mode::Enforce, StubProvider::default()), KEYS);
+        let req = Request::post("/v1/messages")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_valid_credential_is_accepted_and_its_key_id_reaches_the_trace() {
+        let sink = RecordingSink::default();
+        let st = with_keys(
+            state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone())),
+            KEYS,
+        );
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "authed")
+            .header("x-fuse-budget-usd", "5.0")
+            .header(crate::clientkeys::CLIENT_KEY_HEADER, "sk-live-abc")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].key_id, "billing-agent",
+            "the trace records the resolved key_id, not the secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_id_on_the_trace_cannot_be_set_by_a_header() {
+        // The whole point of the field: a caller who sends their own `key_id`
+        // (or an `agent_id` claiming to be someone else) does not move the
+        // identity a budget above the run would be keyed on.
+        let sink = RecordingSink::default();
+        let st = with_keys(
+            state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone())),
+            KEYS,
+        );
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "spoof")
+            .header("x-fuse-budget-usd", "5.0")
+            .header(crate::clientkeys::CLIENT_KEY_HEADER, "sk-live-abc")
+            .header("x-fuse-agent-id", "someone-elses-agent")
+            .header("key_id", "someone-elses-key")
+            .header("x-fuse-key-id", "someone-elses-key")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+        let recs = sink.snapshot();
+        assert_eq!(
+            recs[0].key_id, "billing-agent",
+            "only the credential decides key_id"
+        );
+        assert_eq!(
+            recs[0].agent_id, "someone-elses-agent",
+            "agent_id stays client-supplied attribution, unchanged and still not a budget key"
+        );
+    }
+
     #[tokio::test]
     async fn unmanaged_passthrough_without_run_id() {
         let req = Request::post("/v1/messages")
@@ -2176,6 +2377,7 @@ mod tests {
             None,
             "test-model",
             &st,
+            String::new(),
             String::new(),
             String::new(),
             String::new(),

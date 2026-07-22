@@ -360,13 +360,39 @@ async fn serve() {
         ..Policy::default()
     };
 
+    // Who may call this gateway, and the stable `key_id` their spend is
+    // attributed to. Unset leaves authentication off, exactly as before, so a
+    // drop-in proxy stays drop-in on upgrade.
+    //
+    // Set-but-unusable exits instead of falling back to "off": that fallback
+    // would leave the gateway open at precisely the moment an operator
+    // believed they had just closed it, and a typo in an env var is not a
+    // reason to serve unauthenticated traffic.
+    let client_keys = match tokenfuse_gateway::clientkeys::ClientKeys::from_spec(
+        &std::env::var("TOKENFUSE_CLIENT_KEYS").unwrap_or_default(),
+    ) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("tokenfuse: {e}");
+            std::process::exit(2);
+        }
+    };
+    if client_keys.enabled() {
+        println!(
+            "client auth: ON ({} key(s)); metered calls must send the `{}` header",
+            client_keys.len(),
+            tokenfuse_gateway::clientkeys::CLIENT_KEY_HEADER
+        );
+    }
+
     let mut state = AppState::new(
         Arc::new(Ledger::new()),
         Arc::new(prices),
         Arc::new(policy),
         provider,
         "default",
-    );
+    )
+    .with_client_keys(Arc::new(client_keys));
 
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
     // records would-hits without serving them — safe to drop in).

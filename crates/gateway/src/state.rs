@@ -1,5 +1,6 @@
 //! Shared application state handed to every request handler.
 
+use crate::clientkeys::ClientKeys;
 use crate::firewall::FirewallConfig;
 use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
@@ -59,6 +60,11 @@ pub struct AppState {
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
     pub events: Arc<EventExporter>,
+    /// Who may send calls through this gateway, and the stable `key_id` their
+    /// spend is attributed to. Empty (authentication off, `key_id` empty)
+    /// unless `TOKENFUSE_CLIENT_KEYS` is set at startup — see
+    /// `crate::clientkeys`.
+    pub client_keys: Arc<ClientKeys>,
 }
 
 impl AppState {
@@ -92,7 +98,16 @@ impl AppState {
             taint: Arc::new(Mutex::new(HashMap::new())),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventExporter::disabled()),
+            client_keys: Arc::new(ClientKeys::default()),
         }
+    }
+
+    /// Require a client credential on metered calls, resolving it to a stable
+    /// `key_id`. Chainable. Not set means authentication stays off, which is
+    /// what every existing deployment gets on upgrade.
+    pub fn with_client_keys(mut self, keys: Arc<ClientKeys>) -> Self {
+        self.client_keys = keys;
+        self
     }
 
     /// Replace the Cloud-managed budget overrides (run id → µUSD). Called by the

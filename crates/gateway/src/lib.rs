@@ -3,6 +3,7 @@
 //! drive `app()` directly.
 
 pub mod backtestcli;
+pub mod clientkeys;
 pub mod cloudsink;
 pub mod compliancecli;
 pub mod embedder;

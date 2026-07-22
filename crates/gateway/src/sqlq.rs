@@ -141,6 +141,7 @@ mod tests {
                     parent_run_id: String::new(),
                     on_behalf_of: String::new(),
                     outcome: String::new(),
+                    key_id: String::new(),
                 });
             }
         }
@@ -248,6 +249,7 @@ mod tests {
                 parent_run_id: String::new(),
                 on_behalf_of: String::new(),
                 outcome: String::new(),
+                key_id: String::new(),
             });
         }
 
@@ -386,6 +388,7 @@ mod tests {
                 parent_run_id: "parent-run-1".into(),
                 on_behalf_of: "user://acme.example/j.doe,agent://acme.example/orchestrator".into(),
                 outcome: String::new(),
+                key_id: String::new(),
             });
         }
 
@@ -499,6 +502,7 @@ mod tests {
                 parent_run_id: String::new(),
                 on_behalf_of: String::new(),
                 outcome: "case_resolved".into(),
+                key_id: String::new(),
             });
         }
 
