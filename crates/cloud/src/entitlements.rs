@@ -3,12 +3,17 @@
 //! entitlements workstream: a lightweight flat-monthly plan gate on the paid
 //! control-plane surface.
 //!
-//! [`Plan::Paid`] is allowed every feature; [`Plan::Free`] is denied the whole
-//! paid surface (the caller turns a [`Denied`] into a `402 plan_required`).
+//! [`Plan::Paid`] is allowed every feature. [`Plan::Free`] is OBSERVE-ONLY: it
+//! passes [`Feature::FleetReads`] (the live fleet view — runs, summary, series,
+//! stream, alerts) so a free org sees its own spend and can evaluate the
+//! product, and is denied every ACTING or advanced surface (kill, central
+//! budgets, agents, savings, incidents, device push, audit, compliance). The
+//! caller turns a [`Denied`] into a `402 plan_required`.
 //! Telemetry ingest is deliberately *not* modelled here — an org's gateways
 //! must keep shipping data regardless of plan, so `/v1/ingest` never consults
-//! this gate (fail-open for data collection; matches ADR-3). A Free org loses
-//! fleet *visibility*, never data.
+//! this gate (fail-open for data collection; matches ADR-3). A Free org keeps
+//! full fleet *visibility*; it loses only the *acting* surface, and data always
+//! flows regardless of plan.
 //!
 //! ## Where Stripe plugs in later (not built here)
 //!
@@ -76,9 +81,15 @@ pub struct Denied {
 pub fn gate(plan: Plan, feature: Feature) -> Result<(), Denied> {
     match plan {
         Plan::Paid => Ok(()),
-        Plan::Free => Err(Denied {
-            feature: feature.as_str(),
-        }),
+        // Free is observe-only: the live fleet view is included so a free org
+        // can see its own spend and evaluate the product; every acting or
+        // advanced surface stays paid.
+        Plan::Free => match feature {
+            Feature::FleetReads => Ok(()),
+            _ => Err(Denied {
+                feature: feature.as_str(),
+            }),
+        },
     }
 }
 
@@ -106,9 +117,16 @@ mod tests {
     }
 
     #[test]
-    fn free_denies_every_paid_feature() {
-        for f in ALL {
-            let denied = gate(Plan::Free, f).expect_err("free should deny {f:?}");
+    fn free_allows_observe_but_denies_acting() {
+        // Free is observe-only: the live fleet view is allowed so a free org
+        // can evaluate the product...
+        assert!(
+            gate(Plan::Free, Feature::FleetReads).is_ok(),
+            "free should allow the observe surface (fleet reads)"
+        );
+        // ...but every other feature is the paid, acting/advanced surface.
+        for f in ALL.into_iter().filter(|f| *f != Feature::FleetReads) {
+            let denied = gate(Plan::Free, f).expect_err("free should deny the paid surface");
             assert_eq!(denied.feature, f.as_str());
         }
     }

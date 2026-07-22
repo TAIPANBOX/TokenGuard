@@ -52,7 +52,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
+        ingest, me, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
         incidents, ack_incident, compliance, compliance_evidence, audit, audit_verify,
         audit_manifest, replay, pair_new, pair, register_apns, register_activity,
     ),
@@ -77,6 +77,7 @@ use crate::store::{
         ReplayEvent,
         IngestBody,
         IngestResponse,
+        MeResponse,
         BudgetBody,
         BudgetResponse,
         KillResponse,
@@ -203,6 +204,19 @@ impl AppState {
             return Some((d.org, Plan::Paid));
         }
         self.oidc_principal(headers).map(|p| (p.org, p.plan))
+    }
+
+    /// Resolve the caller to `(org, role, plan)` for `/v1/me`. Reuses
+    /// [`Self::org_for`] for the org + plan (correct across keys / devices /
+    /// OIDC) and reads the role from an org key when present, defaulting to
+    /// `admin` (paired devices and the current dashboard flow are admin).
+    fn identity(&self, headers: &HeaderMap) -> Option<(String, String, Plan)> {
+        let (org, plan) = self.org_for(headers)?;
+        let role = bearer(headers)
+            .and_then(|t| self.keys.get(t))
+            .map(|p| p.role.clone())
+            .unwrap_or_else(|| "admin".to_string());
+        Some((org, role, plan))
     }
 
     /// Authorize an admin action by **org key only** (used for pairing, which is
@@ -358,6 +372,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
+        .route("/v1/me", get(me))
         .route("/v1/runs", get(runs))
         .route("/v1/agents", get(agents))
         .route("/v1/savings", get(savings))
@@ -437,6 +452,17 @@ struct AckResponse {
 #[derive(Serialize, ToSchema)]
 struct ErrorResponse {
     error: String,
+}
+
+/// `GET /v1/me` — the caller's own identity + plan tier, so a client can adapt
+/// its UI (e.g. render paid controls visible-but-inert on a free plan) without
+/// having to probe a mutation and read the `402`.
+#[derive(Serialize, ToSchema)]
+struct MeResponse {
+    org: String,
+    role: String,
+    /// `"free"` | `"paid"`.
+    plan: &'static str,
 }
 
 /// Envelope for a `402 plan_required` denial from the entitlements gate. The
@@ -686,6 +712,36 @@ async fn summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.summary(&org))).into_response()
+}
+
+/// `GET /v1/me` — the authenticated caller's own org, role, and plan tier.
+/// Ungated on purpose: any authenticated caller may read its OWN identity, so a
+/// client can render paid controls as visible-but-inert on a free plan instead
+/// of blanking. `401` when unauthenticated.
+#[utoipa::path(
+    get, path = "/v1/me",
+    responses(
+        (status = 200, description = "the caller's own org, role, and plan tier", body = MeResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn me(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some((org, role, plan)) = st.identity(&headers) else {
+        return unauthorized();
+    };
+    (
+        StatusCode::OK,
+        Json(MeResponse {
+            org,
+            role,
+            plan: match plan {
+                Plan::Free => "free",
+                Plan::Paid => "paid",
+            },
+        }),
+    )
+        .into_response()
 }
 
 /// Runs at or above the alert threshold of their central budget.

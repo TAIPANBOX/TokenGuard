@@ -53,6 +53,10 @@
       <div id="c-saved-sub" class="muted" style="font-size:11px;margin-top:6px">–</div>
     </div>
   </div>
+  <div id="freenote" style="display:none;background:rgba(244,178,62,.08);border:1px solid rgba(244,178,62,.28);border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:#8b949e">
+    <b style="color:#f4b23e">Free tier</b> · full live observability. Kill and central budgets are paid; the buttons below show what upgrading unlocks.
+    <a href="https://tokenfuse.dev/pricing" target="_blank" rel="noreferrer" style="color:#6c7bff;margin-left:6px">Upgrade</a>
+  </div>
   <table>
     <thead><tr>
       <th>Run</th><th>Model</th><th class="num">Spent</th><th class="num">Calls</th>
@@ -65,6 +69,9 @@
 <script>
   const $ = (id) => document.getElementById(id);
   let key = localStorage.getItem("tf_key") || "";
+  // Caller's plan tier: null until /v1/me resolves. "free" renders control
+  // actions inert (an upsell); "paid" (and the null default) keeps them live.
+  let plan = null;
   $("key").value = key;
 
   const usd = (micro) => "$" + (micro / 1e6).toFixed(4);
@@ -87,21 +94,34 @@
   async function refresh() {
     if (!key) return;
     try {
-      const [runs, sum, alerts, sav] = await Promise.all([
-        api("/v1/runs"), api("/v1/summary"), api("/v1/alerts"), api("/v1/savings"),
+      const [runs, sum, alerts, sav, me] = await Promise.all([
+        api("/v1/runs"), api("/v1/summary"), api("/v1/alerts"),
+        // Savings is a paid feature (402 on free); /v1/me is ungated. Swallow
+        // savings so the free (observe) dashboard still refreshes.
+        api("/v1/savings").catch(() => null),
+        api("/v1/me").catch(() => null),
       ]);
+      if (me) plan = me.plan;
+      const acting = plan !== "free";
       $("status").textContent = "connected";
+      $("freenote").style.display = acting ? "none" : "";
       $("c-runs").textContent = sum.runs;
       $("c-calls").textContent = sum.calls;
       $("c-spent").textContent = usd(sum.spent_microusd);
       const alerted = new Set((alerts || []).map((a) => a.run_id));
       $("c-alerts").textContent = alerted.size;
       $("c-alerts").style.color = alerted.size ? "#f85149" : "";
-      $("c-saved").textContent = usd2(sav.total_saved_microusd);
-      $("c-saved").style.color = sav.total_saved_microusd ? "#3fb950" : "";
-      $("c-saved-sub").textContent =
-        "blocked " + usd2(sav.blocked_spend_microusd) + " · cache " + usd2(sav.cache_saved_microusd) +
-        " · router " + usd2(sav.router_saved_microusd);
+      if (sav) {
+        $("c-saved").textContent = usd2(sav.total_saved_microusd);
+        $("c-saved").style.color = sav.total_saved_microusd ? "#3fb950" : "";
+        $("c-saved-sub").textContent =
+          "blocked " + usd2(sav.blocked_spend_microusd) + " · cache " + usd2(sav.cache_saved_microusd) +
+          " · router " + usd2(sav.router_saved_microusd);
+      } else {
+        $("c-saved").textContent = "–";
+        $("c-saved").style.color = "";
+        $("c-saved-sub").textContent = "paid feature";
+      }
       runs.sort((a, b) => b.spent_microusd - a.spent_microusd);
       $("empty").style.display = runs.length ? "none" : "block";
       $("empty").textContent = "No runs yet — send some traffic through a gateway.";
@@ -115,10 +135,14 @@
           <td class="num">${r.steps}</td>
           <td>${ago(r.last_seen_millis)}</td>
           <td style="white-space:nowrap">
-            <button data-budget="${r.run_id}" style="background:#30363d;padding:3px 10px;font-size:12px;margin-right:4px">Budget</button>
+            ${acting
+              ? `<button data-budget="${r.run_id}" style="background:#30363d;padding:3px 10px;font-size:12px;margin-right:4px">Budget</button>`
+              : `<button disabled title="Central budgets are a paid feature. Upgrade to set caps from the dashboard." style="background:#30363d;padding:3px 10px;font-size:12px;margin-right:4px;opacity:.5;cursor:not-allowed">Budget</button>`}
             ${r.killed
               ? '<span class="pill" style="color:#f85149">killed</span>'
-              : `<button data-run="${r.run_id}" style="background:#b62324;padding:3px 10px;font-size:12px;">Kill</button>`}
+              : acting
+                ? `<button data-run="${r.run_id}" style="background:#b62324;padding:3px 10px;font-size:12px;">Kill</button>`
+                : `<button disabled title="The cross-fleet kill switch is a paid feature. Upgrade to kill runs from the dashboard." style="background:#b62324;padding:3px 10px;font-size:12px;opacity:.5;cursor:not-allowed">Kill</button>`}
           </td>
         </tr>`).join("");
       document.querySelectorAll("button[data-run]").forEach((b) => {
