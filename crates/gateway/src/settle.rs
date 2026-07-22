@@ -34,6 +34,11 @@ pub struct SettleGuard {
     /// Request-scoped `X-Fuse-Outcome` value, carried into the settled
     /// `CallRecord` (P4, unit economics). `""` when unset.
     outcome: String,
+    /// The server-resolved client credential identity, carried into the
+    /// settled `CallRecord`. `""` when client keys are not configured. Unlike
+    /// every other field here it does not come from a request header the
+    /// caller wrote — see `CallRecord::key_id`.
+    key_id: String,
 }
 
 impl SettleGuard {
@@ -50,6 +55,7 @@ impl SettleGuard {
         parent_run_id: String,
         on_behalf_of: String,
         outcome: String,
+        key_id: String,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -63,6 +69,7 @@ impl SettleGuard {
             parent_run_id,
             on_behalf_of,
             outcome,
+            key_id,
         }
     }
 
@@ -93,6 +100,7 @@ impl SettleGuard {
             parent_run_id: self.parent_run_id.clone(),
             on_behalf_of: self.on_behalf_of.clone(),
             outcome: self.outcome.clone(),
+            key_id: self.key_id.clone(),
         });
     }
 
@@ -147,6 +155,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
         );
         guard.complete();
 
@@ -169,6 +178,7 @@ mod tests {
                 usage,
                 fallback,
                 reservation,
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),

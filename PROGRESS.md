@@ -28,6 +28,20 @@ documented threat model in [docs/13](docs/13-security-hardening.md)). What's lef
 is genuinely optional scale/ops work (a SQL/columnar Cloud store; automated cert
 rotation) and a formal third-party audit — none of it a blocker.
 
+**In progress: budgets above the run** (per key / agent / team / org). Today a
+budget exists only per run, with the ledger already enforcing the run's whole
+ancestor chain. The blocker for anything wider was identity: every dimension on
+a metered call arrived as a header the caller wrote, and a budget keyed on
+something the caller chooses is a budget the caller can move off. Slice 1 fixes
+that and nothing else: an opt-in gateway client credential
+(`TOKENFUSE_CLIENT_KEYS`, header `x-fuse-key`) resolved server-side to a stable
+`key_id`, appended to the Parquet trace under the same nullable-evolution rule
+as `agent_id` / `parent_run_id` / `outcome`. Off unless configured, so existing
+deployments are untouched; set-but-unusable exits rather than silently serving
+unauthenticated traffic. No enforcement yet, deliberately: this establishes the
+identity a later slice can enforce against, and the cloud-side accumulators,
+the `key_id -> team` mapping and threshold alerts are the next increment.
+
 ## Status by component
 
 | Component | State | Notes |

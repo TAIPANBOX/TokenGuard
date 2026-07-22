@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, verify_id_token, AppState, OidcConfig, Plan, Principal, Store};
+use tokenfuse_cloud::{app, verify_id_token, AppState, OidcConfig, Principal, Store};
 
 const ISSUER: &str = "https://idp.example.com";
 const AUDIENCE: &str = "tokenfuse-cloud";
@@ -128,7 +128,6 @@ fn state_with_oidc() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8).with_oidc(Some(cfg()))
@@ -143,7 +142,6 @@ fn state_keys_only() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)
@@ -182,7 +180,6 @@ fn valid_token_maps_to_org_and_viewer_least_privilege() {
     let p = verify_id_token(&cfg(), &token).expect("token verifies");
     assert_eq!(p.org, "acme");
     assert_eq!(p.role, "viewer");
-    assert_eq!(p.plan, Plan::Paid);
 
     // Admin role present → admin.
     let admin = token_with_roles(serde_json::json!(["admin"]));

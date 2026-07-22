@@ -2,7 +2,7 @@
 //! `GET /v1/compliance/evidence`, mirroring `tests/audit.rs` / `tests/reads.rs`:
 //! the three framework sections are present, a control with a real backing
 //! signal in this org's data reads `Enforced`, an unbacked one reads
-//! `Documented`, and the endpoint is gated like `/v1/compliance`.
+//! `Documented`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
@@ -22,15 +22,6 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
-        },
-    );
-    keys.insert(
-        "freekey".into(),
-        Principal {
-            org: "freeco".into(),
-            role: "admin".into(),
-            plan: Plan::Free,
         },
     );
     keys
@@ -176,24 +167,4 @@ async fn backed_controls_read_enforced_after_real_signals() {
     assert_eq!(v["audit_entries"], 1);
     assert!(v["decisions_total"].as_u64().unwrap() >= 3);
     assert!(v["incidents_total"].as_u64().unwrap() >= 1);
-}
-
-#[tokio::test]
-async fn compliance_evidence_is_gated_for_free_plan_and_requires_auth() {
-    let store = Arc::new(Store::new());
-    let state = AppState::new(store, Arc::new(keys()), 0.8);
-
-    let (status, _) = send(&state, "GET", "/v1/compliance/evidence", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let (status, v) = send(
-        &state,
-        "GET",
-        "/v1/compliance/evidence",
-        Some("freekey"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(v["error"]["feature"], "compliance");
 }

@@ -34,7 +34,9 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
+
+<sub><a href="https://taipanbox.github.io/tokenfuse/preview/"><b>▶ Live preview</b></a>: the dashboard with sample data, in your browser, no backend and no install.</sub>
 
 </div>
 
@@ -75,6 +77,8 @@ flowchart TB
 - **Talks to**: **Wardryx** (per-request policy), its own **Cloud** control plane, and every downstream consumer (**Idryx**, **Qryx**, **Verdryx**) via the event bus. Configured by **terraform-provider-taipan**; rehearsed against by **Mockryx**.
 
 The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan.
+
+Run the whole open stack locally with one command via [**stack-up**](https://github.com/TAIPANBOX/stack-up); the stack's home on the web is [**it-rat.com**](https://it-rat.com).
 
 ## Live infrastructure validation
 
@@ -161,9 +165,9 @@ Every kill you can trigger from TokenFuse (the API, `tokenfuse top`, Slack, the 
 
 A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** — a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing — and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and — with durable storage enabled — a budget outlives not just a node crash but a full process restart.
 
-### 4. Provider-agnostic: one proxy, every LLM call
+### 4. Drop-in, fail-open, and fast
 
-Point `TOKENFUSE_UPSTREAM` at Anthropic, OpenAI, or any Anthropic/OpenAI-shaped endpoint — including a local Ollama or vLLM server — and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 — see [BENCHMARKS.md](BENCHMARKS.md)).
+Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 — see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ### 5. Catch a poisoned MCP tool for free, and gate CI on it
 
@@ -264,7 +268,7 @@ TokenFuse is **complementary** to observability and gateways; many teams will ru
 <sub>One shared core, enabled as config-gated capability packs.</sub>
 </div>
 
-Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v0.3.0** release versus landed on `main` since.
+Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v0.4.0** release versus landed on `main` since.
 
 <div align="center">
 
@@ -291,7 +295,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 
 **Ops & platform**
 - 🧬 **HA raft cluster**: replicated budgets, durable storage, runtime membership, token auth + TLS.
-- ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways.
+- ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways. Binds to **loopback by default**; a wider bind is an explicit opt-in (`TOKENFUSE_CLOUD_HOST`) meant to sit behind your own TLS or tunnel, never on a raw public IP.
 - 📋 **Compliance evidence pack + audit trail**: `tokenfuse compliance` (CLI, free) and the Cloud `/v1/compliance` / `/v1/compliance/evidence` endpoints project real decision, incident, and MCP-scan evidence onto EU AI Act, US Fed SR 11-7, and SOC 2 controls, each graded `enforced` / `partial` / `documented` rather than over-claimed (a green catalog is not a certification). Every control-plane mutation (kill, budget change, device pairing, incident ack) lands in a hash-chained, ES256-signed audit trail (`/v1/audit`, `/v1/audit/verify`, `/v1/audit/manifest`).
 - 📱 **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
 - 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export; a separate opt-in NDJSON event stream sits alongside it (next bullet).
@@ -339,10 +343,11 @@ Then change **one line** in your app, the base URL:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:4100   # Anthropic SDK
-export OPENAI_BASE_URL=http://localhost:4100       # OpenAI-style SDKs (also Ollama / vLLM)
 ```
 
 Your agent runs exactly as before; TokenFuse just watches every call.
+
+> The gateway speaks the **Anthropic Messages API** (`/v1/messages`) today. An OpenAI-compatible `/v1/chat/completions` endpoint is planned but not yet implemented ([docs/02](docs/02-architecture.md)), so OpenAI-style SDKs (and Ollama / vLLM clients) can't point at it yet.
 
 ### Step 3. Give a run a budget
 
@@ -468,11 +473,13 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 ## 📋 Project status
 
-**v0.3.0: functional and shipped, young and not yet battle-tested.**
+**v0.4.0: functional and shipped, young and not yet battle-tested.**
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-Since v0.3.0, **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island) has been built end-to-end, the web dashboard has been restyled to share the app's "fuse" identity, and the MCP scanner gained a live `--url` mode, JSON reports, `--fail-on` exit codes, and a composite GitHub Action so it can gate CI. Since then, `tokenfuse focus-export` has shipped (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), along with an opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header — TokenFuse's first pieces of the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec. None of this has shipped in a tagged release yet; it's on `main`.
+**v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island), the web dashboard restyled to share the app's "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
+
+Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
@@ -536,9 +543,9 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Is the budget enforcement a hard real-time guarantee?** No — be precise about this. TokenFuse estimates cost *before* forwarding a call and settles the real cost from the response afterward; it's a fast pre-flight approximation reconciled against actual usage, not a guarantee that not one extra cent can ever be spent. It's also **fail-open** by default: if TokenFuse itself has trouble, traffic keeps flowing rather than stalling your agents. That's a deliberate trade-off for availability — run the raft **HA cluster** if you need the opposite guarantee (never losing a budget).
 
-**Is it free?** The CLI and local proxy are **free forever** (open source, Apache-2.0, self-host — no seat limits, no time limit). That includes `tokenfuse mcp-scan` and its GitHub Action. The hosted **Cloud** (fleet-wide dashboard, Slack/mobile kill-switch, central budgets across many gateways) is a paid plan billed at a **flat monthly rate for unlimited seats**, not per-seat or a percentage of spend. Exact pricing isn't finalized yet.
+**Is it free?** Yes, all of it. TokenFuse is open source (Apache-2.0) and free to self-host, with no seat limits and no time limit: the CLI, the local proxy, `tokenfuse mcp-scan` and its GitHub Action, and the **Cloud** control plane and dashboard (fleet spend, alerts, central budgets, the kill-switch). There is no paid TokenFuse tier. A separate commercial product provides the **secured, managed enterprise control room** over the whole stack (authenticated remote access over a tunnel, unified fleet control, hardware-signed actions); TokenFuse itself stays free and open.
 
-**Is it production-ready?** It's a young v0.3.0: functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
+**Is it production-ready?** It's a young v0.4.0: functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
@@ -581,6 +588,22 @@ A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with 
 Shipped in the same change as replay: the Cloud **regulator evidence pack** (`/v1/compliance/evidence`: EU AI Act / SR 11-7 / SOC 2 sections, each control graded from this org's live decision + incident data, not the replay file itself). Full picture, including the hash-chained audit trail and the free CLI: [What's inside](#-whats-inside).
 
 **Trace + unit-economics** (already present, documented here for completeness): set `TOKENFUSE_DATA_DIR` to write Parquet trace segments (read back by `focus-export` / `outcomes` / `sql`). Request header `x-fuse-outcome` tags a call's result with an **opaque** string, captured verbatim and never validated against a fixed vocabulary; the illustrative values TokenFuse and [Verdryx](https://github.com/TAIPANBOX/verdryx) both use are `case_resolved`, `escalated`, `abandoned`.
+
+**Client credentials** (opt-in, off by default):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOKENFUSE_CLIENT_KEYS` | unset ⇒ **off** | `secret:key_id,…`. Set it and every call to `/v1/messages` must present a known secret in the `x-fuse-key` header or get `401`; each call's trace then records the resolved `key_id`. |
+
+Until now the gateway authenticated nobody, and every identity on a call was a header the caller wrote (`x-fuse-run-id`, `x-fuse-agent-id`). That is honest for attribution a cooperating fleet reports about itself, and it is why `agent_id` is documented as attribution-only. It is not enough to key a budget on: anything a caller can choose, a caller can change, so a per-agent cap keyed on `x-fuse-agent-id` is bypassed by sending a different one, and someone else's agent id can be burned on purpose. `key_id` is the first identity on the trace the caller cannot choose.
+
+Notes, because the details matter more than the flag:
+
+- **Unset changes nothing.** No credential is required and `key_id` is empty. A drop-in proxy has to stay drop-in on upgrade.
+- **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
+- **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
+- **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
+- **Scope, stated plainly:** this is `/v1/messages` only. `/v1/runs` and `/v1/runs/{id}/kill` on the gateway are unauthenticated today and stay that way in this change; if that matters to you, do not expose the gateway's admin surface. This adds identity, it does not yet enforce a budget against it.
 
 ---
 

@@ -163,7 +163,21 @@ async fn main() {
         .with_audit_signing_key(audit_signing_key)
         .with_replay_events_path(replay_events_path);
 
-    let addr = format!("0.0.0.0:{port}");
+    // Bind to loopback by DEFAULT so a naive run never exposes the money-plane
+    // API to the network. A deploy that fronts it with a firewall + tunnel
+    // (e.g. taipan/Genaryx) opts into a broader bind via `TOKENFUSE_CLOUD_HOST`;
+    // remote access is meant to go through that secured path, never a raw open
+    // port a scanner can reach.
+    let host = std::env::var("TOKENFUSE_CLOUD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        tracing::warn!(
+            host = %host,
+            "binding the control plane to a non-loopback address: it is now reachable from \
+             the network. Ensure a firewall closes this port and remote access goes through a \
+             tunnel, not a raw open port."
+        );
+    }
+    let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind control-plane address");

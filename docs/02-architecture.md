@@ -38,7 +38,7 @@ Language split: Rust — everything in the request path **and the Cloud control 
 
 ## 4. Core components (a single Rust binary)
 
-1. **Gateway** — `/v1/messages` (Anthropic), `/v1/chat/completions` (OpenAI). Attribution headers → estimate → policies → reserve → clamp → forward → SSE passthrough → usage from the final chunk → settle → event. Provider keys: pass-through only, never written to disk/logs (CI test enforces this).
+1. **Gateway** — `/v1/messages` (Anthropic Messages API). An OpenAI-compatible `/v1/chat/completions` endpoint is planned but NOT yet implemented; the router today serves only `/v1/messages`, `/v1/runs` and `/v1/runs/{id}/kill`. Attribution headers → estimate → policies → reserve → clamp → forward → SSE passthrough → usage from the final chunk → settle → event. Provider keys: pass-through only, never written to disk/logs (CI test enforces this).
 2. **Policy engine** — in-process, hot-reload (LISTEN/NOTIFY or 10s polling).
 3. **Budget counters** — a Lua script `check_and_reserve` (Redis mode) / atomic structures (in-proc).
 4. **Anomaly detector + forecast** — inline heuristics + EWMA forecast of "budget blowout at step ~N".
