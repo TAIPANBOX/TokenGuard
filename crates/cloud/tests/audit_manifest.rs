@@ -4,7 +4,7 @@
 //! `p256`) against the embedded public key over the canonical bytes; the tip
 //! moves when the chain grows; an empty chain still signs a zero-tip manifest;
 //! without a key the endpoint reports not-configured (`404`, not `500`); and it
-//! is viewer-readable, auth-required, and gated as a paid feature.
+//! is viewer-readable and auth-required.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use p256::ecdsa::{signature::Verifier, Signature, SigningKey, VerifyingKey};
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 /// A deterministic P-256 signing key for tests (fixed scalar, no RNG), matching
 /// the `devices.rs` test-key pattern.
@@ -31,7 +31,6 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -39,16 +38,6 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
-            plan: Plan::Paid,
-        },
-    );
-    // A separate org on the free plan, to prove the manifest is gated.
-    keys.insert(
-        "freekey".into(),
-        Principal {
-            org: "freeco".into(),
-            role: "admin".into(),
-            plan: Plan::Free,
         },
     );
     keys
@@ -212,15 +201,4 @@ async fn manifest_requires_auth() {
     assert_eq!(no_key, StatusCode::UNAUTHORIZED);
     let (wrong_key, _) = send(&state, "GET", "/v1/audit/manifest", Some("nope"), None).await;
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn manifest_is_gated_for_free_plan() {
-    // Even with a signing key configured, a `:free` org is refused with 402.
-    let state = state_with_key();
-
-    let (status, v) = send(&state, "GET", "/v1/audit/manifest", Some("freekey"), None).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(v["error"]["type"], "plan_required");
-    assert_eq!(v["error"]["feature"], "audit");
 }

@@ -1,7 +1,7 @@
 //! HTTP-level tests for the tamper-evident audit trail (WS2), mirroring
 //! `tests/mutations.rs` and `tests/reads.rs`: control-plane mutations produce a
 //! linked, verifiable chain; an org reads its own trail (viewer allowed, unauth
-//! rejected); and the endpoints are gated as a paid feature.
+//! rejected).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn test_state() -> AppState {
     let store = Arc::new(Store::new());
@@ -21,7 +21,6 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -29,16 +28,6 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
-            plan: Plan::Paid,
-        },
-    );
-    // A separate org on the free plan, to prove the audit surface is gated.
-    keys.insert(
-        "freekey".into(),
-        Principal {
-            org: "freeco".into(),
-            role: "admin".into(),
-            plan: Plan::Free,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)
@@ -134,18 +123,4 @@ async fn audit_readable_by_viewer_unauth_rejected() {
     assert_eq!(no_key, StatusCode::UNAUTHORIZED);
     let (wrong_key, _) = send(&state, "GET", "/v1/audit", Some("nope"), None).await;
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn audit_is_gated_for_free_plan() {
-    let state = test_state();
-
-    let (status, v) = send(&state, "GET", "/v1/audit", Some("freekey"), None).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(v["error"]["type"], "plan_required");
-    assert_eq!(v["error"]["feature"], "audit");
-
-    let (status, v) = send(&state, "GET", "/v1/audit/verify", Some("freekey"), None).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(v["error"]["feature"], "audit");
 }
