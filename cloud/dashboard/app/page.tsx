@@ -81,6 +81,10 @@ export default function Page() {
   const [savings, setSavings] = useState<Savings | null>(null);
   const [status, setStatus] = useState("");
   const [armed, setArmed] = useState<string | null>(null);
+  // The caller's plan tier: null until /v1/me resolves. "free" renders control
+  // actions as visible-but-inert (an upsell); "paid" (and the null default)
+  // keeps them live.
+  const [plan, setPlan] = useState<"free" | "paid" | null>(null);
 
   useEffect(() => {
     // URL params (?base=&key=) let you connect via a shareable link; they take
@@ -112,10 +116,14 @@ export default function Page() {
   const refresh = useCallback(async () => {
     if (!connected || !key) return;
     try {
-      const [runsRes, sumRes, budRes, serRes, alertRes, sav] = await Promise.all([
+      const [runsRes, sumRes, bud, serRes, alertRes, sav] = await Promise.all([
         api("/v1/runs"),
         api("/v1/summary"),
-        api("/v1/budgets"),
+        // Central budgets are a paid feature: 402 on free plans. Swallow it so
+        // the free (observe) dashboard still refreshes; runs then show "no cap".
+        api("/v1/budgets")
+          .then((r) => r.json() as Promise<Record<string, number>>)
+          .catch(() => ({}) as Record<string, number>),
         api("/v1/series?window=15m&step=60s"),
         api("/v1/alerts"),
         // Savings is a paid-plan feature: 402/absent on free plans. Swallow the
@@ -125,7 +133,6 @@ export default function Page() {
           .catch(() => null),
       ]);
       const rs: Run[] = await runsRes.json();
-      const bud: Record<string, number> = await budRes.json();
       rs.sort((a, b) => {
         const fa = bud[a.run_id] ? a.spent_microusd / bud[a.run_id] : 0;
         const fb = bud[b.run_id] ? b.spent_microusd / bud[b.run_id] : 0;
@@ -149,6 +156,20 @@ export default function Page() {
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
   }, [connected, refresh]);
+
+  // Resolve the caller's plan tier once. /v1/me is ungated, so this works on a
+  // free key too; it decides whether control actions are live or shown inert.
+  useEffect(() => {
+    if (!connected || !key) return;
+    let alive = true;
+    api("/v1/me")
+      .then((r) => r.json() as Promise<{ plan: "free" | "paid" }>)
+      .then((m) => alive && setPlan(m.plan))
+      .catch(() => alive && setPlan(null));
+    return () => {
+      alive = false;
+    };
+  }, [connected, key, api]);
 
   const connect = () => {
     localStorage.setItem("tf_base", base);
@@ -199,6 +220,10 @@ export default function Page() {
   const maxSpend = Math.max(1, ...runs.map((r) => r.spent_microusd));
   const activeRuns = runs.filter((r) => !r.killed).length;
   const killedRuns = runs.filter((r) => r.killed).length;
+  // Free tier is observe-only: control actions are shown but inert (an upsell).
+  // Unknown plan (null, before /v1/me resolves) keeps them live, matching paid.
+  const acting = plan !== "free";
+  const upgradeUrl = "https://tokenfuse.dev/pricing";
 
   const brand = (
     <div className="brand">
@@ -274,6 +299,18 @@ export default function Page() {
         </div>
       ) : (
         <>
+          {plan === "free" && (
+            <div className="freeband">
+              <span className="ff">Free tier</span>
+              <span className="ft">
+                Full live observability. <b>Kill</b> and <b>central budgets</b> are paid; the buttons below show what
+                upgrading unlocks.
+              </span>
+              <a className="fbtn" href={upgradeUrl} target="_blank" rel="noreferrer">
+                Upgrade
+              </a>
+            </div>
+          )}
           <div className="ammeter">
             <span className="lab">Fleet draw</span>
             <div className={"fuse " + heatClass(fleetFrac, false)}>
@@ -417,17 +454,35 @@ export default function Page() {
                           </td>
                           <td>
                             <div className="acts">
-                              <button className="mini" onClick={() => setBudget(r.run_id)}>
-                                Budget
-                              </button>
+                              {acting ? (
+                                <button className="mini" onClick={() => setBudget(r.run_id)}>
+                                  Budget
+                                </button>
+                              ) : (
+                                <button
+                                  className="mini locked"
+                                  disabled
+                                  title="Central budgets are a paid feature. Upgrade to set caps from the dashboard."
+                                >
+                                  Budget
+                                </button>
+                              )}
                               {r.killed ? (
                                 <span className="pill dead">402 killed</span>
-                              ) : (
+                              ) : acting ? (
                                 <button
                                   className={"mini kill" + (armed === r.run_id ? " armed" : "")}
                                   onClick={() => kill(r.run_id)}
                                 >
                                   {armed === r.run_id ? "Confirm" : "Kill"}
+                                </button>
+                              ) : (
+                                <button
+                                  className="mini kill locked"
+                                  disabled
+                                  title="The cross-fleet kill switch is a paid feature. Upgrade to kill runs from the dashboard."
+                                >
+                                  Kill
                                 </button>
                               )}
                             </div>
