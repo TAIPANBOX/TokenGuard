@@ -1,7 +1,6 @@
-//! HTTP-level tests for the P2 entitlements gate: a `:free` org is OBSERVE-ONLY
-//! — served the live fleet view (runs / summary / series / alerts) but refused
-//! the acting/advanced surface with `402 plan_required` — while a default
-//! (plan-less → Paid) org is served everything, and telemetry ingest is never
+//! HTTP-level tests for the P2 entitlements gate: a `:free` org is refused the
+//! paid control-plane surface with `402 plan_required`, while a default
+//! (plan-less → Paid) org is served normally, and telemetry ingest is never
 //! blocked. Mirrors the harness in `reads.rs` / `mutations.rs`.
 
 use std::sync::Arc;
@@ -48,14 +47,7 @@ async fn send(
 #[tokio::test]
 async fn free_key_gets_402_plan_required_on_paid_reads() {
     let state = test_state();
-    // Observe-only: the acting/advanced reads stay paid. The live fleet view
-    // (runs/summary/series/alerts) is free — see the next test.
-    for path in [
-        "/v1/savings",
-        "/v1/agents",
-        "/v1/incidents",
-        "/v1/compliance",
-    ] {
+    for path in ["/v1/runs", "/v1/savings", "/v1/incidents", "/v1/compliance"] {
         let (status, v) = send(&state, "GET", path, "freekey", None).await;
         assert_eq!(
             status,
@@ -74,23 +66,6 @@ async fn free_key_gets_402_plan_required_on_paid_reads() {
             v["error"]["feature"].is_string(),
             "{path} carries a feature id"
         );
-    }
-}
-
-/// The free tier is observe-only: the live fleet view is served at `200` so a
-/// free org sees its own runs / spend / burn / alerts and can evaluate the
-/// product. Only the acting/advanced surface is gated.
-#[tokio::test]
-async fn free_key_can_read_the_observe_surface() {
-    let state = test_state();
-    for path in [
-        "/v1/runs",
-        "/v1/summary",
-        "/v1/series?window=15m&step=60s",
-        "/v1/alerts",
-    ] {
-        let (status, _) = send(&state, "GET", path, "freekey", None).await;
-        assert_eq!(status, StatusCode::OK, "{path} is the free observe surface");
     }
 }
 
@@ -158,15 +133,15 @@ async fn plan_gate_keys_off_the_calling_principal_not_a_sibling_key() {
     );
     let state = AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8);
 
-    // The paid key on this org is served a PAID read (savings) normally...
-    let (status, _) = send(&state, "GET", "/v1/savings", "paidkey", None).await;
+    // The paid key on this org is served normally...
+    let (status, v) = send(&state, "GET", "/v1/runs", "paidkey", None).await;
     assert_eq!(status, StatusCode::OK, "paid key should not be gated");
+    assert!(v.is_array());
     let (status, _) = send(&state, "POST", "/v1/runs/r1/kill", "paidkey", None).await;
     assert_eq!(status, StatusCode::OK, "paid key should be able to mutate");
 
-    // ...while the free key for the SAME org is still gated on that same paid
-    // read, even though the observe surface (runs/summary) is free for both.
-    let (status, v) = send(&state, "GET", "/v1/savings", "freekey", None).await;
+    // ...while the free key for the SAME org is still gated on the same route.
+    let (status, v) = send(&state, "GET", "/v1/runs", "freekey", None).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "free key stays gated");
     assert_eq!(v["error"]["type"], "plan_required");
     let (status, v) = send(&state, "POST", "/v1/runs/r2/kill", "freekey", None).await;
