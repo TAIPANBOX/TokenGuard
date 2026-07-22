@@ -34,7 +34,9 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The hosted Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
+
+<sub><a href="https://taipanbox.github.io/tokenfuse/preview/"><b>▶ Live preview</b></a>: the dashboard with sample data, in your browser, no backend and no install.</sub>
 
 </div>
 
