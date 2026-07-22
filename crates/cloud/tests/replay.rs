@@ -1,8 +1,7 @@
 //! HTTP-level tests for incident replay (wave 2), mirroring `tests/audit.rs`
 //! and `tests/reads.rs`: `GET /v1/replay/{run}` reads the agent-event NDJSON
 //! export, scoped to one run and ts-ordered, joined with that run's incidents
-//! and audit-chain entries; cross-org run ids 404 rather than leak; and the
-//! endpoint is gated as a paid feature like the rest of the audit trail.
+//! and audit-chain entries; cross-org run ids 404 rather than leak.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -13,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
@@ -22,7 +21,6 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -30,15 +28,6 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "beta".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
-        },
-    );
-    keys.insert(
-        "freekey".into(),
-        Principal {
-            org: "freeco".into(),
-            role: "admin".into(),
-            plan: Plan::Free,
         },
     );
     keys
@@ -187,17 +176,4 @@ async fn replay_404s_for_unknown_or_cross_org_run_without_leaking() {
     let (status, v) = send(&state, "GET", "/v1/replay/never-seen", Some("devkey"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"], "unknown run");
-}
-
-#[tokio::test]
-async fn replay_is_gated_for_free_plan_and_requires_auth() {
-    let store = Arc::new(Store::new());
-    let state = AppState::new(store, Arc::new(keys()), 0.8);
-
-    let (status, _) = send(&state, "GET", "/v1/replay/run-1", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let (status, v) = send(&state, "GET", "/v1/replay/run-1", Some("freekey"), None).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(v["error"]["feature"], "audit");
 }

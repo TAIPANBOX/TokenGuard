@@ -37,7 +37,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::keys::{Plan, Principal};
+use crate::keys::Principal;
 
 /// Default claim name carrying the org identifier.
 const DEFAULT_ORG_CLAIM: &str = "org";
@@ -171,9 +171,7 @@ impl Claims {
 /// Verify an OIDC ID-token / JWT and map it to a [`Principal`], or `None` on any
 /// validation failure. See the module docs for the exact checks. The role is
 /// `admin` **iff** the roles claim contains the configured admin role, else
-/// `viewer` (least privilege); the plan is [`Plan::Paid`] for consistency with
-/// the API-key default (the org's real plan is still resolved by the caller via
-/// `plan_for_org`).
+/// `viewer` (least privilege).
 pub fn verify_id_token(cfg: &OidcConfig, token: &str) -> Option<Principal> {
     verify(cfg, token).map(|v| v.principal)
 }
@@ -242,7 +240,6 @@ pub fn verify(cfg: &OidcConfig, token: &str) -> Option<Verified> {
         principal: Principal {
             org,
             role: role.to_string(),
-            plan: Plan::Paid,
         },
         actor: format!("oidc:{subject}"),
     })

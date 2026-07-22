@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, CallRecord, Plan, Principal, Store};
+use tokenfuse_cloud::{app, AppState, CallRecord, Principal, Store};
 
 fn test_state() -> (AppState, Arc<Store>) {
     let store = Arc::new(Store::new());
@@ -19,7 +19,6 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -27,7 +26,6 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
-            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -35,7 +33,6 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "beta".into(),
             role: "admin".into(),
-            plan: Plan::Paid,
         },
     );
     (
