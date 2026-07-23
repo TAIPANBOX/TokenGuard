@@ -129,11 +129,20 @@ struct ToolCallCounter {
     /// OpenAI non-streaming: `choices[].message.tool_calls` length, summed
     /// across choices (a request can ask for more than one).
     openai_nonstream: u32,
-    /// OpenAI streaming: distinct `index` values seen across
-    /// `choices[].delta.tool_calls[]`. Deltas repeat per index as a call's
-    /// arguments stream in, so only the count of *unique* indexes is the
-    /// number of tool calls - counting deltas directly would overcount.
-    openai_stream_idx: std::collections::HashSet<u64>,
+    /// OpenAI streaming: distinct `(choice_index, tool_call_index)` pairs
+    /// seen across `choices[].delta.tool_calls[]`. Deltas repeat per
+    /// tool_call index as a call's arguments stream in, so only the count of
+    /// *unique* indexes is the number of tool calls - counting deltas
+    /// directly would overcount. The pairing with `choice_index` matters
+    /// because `n > 1` (multiple choices) is legal on this endpoint: each
+    /// choice's own `tool_calls[].index` restarts from 0 independently, so
+    /// two different choices both streaming a tool call at index 0 are two
+    /// distinct tool calls, not one - a bare `HashSet<u64>` keyed on the
+    /// tool_call index alone would collapse them into one and undercount.
+    /// The choice's own `"index"` defaults to 0 when the key is absent
+    /// (which is every request that didn't ask for `n > 1`), so the common
+    /// single-choice case is unaffected.
+    openai_stream_idx: std::collections::HashSet<(u64, u64)>,
 }
 
 impl ToolCallCounter {
@@ -153,6 +162,10 @@ impl ToolCallCounter {
         }
         if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
+                // Absent (no `n>1` requested) defaults to 0, the same
+                // implicit single-choice index every OpenAI response without
+                // `n` carries.
+                let choice_idx = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 let Some(deltas) = choice
                     .get("delta")
                     .and_then(|d| d.get("tool_calls"))
@@ -162,7 +175,7 @@ impl ToolCallCounter {
                 };
                 for tc in deltas {
                     if let Some(idx) = tc.get("index").and_then(|i| i.as_u64()) {
-                        self.openai_stream_idx.insert(idx);
+                        self.openai_stream_idx.insert((choice_idx, idx));
                     }
                 }
             }
@@ -538,6 +551,19 @@ mod tests {
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n");
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n");
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(2));
+    }
+
+    /// Regression: `n>1` (multiple choices) each stream their OWN tool_calls
+    /// index restarting from 0, so index alone is not a globally unique key.
+    /// Two different choices both emitting a tool call at index 0 are two
+    /// distinct tool calls - counting must not collapse them into one.
+    #[test]
+    fn counts_openai_streaming_tool_calls_across_multiple_choices_by_choice_and_index() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}},{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n");
         p.feed(b"data: [DONE]\n\n");
         let u = p.finish();
         assert_eq!(u.tool_calls, Some(2));
