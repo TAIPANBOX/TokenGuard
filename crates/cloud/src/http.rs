@@ -620,13 +620,17 @@ async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.agents(&org))).into_response()
 }
 
-/// The caller org's per-unit spend rollup, highest spend first
-/// (docs/20-identity-map.md section 4). A run with no resolved unit rolls up
-/// under the literal `"unassigned"` bucket, never a blank one.
+/// The caller org's per-unit spend rollup, highest month-to-date spend first
+/// (all-time spend as the tie-break; docs/20-identity-map.md section 4). A
+/// run with no resolved unit rolls up under the literal `"unassigned"`
+/// bucket, never a blank one. Each row carries both all-time totals and the
+/// `month`/`month_spent_microusd`/`month_calls` month-to-date columns - the
+/// UTC-calendar-month window the `/v1/unit-budgets` caps are enforced
+/// against (see `UnitAgg`).
 #[utoipa::path(
     get, path = "/v1/units",
     responses(
-        (status = 200, description = "aggregated units, highest spend first; unmapped spend rolls up under \"unassigned\"", body = Vec<UnitAgg>),
+        (status = 200, description = "aggregated units, highest month-to-date spend first; unmapped spend rolls up under \"unassigned\"; month_* columns cover the current UTC calendar month", body = Vec<UnitAgg>),
         (status = 401, description = "unauthorized", body = ErrorResponse),
     ),
     tag = "reads"

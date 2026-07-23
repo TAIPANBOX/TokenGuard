@@ -294,6 +294,21 @@ async fn units_roll_up_and_sort_by_spend() {
     assert_eq!(units[1]["spent_microusd"], 500);
     assert_eq!(units[2]["unit"], "unassigned");
     assert_eq!(units[2]["spent_microusd"], 250);
+
+    // Month-to-date columns ride the same rows (docs/20: the UTC-calendar-
+    // month window the `/v1/unit-budgets` caps are enforced against).
+    // Everything above was ingested "now", so month-to-date equals the
+    // all-time totals here. (Theoretical flake: this test straddling a UTC
+    // month flip between ingest and read, a sub-millisecond window once a
+    // month - accepted; the store-level tests pin the windowing itself
+    // deterministically via `units_at`.)
+    let month = units[0]["month"].as_str().expect("month window key");
+    assert_eq!(month.len(), 7, "YYYY-MM, got {month}");
+    assert_eq!(units[0]["month_spent_microusd"], 3000);
+    assert_eq!(units[0]["month_calls"], 2);
+    assert_eq!(units[1]["month_spent_microusd"], 500);
+    assert_eq!(units[1]["month_calls"], 2);
+    assert_eq!(units[2]["month_spent_microusd"], 250);
 }
 
 /// I1 (docs/21-tool-runs.md): `tool_calls` shows up on the JSON responses of

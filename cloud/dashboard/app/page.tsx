@@ -30,13 +30,20 @@ type Savings = {
   total_saved_microusd: number;
 };
 // Per-business-unit spend rollup (docs/20 identity map). Unmapped spend rolls
-// up under the literal id "unassigned".
+// up under the literal id "unassigned". The month_* fields cover the current
+// UTC calendar month - the same window the "$X/mo" caps in /v1/unit-budgets
+// are enforced against by the gateway. They are absent on a plane that
+// predates the month-to-date fold: the card then falls back to the all-time
+// total, honestly labeled, never silently passed off as a month.
 type Unit = {
   unit: string;
   spent_microusd: number;
   calls: number;
   runs: number;
   last_seen_millis: number;
+  month?: string;
+  month_spent_microusd?: number;
+  month_calls?: number;
 };
 
 const usd = (micro: number) => "$" + (micro / 1e6).toFixed(2);
@@ -570,7 +577,16 @@ export default function Page() {
                       <tbody>
                         {units.map((u) => {
                           const cap = unitBudgets[u.unit] || 0;
-                          const frac = cap > 0 ? u.spent_microusd / cap : 0;
+                          // The caps are MONTHLY (enforced by the gateway over
+                          // the UTC calendar month), so the bar must compare
+                          // month-to-date spend - never the all-time total.
+                          // An older plane omits month_spent_microusd: fall
+                          // back to all-time with an explicit label rather
+                          // than quietly over-reporting (the same honesty
+                          // rule as the "all time" summary tiles).
+                          const hasMonth = u.month_spent_microusd !== undefined;
+                          const spent = u.month_spent_microusd ?? u.spent_microusd;
+                          const frac = cap > 0 ? spent / cap : 0;
                           const heat = heatClass(frac, false);
                           const over = cap > 0 && frac >= 1;
                           const unassigned = u.unit === "unassigned";
@@ -585,19 +601,22 @@ export default function Page() {
                                 {cap > 0 ? (
                                   <>
                                     <div className="nrow">
-                                      <b style={over ? { color: "var(--ember)" } : undefined}>{usd(u.spent_microusd)}</b>
+                                      <b style={over ? { color: "var(--ember)" } : undefined}>{usd(spent)}</b>
                                       <span style={{ color: "var(--dim)" }}>{usd(cap)}/mo</span>
                                     </div>
                                     <div className={"fuse " + heat}>
                                       <i style={{ width: `${Math.min(100, frac * 100)}%` }} />
                                     </div>
+                                    <div className="nocap">
+                                      {hasMonth ? `this month · all time ${usd(u.spent_microusd)}` : "all time vs monthly cap"}
+                                    </div>
                                   </>
                                 ) : (
                                   <>
                                     <div className="nrow">
-                                      <b>{usd(u.spent_microusd)}</b>
+                                      <b>{usd(spent)}</b>
                                     </div>
-                                    <div className="nocap">no cap set</div>
+                                    <div className="nocap">{hasMonth ? "this month · no cap set" : "all time · no cap set"}</div>
                                   </>
                                 )}
                               </td>

@@ -239,6 +239,80 @@ pub struct UnitAgg {
     /// Sum of `tool_calls` across this unit's runs (I1, docs/21-tool-runs.md),
     /// folded the same way as `spent_microusd` above.
     pub tool_calls: u64,
+    /// The UTC `YYYY-MM` window (see [`month_key`]) the `month_*` fields
+    /// cover - always the CURRENT month at read time. An accumulator last
+    /// touched in an earlier month reads as zero here (lazy rollover, the
+    /// same rule as the gateway's `unitledger`); the stored counters are
+    /// only actually reset by the next ingest.
+    pub month: String,
+    /// Month-to-date real spend for this unit - the honest counterpart to
+    /// the monthly caps in `/v1/unit-budgets`, which the gateway's
+    /// `unitledger` enforces over the UTC calendar month (docs/20 section
+    /// 3). Two deliberate differences from the all-time `spent_microusd`
+    /// above: (1) it is an exact per-record fold like [`OrgTotals`], NOT
+    /// subject to `MAX_RUNS_PER_ORG` eviction of the run map; (2)
+    /// attribution is the record's unit AT INGEST TIME ("unassigned" when
+    /// unresolved), matching how the gateway accounted the call - it is
+    /// never re-attributed when a later record names the run's unit the way
+    /// the [`RunAgg`] fold's last-non-empty-wins rule is. Zero right after
+    /// a plane upgrade mid-month: there is no per-month history in old
+    /// snapshots to backfill from, so the counter starts at the upgrade
+    /// (an under-count for that first partial month, stated plainly rather
+    /// than passing all-time spend off as a month).
+    pub month_spent_microusd: i64,
+    /// Month-to-date call count (every record, blocked included - a block
+    /// is a guard firing; only its avoided SPEND is excluded above).
+    pub month_calls: u64,
+}
+
+/// Milliseconds per UTC day (for [`month_key`]).
+const DAY_MILLIS: i64 = 86_400_000;
+
+/// The UTC `YYYY-MM` window key for an epoch-milliseconds timestamp.
+///
+/// A verbatim twin of `crates/gateway/src/unitledger.rs::month_key`
+/// (civil-from-days conversion, Howard Hinnant's algorithm). `cloud` and
+/// `gateway` are sibling crates, and the only shared home would be
+/// `tokenfuse-core`, which this small window helper deliberately stays out
+/// of (repo invariant: core stays scope- and dependency-minimal). The
+/// `month_key_matches_unitledger_vectors` test pins the two to identical
+/// outputs; docs/20 fixes the semantics both implement (Q2: the unit budget
+/// window is the UTC calendar month).
+pub(crate) fn month_key(ts_millis: i64) -> String {
+    let days = ts_millis.div_euclid(DAY_MILLIS);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}")
+}
+
+/// One unit's month-to-date accumulator (the Cloud's durable mirror of the
+/// gateway `unitledger` window - docs/20 section 3 points here for the
+/// cross-fleet VIEW of unit spend). Folded per-record in [`Store::ingest`]
+/// and persisted in the snapshot; rolls over lazily when an ingest observes
+/// a new UTC month, exactly like the gateway ledger.
+///
+/// The window is keyed by the PLANE's clock (`ingest_at`'s `now_ms`), not
+/// the record's own `ts_millis`: `/v1/ingest` is ungated, so a forged
+/// timestamp must not be able to reset (or ping-pong) a month window and
+/// hide spend. The cost is that attribution around a month boundary can
+/// drift from the gateway's call-time window by the telemetry batching
+/// delay - seconds, and only for calls in flight exactly at the boundary.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct UnitMonthAcc {
+    /// UTC `YYYY-MM` this accumulator covers (see [`month_key`]).
+    window: String,
+    /// Real spend this month (blocked/avoided-spend rows excluded, the same
+    /// gate as every other spend fold).
+    spent_microusd: i64,
+    /// Calls this month, blocked included (a block is a guard firing).
+    calls: u64,
 }
 
 /// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
@@ -470,6 +544,18 @@ const MAX_INCIDENTS_PER_ORG: usize = 10_000;
 /// ungated-`/v1/ingest` cardinality concern as [`MAX_RUNS_PER_ORG`].
 const MAX_BREAK_KEYS: usize = 10_000;
 
+/// Hard cap on distinct unit buckets in each org's [`Inner::unit_months`]
+/// map - the same ungated-`/v1/ingest` cardinality concern as
+/// [`MAX_RUNS_PER_ORG`] (`r.unit` is attacker-controlled). Overflow folds
+/// into the "unassigned" bucket rather than LRU-evicting: evicting would
+/// silently zero a real unit's month-to-date counter mid-month, which could
+/// hide an over-cap unit from `/v1/units`, while the overflow bucket stays
+/// VISIBLE (docs/20 section 3's rule for unmapped spend). The "unassigned"
+/// bucket is always admissible, so the map can hold at most this many keys
+/// plus that one. Far above any real org's unit count; only misconfig or
+/// abuse reaches it.
+const MAX_UNIT_MONTH_KEYS: usize = 4_096;
+
 /// Default alert-fraction threshold (mirrors `TOKENFUSE_CLOUD_ALERT_PCT`'s
 /// documented default in `main.rs`), used by [`Store::with_incident_config`]
 /// when no explicit value is given. `Store` needs its OWN copy of this
@@ -637,6 +723,11 @@ struct Inner {
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
     savings: HashMap<String, SavingsAcc>,
+    /// org → unit bucket → month-to-date accumulator (persisted). Keyed by
+    /// the RESOLVED bucket - the literal "unassigned" for an empty unit,
+    /// the same key [`Store::units`] folds unmapped runs under - so the
+    /// read-side join is direct. Bounded by [`MAX_UNIT_MONTH_KEYS`].
+    unit_months: HashMap<String, HashMap<String, UnitMonthAcc>>,
     /// org → wire `decision` string → total occurrences (persisted). Folded in
     /// [`Store::ingest`] over EVERY record — including blocked ones, since a
     /// block is compliance *evidence* (the guard fired), not spend. Feeds the
@@ -701,6 +792,7 @@ struct SnapshotRef<'a> {
     unit_budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
+    unit_months: &'a HashMap<String, HashMap<String, UnitMonthAcc>>,
     decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
     audit: &'a HashMap<String, Vec<AuditEntry>>,
@@ -726,6 +818,13 @@ struct SnapshotOwned {
     /// `savings()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
     savings: HashMap<String, SavingsAcc>,
+    /// Missing on snapshots that predate the month-to-date unit fold -
+    /// `default` loads empty, so `units()` reports month zeros until fresh
+    /// telemetry accumulates. Deliberately NOT backfilled from `orgs`: a
+    /// [`RunAgg`] carries no per-month split, and passing lifetime spend
+    /// off as a month is exactly the dishonesty this fold exists to fix.
+    #[serde(default)]
+    unit_months: HashMap<String, HashMap<String, UnitMonthAcc>>,
     /// Missing on pre-compliance snapshots — `default` loads empty, so
     /// `decision_counts()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
@@ -915,8 +1014,14 @@ impl Store {
                 let totals = inner.org_totals.entry(org.to_string()).or_default();
                 let recency = inner.run_recency.entry(org.to_string()).or_default();
                 let break_recency = inner.break_recency.entry(org.to_string()).or_default();
+                let unit_months = inner.unit_months.entry(org.to_string()).or_default();
                 let budgets = inner.budgets.get(org);
                 let alert_pct = self.alert_pct;
+                // The month window every record in this batch folds into -
+                // derived from the PLANE's `now_ms`, never `r.ts_millis`
+                // (see [`UnitMonthAcc`]: a forged record timestamp must not
+                // reset a month window).
+                let month_now = month_key(now_ms);
                 for r in records {
                     // C4: `cost_microusd`/`saved_microusd` are attacker-
                     // controlled (ingest is ungated). A negative value is
@@ -1022,6 +1127,46 @@ impl Store {
                     }
                     if r.ts_millis > agg.last_seen {
                         agg.last_seen = r.ts_millis;
+                    }
+                    // Month-to-date unit rollup (docs/20 section 3: the
+                    // durable cross-fleet view of unit spend, mirroring the
+                    // gateway `unitledger`'s UTC-calendar-month window).
+                    // Attribution is the record's unit AS RESOLVED AT CALL
+                    // TIME - an unmapped call lands in "unassigned" even if
+                    // a later record names the run's unit (see
+                    // [`UnitAgg::month_spent_microusd`] for why that is the
+                    // honest mirror of what the gateway enforced).
+                    {
+                        let ukey: &str = if r.unit.is_empty() {
+                            "unassigned"
+                        } else {
+                            &r.unit
+                        };
+                        // Cardinality bound: overflow folds into
+                        // "unassigned", never evicts (see
+                        // [`MAX_UNIT_MONTH_KEYS`]).
+                        let ukey: &str = if unit_months.contains_key(ukey)
+                            || unit_months.len() < MAX_UNIT_MONTH_KEYS
+                        {
+                            ukey
+                        } else {
+                            "unassigned"
+                        };
+                        let acc = unit_months.entry(ukey.to_string()).or_default();
+                        if acc.window != month_now {
+                            // Lazy rollover - the same rule as the gateway's
+                            // `UnitLedger::rolled`. Also covers a fresh
+                            // (`or_default`, empty-window) accumulator.
+                            acc.window = month_now.clone();
+                            acc.spent_microusd = 0;
+                            acc.calls = 0;
+                        }
+                        acc.calls += 1;
+                        if !is_blocked(&r.decision) {
+                            // C4: same clamped `cost` and saturating fold as
+                            // the run/org totals above.
+                            acc.spent_microusd = acc.spent_microusd.saturating_add(cost);
+                        }
                     }
                     // FinOps savings, folded in the same pass. Only the
                     // budget-protection subset counts as blocked (avoided)
@@ -1407,13 +1552,24 @@ impl Store {
         out
     }
 
-    /// An org's per-unit spend rollup, highest spend first
-    /// (docs/20-identity-map.md section 4). Folds the org's [`RunAgg`]s by
-    /// `unit`, mirroring [`Store::agents`]'s fold-by-`agent_id` shape - with
-    /// one deliberate difference at the bucketing key. Spend (and
-    /// `tool_calls`, I1) already exclude blocked rows (that gate is applied
-    /// when folding calls into `RunAgg::spent_microusd`/`RunAgg::tool_calls`).
+    /// An org's per-unit spend rollup, highest month-to-date spend first
+    /// (all-time spend as the tie-break; docs/20-identity-map.md section 4).
+    /// All-time columns fold the org's retained [`RunAgg`]s by `unit`,
+    /// mirroring [`Store::agents`]'s fold-by-`agent_id` shape - with one
+    /// deliberate difference at the bucketing key. Spend (and `tool_calls`,
+    /// I1) already exclude blocked rows (that gate is applied when folding
+    /// calls into `RunAgg::spent_microusd`/`RunAgg::tool_calls`). The
+    /// `month_*` columns join in from the ingest-time [`UnitMonthAcc`] fold;
+    /// see [`UnitAgg`] for how the two deliberately differ (eviction
+    /// exactness, call-time attribution).
     pub fn units(&self, org: &str) -> Vec<UnitAgg> {
+        self.units_at(org, now_millis())
+    }
+
+    /// [`Store::units`] with an explicit `now_ms`, so month-window reads are
+    /// deterministic in tests (the same pattern [`Store::ingest_at`] sets).
+    pub(crate) fn units_at(&self, org: &str, now_ms: i64) -> Vec<UnitAgg> {
+        let month_now = month_key(now_ms);
         let inner = self.inner.read().unwrap();
         let mut by_unit: HashMap<String, UnitAgg> = HashMap::new();
         if let Some(runs) = inner.orgs.get(org) {
@@ -1441,8 +1597,32 @@ impl Store {
                 u.tool_calls = u.tool_calls.saturating_add(agg.tool_calls);
             }
         }
+        // Join the month-to-date accumulators. A unit can appear here with
+        // no retained runs (all evicted under `MAX_RUNS_PER_ORG`): it still
+        // gets a row, with zeroed all-time/run columns - the month figure is
+        // exact and must not vanish with the run map. The converse (a run
+        // bucket with no accumulator, e.g. a snapshot from before this fold
+        // existed) reads as month zero.
+        if let Some(months) = inner.unit_months.get(org) {
+            for (unit, acc) in months {
+                let u = by_unit.entry(unit.clone()).or_insert_with(|| UnitAgg {
+                    unit: unit.clone(),
+                    ..Default::default()
+                });
+                // A stale window means no traffic yet this month: report
+                // zeros without mutating stored state (reads take the read
+                // lock; the next ingest does the actual rollover).
+                if acc.window == month_now {
+                    u.month_spent_microusd = acc.spent_microusd;
+                    u.month_calls = acc.calls;
+                }
+            }
+        }
+        for u in by_unit.values_mut() {
+            u.month = month_now.clone();
+        }
         let mut out: Vec<UnitAgg> = by_unit.into_values().collect();
-        out.sort_by_key(|u| std::cmp::Reverse(u.spent_microusd));
+        out.sort_by_key(|u| std::cmp::Reverse((u.month_spent_microusd, u.spent_microusd)));
         out
     }
 
@@ -1878,6 +2058,7 @@ impl Store {
                 unit_budgets: &inner.unit_budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
+                unit_months: &inner.unit_months,
                 decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
                 audit: &inner.audit,
@@ -1908,6 +2089,7 @@ impl Store {
         inner.unit_budgets = snap.unit_budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
+        inner.unit_months = snap.unit_months;
         inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;
         inner.audit = snap.audit;
@@ -2751,6 +2933,186 @@ mod tests {
         let buckets = s.series("acme", None, 1_000, 1_000, 1_000);
         let total_in_series: u64 = buckets.iter().map(|b| b.tool_calls).sum();
         assert_eq!(total_in_series, 2 + 1 + 99);
+    }
+
+    /// 2026-07-15T00:00:00Z, the same fixed mid-month instant the gateway's
+    /// `unitledger` tests use.
+    const JULY: i64 = 1_784_073_600_000;
+    /// One day into the following month (2026-08-01T00:00:00Z).
+    const AUGUST: i64 = JULY + 17 * DAY_MILLIS;
+
+    /// A minimal record for the month-fold tests below.
+    fn urec(run: &str, unit: &str, decision: &str, cost: i64, ts: i64) -> CallRecord {
+        CallRecord {
+            run_id: run.into(),
+            unit: unit.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        }
+    }
+
+    /// [`month_key`] is a verbatim twin of
+    /// `crates/gateway/src/unitledger.rs::month_key`; these are that module's
+    /// `month_key_matches_known_dates` vectors, verbatim. If this test and
+    /// that one ever disagree, enforcement and reporting have split-brained
+    /// on what "this month" means - fix the drift, not the test.
+    #[test]
+    fn month_key_matches_unitledger_vectors() {
+        assert_eq!(month_key(0), "1970-01");
+        assert_eq!(month_key(-1), "1969-12");
+        assert_eq!(month_key(JULY), "2026-07");
+        assert_eq!(month_key(AUGUST), "2026-08");
+        // 2024-02-29T12:00:00Z (leap day).
+        assert_eq!(month_key(1_709_208_000_000), "2024-02");
+    }
+
+    /// The month-to-date fold windows by the PLANE's clock (`ingest_at`'s
+    /// `now_ms`), rolls over lazily at the UTC month boundary like the
+    /// gateway's `unitledger`, reads as zero for a stale window without
+    /// mutating stored state, and ignores record timestamps entirely
+    /// (`/v1/ingest` is ungated - a forged `ts_millis` must not be able to
+    /// reset a month window).
+    #[test]
+    fn units_month_to_date_windows_by_plane_clock_and_rolls_over() {
+        let s = Store::new();
+        // Record timestamps are deliberate nonsense (epoch and far future):
+        // only `now_ms` may pick the window.
+        s.ingest_at(
+            "acme",
+            &[
+                urec("r1", "treasury", "allow", 1000, 0),
+                // Blocked: call counted, avoided spend excluded.
+                urec(
+                    "r1",
+                    "treasury",
+                    "budget_exceeded",
+                    999_999,
+                    999_999_999_999_999,
+                ),
+                urec("r2", "treasury", "allow", 2000, 10),
+                urec("r3", "", "allow", 250, 20),
+            ],
+            JULY,
+        );
+        let units = s.units_at("acme", JULY + DAY_MILLIS);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].unit, "treasury");
+        assert_eq!(units[0].month, "2026-07");
+        assert_eq!(units[0].month_spent_microusd, 3000);
+        assert_eq!(units[0].month_calls, 3);
+        assert_eq!(units[0].spent_microusd, 3000);
+        assert_eq!(units[1].unit, "unassigned");
+        assert_eq!(units[1].month_spent_microusd, 250);
+
+        // August, before any new traffic: month columns read as zero, the
+        // row names the CURRENT window, all-time keeps the July history,
+        // and the sort falls back to the all-time tie-break.
+        let units = s.units_at("acme", AUGUST);
+        assert_eq!(units[0].unit, "treasury");
+        assert_eq!(units[0].month, "2026-08");
+        assert_eq!(units[0].month_spent_microusd, 0);
+        assert_eq!(units[0].month_calls, 0);
+        assert_eq!(units[0].spent_microusd, 3000);
+
+        // The first August ingest performs the actual (lazy) rollover and
+        // starts fresh counters.
+        s.ingest_at("acme", &[urec("r4", "treasury", "allow", 40, 30)], AUGUST);
+        let units = s.units_at("acme", AUGUST);
+        assert_eq!(units[0].unit, "treasury");
+        assert_eq!(units[0].month_spent_microusd, 40);
+        assert_eq!(units[0].month_calls, 1);
+        assert_eq!(units[0].spent_microusd, 3040);
+    }
+
+    /// Month attribution is the unit resolved AT CALL TIME, mirroring what
+    /// the gateway's `unitledger` actually enforced - deliberately NOT the
+    /// [`RunAgg`] fold's last-non-empty-wins rule, which re-attributes a
+    /// run's whole lifetime once a later record names its unit. Also covers
+    /// the read-side union: a month-only bucket still gets a row with
+    /// zeroed all-time/run columns.
+    #[test]
+    fn units_month_attribution_is_call_time_not_run_lifetime() {
+        let s = Store::new();
+        s.ingest_at("acme", &[urec("r1", "", "allow", 100, 10)], JULY);
+        s.ingest_at("acme", &[urec("r1", "ops", "allow", 1, 20)], JULY);
+        let units = s.units_at("acme", JULY);
+        assert_eq!(units.len(), 2);
+        // The all-time fold reads the whole run (101) as ops...
+        let ops = units.iter().find(|u| u.unit == "ops").expect("ops row");
+        assert_eq!(ops.spent_microusd, 101);
+        assert_eq!(ops.runs, 1);
+        assert_eq!(ops.month_spent_microusd, 1);
+        // ...while the month fold keeps the pre-resolution 100 where the
+        // gateway accounted it, visibly, in "unassigned".
+        let un = units
+            .iter()
+            .find(|u| u.unit == "unassigned")
+            .expect("unassigned row");
+        assert_eq!(un.month_spent_microusd, 100);
+        assert_eq!(un.spent_microusd, 0);
+        assert_eq!(un.runs, 0);
+    }
+
+    /// The month accumulators are persisted (and load as empty month-zero
+    /// state from a snapshot that predates them - covered by every OTHER
+    /// test loading legacy fixtures, since `unit_months` is
+    /// `#[serde(default)]`).
+    #[test]
+    fn unit_month_counters_persist_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-unitmonths.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest_at("acme", &[urec("r1", "treasury", "allow", 1000, 10)], JULY);
+        s.save(&path).expect("save");
+
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let units = s2.units_at("acme", JULY);
+        assert_eq!(units[0].unit, "treasury");
+        assert_eq!(units[0].month_spent_microusd, 1000);
+        assert_eq!(units[0].month_calls, 1);
+        // A restart across a month boundary still reads the stale window
+        // as zero.
+        assert_eq!(s2.units_at("acme", AUGUST)[0].month_spent_microusd, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// At [`MAX_UNIT_MONTH_KEYS`] distinct units, a NEW unit folds into
+    /// "unassigned" (visible, docs/20 section 3) instead of growing the map
+    /// or evicting - and existing units keep accumulating normally.
+    #[test]
+    fn unit_month_overflow_folds_into_unassigned() {
+        let s = Store::new();
+        let recs: Vec<CallRecord> = (0..MAX_UNIT_MONTH_KEYS)
+            .map(|i| urec(&format!("r{i}"), &format!("u{i}"), "allow", 1, 0))
+            .collect();
+        s.ingest_at("acme", &recs, JULY);
+        s.ingest_at("acme", &[urec("rx", "one-too-many", "allow", 7, 0)], JULY);
+        s.ingest_at("acme", &[urec("ry", "u0", "allow", 5, 0)], JULY);
+
+        let units = s.units_at("acme", JULY);
+        // The overflowed unit still gets an all-time row - the RunAgg fold
+        // is bounded by MAX_RUNS_PER_ORG, not this cap - but its MONTH
+        // counter lives in "unassigned".
+        assert_eq!(units.len(), MAX_UNIT_MONTH_KEYS + 2);
+        let otm = units
+            .iter()
+            .find(|u| u.unit == "one-too-many")
+            .expect("all-time row for the overflowed unit");
+        assert_eq!(otm.spent_microusd, 7);
+        assert_eq!(otm.month_spent_microusd, 0);
+        let un = units
+            .iter()
+            .find(|u| u.unit == "unassigned")
+            .expect("unassigned row");
+        assert_eq!(un.month_spent_microusd, 7);
+        let u0 = units.iter().find(|u| u.unit == "u0").expect("u0 row");
+        assert_eq!(u0.month_spent_microusd, 6);
     }
 
     /// Central unit-budget overrides round-trip through the store, mirroring
