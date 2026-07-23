@@ -73,6 +73,17 @@ pub enum EventType {
     /// Raised at the gateway's identity gate. Severity `high`, the same
     /// auth-family band as `dlp_block`/`taint_block`.
     IdentityMismatch,
+    /// New (docs/23, mcp-broker v2): one MCP `tools/call` that passed through
+    /// the broker's Wardryx policy gate. `data` carries `{tool, upstream,
+    /// decision}` where `decision` is the PDP's own `allow|deny|hold` (or
+    /// `would-<decision>` in shadow mode). Severity `low`: this is a
+    /// per-action audit signal, not an alert on its own -- a denied call is
+    /// visible in the `decision` field, not in the event's fixed severity, so
+    /// an operator can count and audit tool actions without every allowed one
+    /// paging like a `high` incident. Only emitted when the broker's Wardryx
+    /// gate is active and the request carried an `agent_id` (never fabricated,
+    /// see [`build`]).
+    ToolCall,
 }
 
 impl EventType {
@@ -90,6 +101,7 @@ impl EventType {
             EventType::TaintBlock => "taint_block",
             EventType::McpDrift => "mcp_drift",
             EventType::IdentityMismatch => "identity_mismatch",
+            EventType::ToolCall => "tool_call",
         }
     }
 
@@ -115,6 +127,9 @@ impl EventType {
             | EventType::DlpBlock
             | EventType::TaintBlock
             | EventType::IdentityMismatch => Severity::High,
+            // A per-action audit signal, not an alert: the allow/deny/hold is
+            // in `data.decision`, so allowed calls do not page like incidents.
+            EventType::ToolCall => Severity::Low,
         }
     }
 }
@@ -381,10 +396,19 @@ mod tests {
             (EventType::TaintBlock, "taint_block"),
             (EventType::McpDrift, "mcp_drift"),
             (EventType::IdentityMismatch, "identity_mismatch"),
+            (EventType::ToolCall, "tool_call"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
         }
+    }
+
+    #[test]
+    fn tool_call_is_a_low_severity_audit_signal() {
+        // A per-action audit event, not an alert: allowed tool calls must not
+        // carry a high/critical severity that would page like an incident.
+        assert_eq!(EventType::ToolCall.severity(), Severity::Low);
+        assert_eq!(EventType::ToolCall.as_wire_str(), "tool_call");
     }
 
     // -- build() / envelope shape -------------------------------------------

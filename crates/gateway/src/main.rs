@@ -256,10 +256,47 @@ async fn mcp_broker() {
     }
 
     let upstream = std::env::var("TOKENFUSE_MCP_UPSTREAM").unwrap_or_default();
-    if upstream.is_empty() {
-        eprintln!("set TOKENFUSE_MCP_UPSTREAM=<real MCP server url>");
+    // Additional named upstreams: `TOKENFUSE_MCP_UPSTREAMS="name=url,name2=url2"`.
+    // A request picks one by its `X-Fuse-Mcp-Upstream` header; an entry missing
+    // its `=` is skipped with a warning rather than silently mis-parsed.
+    let mut named_upstreams = std::collections::BTreeMap::new();
+    for entry in std::env::var("TOKENFUSE_MCP_UPSTREAMS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        match entry.split_once('=') {
+            Some((name, url)) if !name.trim().is_empty() && !url.trim().is_empty() => {
+                named_upstreams.insert(name.trim().to_string(), url.trim().to_string());
+            }
+            _ => eprintln!(
+                "TOKENFUSE_MCP_UPSTREAMS: ignoring malformed entry {entry:?} (want name=url)"
+            ),
+        }
+    }
+    if upstream.is_empty() && named_upstreams.is_empty() {
+        eprintln!(
+            "set TOKENFUSE_MCP_UPSTREAM=<real MCP server url> \
+             (and/or TOKENFUSE_MCP_UPSTREAMS=name=url,... for named upstreams)"
+        );
         return;
     }
+    // If only named upstreams are configured, the first is the default an
+    // un-named request forwards to, so the broker always has a fallback.
+    let upstream = if upstream.is_empty() {
+        named_upstreams
+            .values()
+            .next()
+            .cloned()
+            .expect("named_upstreams is non-empty here")
+    } else {
+        upstream
+    };
+    // The second PEP: the broker reuses the SAME Wardryx config the gateway
+    // reads (TOKENFUSE_WARDRYX_*), so configuring Wardryx once gates both the
+    // LLM path and MCP tool calls. Off unless TOKENFUSE_WARDRYX_MODE+URL are set.
+    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env());
     let vault = tokenfuse_core::SecretVault::from_pairs(
         &std::env::var("TOKENFUSE_MCP_SECRETS").unwrap_or_default(),
     );
@@ -285,10 +322,12 @@ async fn mcp_broker() {
     let events = Arc::new(tokenfuse_gateway::events::from_env());
     let state = Arc::new(BrokerState {
         upstream: upstream.clone(),
+        named_upstreams,
         vault,
         scan,
         dlp,
         lock,
+        wardryx,
         client: reqwest::Client::new(),
         events,
     });
