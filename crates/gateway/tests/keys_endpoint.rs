@@ -18,9 +18,19 @@ use tower::ServiceExt;
 const CONFIGURED_SECRET: &str = "sk-live-abc-super-secret";
 const OTHER_SECRET: &str = "sk-live-def-also-secret";
 
+/// Per-call uniquifier for the temp map path below. The tests in this binary
+/// run in parallel threads of ONE process, so a pid-only filename is shared
+/// across them - one test's `remove_file` then races another's read (exactly
+/// what CI hit: NotFound / a default map). Same fix `keysreport.rs`'s own
+/// `map_from` helper already uses.
+static NEXT_MAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_identity_map(json: &str) -> IdentityMap {
-    let path =
-        std::env::temp_dir().join(format!("tf-keys-endpoint-map-{}.json", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "tf-keys-endpoint-map-{}-{}.json",
+        std::process::id(),
+        NEXT_MAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&path, json).unwrap();
     let map = IdentityMap::from_path(&path).expect("valid map");
     let _ = std::fs::remove_file(&path);
