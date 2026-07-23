@@ -2,19 +2,19 @@
 //!
 //! Jobs at the boundary between the agent and a real MCP server:
 //!
-//! 1. **Credential brokering** — on `tools/call`, replace `{{secret:NAME}}`
+//! 1. **Credential brokering** - on `tools/call`, replace `{{secret:NAME}}`
 //!    handles in the params with real secrets from the vault *just before*
 //!    forwarding. The agent (and the LLM prompt, trace, and memory) only ever
 //!    holds handles; the secret appears only on the wire to the MCP server.
-//! 2. **Policy gate (the second PEP, docs/23)** — on `tools/call`, put the call
+//! 2. **Policy gate (the second PEP, docs/23)** - on `tools/call`, put the call
 //!    to the same Wardryx PDP the LLM path uses, BEFORE injecting secrets or
 //!    forwarding, so a `deny_tool` (or `deny_if_unattested`, or an approval
 //!    `hold`) policy enforces at the MCP layer too. Off unless Wardryx is
 //!    configured. The broker holds no signer and mutates nothing: a deny/hold
 //!    is a JSON-RPC refusal. Each gated call emits one `tool_call` audit event.
-//! 3. **Live poisoning + rug-pull scan** — on `tools/list`, run the
+//! 3. **Live poisoning + rug-pull scan** - on `tools/list`, run the
 //!    tool-description scanner and diff against a pinned lockfile.
-//! 4. **DLP** — block raw secrets in outgoing args and **redact** secrets in tool
+//! 4. **DLP** - block raw secrets in outgoing args and **redact** secrets in tool
 //!    responses so a result can't leak a credential into the model's context.
 //!
 //! A request selects one of several **named upstreams** with `X-Fuse-Mcp-Upstream`
@@ -172,7 +172,7 @@ fn emit_tool_call(
     crate::events::log_outcome(EventType::ToolCall, outcome);
 }
 
-/// HTTP handler — delegates to the transport-agnostic [`process`]. Reads the
+/// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
 /// (agent-passport SPEC.md §3.2) so an event raised for this request can carry
 /// the required `agent_id` (without it, events are skipped, not fabricated),
@@ -234,16 +234,16 @@ fn resolve_upstream<'a>(
     }
 }
 
-/// Broker a single JSON-RPC request and return the response — shared by the HTTP
+/// Broker a single JSON-RPC request and return the response - shared by the HTTP
 /// and stdio transports. Injects secrets, scans, forwards, and redacts.
 ///
-/// `agent_id`: the caller's `X-Fuse-Agent-Id`, when known — the HTTP
+/// `agent_id`: the caller's `X-Fuse-Agent-Id`, when known - the HTTP
 /// transport ([`handle`]) reads it off the request headers; the stdio
 /// transport ([`run_stdio`]) has no per-message header channel and always
 /// passes `None`, so a stdio-transport rug-pull is detected and logged
 /// (`tracing::warn!`, unchanged) but its `mcp_drift` agent-event is skipped
 /// (agent-passport SPEC.md §6.1 requires `agent_id`; see
-/// `tokenfuse_core::agent_event::build`) and counted — a known, documented
+/// `tokenfuse_core::agent_event::build`) and counted - a known, documented
 /// gap rather than a fabricated identity.
 pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
@@ -398,7 +398,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         }
     }
 
-    // Forward to the real MCP server (serialize by hand — reqwest's json feature
+    // Forward to the real MCP server (serialize by hand - reqwest's json feature
     // isn't enabled in this crate).
     let payload = match serde_json::to_vec(&req) {
         Ok(p) => p,
@@ -510,7 +510,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
     out
 }
 
-/// Run the broker over **stdio** — newline-delimited JSON-RPC on stdin/stdout,
+/// Run the broker over **stdio** - newline-delimited JSON-RPC on stdin/stdout,
 /// for MCP clients that launch a server as a subprocess. Each request is brokered
 /// via [`process`] and forwarded to the configured HTTP upstream. Logs must go to
 /// stderr (stdout is the protocol channel).
