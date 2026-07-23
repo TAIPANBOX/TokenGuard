@@ -385,14 +385,13 @@ export default function Page() {
                 <div className="s">this org</div>
               </div>
               {/* `summary.tool_calls` (like `summary.spent_microusd` in the
-                  "Spent today" tile above, and `summary.calls` in "Active
-                  runs") is `Store::summary`'s org-wide, full-ingest-history
-                  running total - there is no day-boundary reset anywhere in
-                  `OrgTotals`. "Spent today" already carries this same
-                  all-time-mislabeled-as-today pattern (a pre-existing issue,
-                  not introduced here and not fixed here - flagged
-                  separately), so this tile is labeled honestly instead of
-                  quietly repeating it: "Tool runs", not "...today". */}
+                  "Spent" tile above, and `summary.calls` in "Active runs")
+                  is `Store::summary`'s org-wide, full-ingest-history running
+                  total - there is no day-boundary reset anywhere in
+                  `OrgTotals`. Those tiles say "all time" for exactly this
+                  reason (#131, and see the caveat there about why a client-
+                  side /v1/series sum is not an honest "today"), so this one
+                  does too: "Tool runs", never "...today". */}
               <div className="card tile" style={{ gridColumn: "1 / -1" }}>
                 <div className="k">Tool runs</div>
                 <div className="n">{summary.tool_calls}</div>
