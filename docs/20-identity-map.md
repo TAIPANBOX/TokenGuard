@@ -116,7 +116,17 @@ counters roll over on the first call of a new month.
   ledger in this slice (a new dimension in raft state is a schema-identity
   decision, per this repo's invariants). Fleet-consistent unit caps are a
   future slice; the durable cross-fleet VIEW of unit spend lives in the Cloud
-  aggregation, which is fed by the trace and survives restarts.
+  aggregation, which is fed by the trace and survives restarts. That view
+  carries a month-to-date rollup mirroring this same UTC-calendar-month
+  window (`/v1/units` `month_*` fields), with two stated approximations: the
+  Cloud windows by its own receive clock (so a call in flight exactly at the
+  month boundary can land one window off by the telemetry batching delay,
+  seconds), and attribution is per call as resolved at call time, never
+  re-attributed when a run's unit is named later. On a plane upgraded
+  mid-month the counter starts at the upgrade (an under-count for that first
+  partial month) - there is no per-month history in old snapshots to
+  backfill from, and passing lifetime spend off as a month is exactly what
+  this rollup exists to avoid.
 - Budgets remain estimate-then-settle; the system stays fail-open on internal
   errors, as documented for run budgets.
 - With client keys off, `strict` has nothing authenticated to check: binding
@@ -140,7 +150,14 @@ counters roll over on the first call of a new month.
 - FOCUS export: a new `x_unit` column, one value per call row.
 - Cloud API (additive only):
   - ingest accepts the new `unit` field on records (defaults to empty).
-  - `GET /v1/units` - per-unit aggregation for the org (viewer role).
+  - `GET /v1/units` - per-unit aggregation for the org (viewer role). Each
+    row carries all-time totals plus `month`/`month_spent_microusd`/
+    `month_calls`: the month-to-date mirror of the unitledger window
+    (UTC calendar month, lazy rollover), sorted highest month-to-date
+    first. See section 3's honest limitations for the boundary/attribution
+    approximations; the dashboard compares the monthly caps against these
+    month columns, falling back to an explicitly-labeled all-time figure
+    on planes that predate them.
   - `POST /v1/units/{id}/budget` - central monthly-cap override (admin role,
     audited like run-budget changes).
   - `GET /v1/unit-budgets` - flat `{unit: microusd}` map for gateway pollers.
