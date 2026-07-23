@@ -142,6 +142,7 @@ mod tests {
                     on_behalf_of: String::new(),
                     outcome: String::new(),
                     key_id: String::new(),
+                    unit: String::new(),
                 });
             }
         }
@@ -250,6 +251,7 @@ mod tests {
                 on_behalf_of: String::new(),
                 outcome: String::new(),
                 key_id: String::new(),
+                unit: String::new(),
             });
         }
 
@@ -389,6 +391,7 @@ mod tests {
                 on_behalf_of: "user://acme.example/j.doe,agent://acme.example/orchestrator".into(),
                 outcome: String::new(),
                 key_id: String::new(),
+                unit: String::new(),
             });
         }
 
@@ -503,6 +506,7 @@ mod tests {
                 on_behalf_of: String::new(),
                 outcome: "case_resolved".into(),
                 key_id: String::new(),
+                unit: String::new(),
             });
         }
 
@@ -529,6 +533,122 @@ mod tests {
         assert_eq!(rows[0].1, "case_resolved");
         assert_eq!(rows[1].0, "pre-p4-run");
         assert_eq!(rows[1].1, "", "pre-P4 file's outcome defaults to ''");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Unit identity (docs/20-identity-map.md): the SAME schema-evolution
+    /// proof again, one more generation later - a trace directory that mixes
+    /// a PRE-UNIT file (14 columns, written before `unit` existed) with a NEW
+    /// file (15 columns, with it) must read back cleanly, with the old row
+    /// defaulting the new column to `''`. The new file's `unit` is a
+    /// NON-empty value, proving the column round-trips end to end rather than
+    /// merely defaulting to the same empty string everywhere.
+    #[tokio::test]
+    async fn mixed_pre_unit_and_unit_schema_files_read_with_defaults() {
+        use datafusion::arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("tf-sql-mixed-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // 1) Write a PRE-UNIT file by hand: exactly today's 14 columns (P4 +
+        //    key identity), genuinely lacking `unit` on disk.
+        let pre_unit_schema = Arc::new(Schema::new(vec![
+            Field::new("ts_millis", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("decision", DataType::Utf8, false),
+            Field::new("input_tokens", DataType::UInt64, false),
+            Field::new("output_tokens", DataType::UInt64, false),
+            Field::new("cost_microusd", DataType::Int64, false),
+            Field::new("step", DataType::UInt32, false),
+            Field::new("agent_id", DataType::Utf8, false),
+            Field::new("saved_microusd", DataType::Int64, false),
+            Field::new("parent_run_id", DataType::Utf8, false),
+            Field::new("on_behalf_of", DataType::Utf8, false),
+            Field::new("outcome", DataType::Utf8, false),
+            Field::new("key_id", DataType::Utf8, false),
+        ]));
+        let pre_unit_batch = RecordBatch::try_new(
+            pre_unit_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(StringArray::from(vec!["pre-unit-run"])),
+                Arc::new(StringArray::from(vec!["m"])),
+                Arc::new(StringArray::from(vec!["allow"])),
+                Arc::new(UInt64Array::from(vec![10u64])),
+                Arc::new(UInt64Array::from(vec![5u64])),
+                Arc::new(Int64Array::from(vec![1_000i64])),
+                Arc::new(UInt32Array::from(vec![1u32])),
+                Arc::new(StringArray::from(vec!["agent-old"])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+            ],
+        )
+        .unwrap();
+        {
+            let file = std::fs::File::create(dir.join("calls-pre-unit.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(file, pre_unit_schema, None).unwrap();
+            w.write(&pre_unit_batch).unwrap();
+            w.close().unwrap();
+        }
+
+        // 2) Write a unit-schema file via the current sink (has the new
+        //    column), with a NON-empty `unit` so the assertion below proves a
+        //    real round-trip rather than two empty strings matching by luck.
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            sink.record(CallRecord {
+                ts_millis: 2,
+                run_id: "unit-run".into(),
+                model: "m".into(),
+                decision: "allow".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: 1,
+                agent_id: "agent-new".into(),
+                saved_microusd: 0,
+                parent_run_id: String::new(),
+                on_behalf_of: String::new(),
+                outcome: String::new(),
+                key_id: String::new(),
+                unit: "treasury".into(),
+            });
+        }
+
+        // 3) Read via the sqlq path with the robust coalesce the CLIs use.
+        let batches = query(
+            "select run_id, coalesce(unit, '') as unit from calls order by run_id",
+            &dir_str,
+        )
+        .await
+        .expect("mixed pre-unit/unit schema read must succeed");
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for b in &batches {
+            for i in 0..b.num_rows() {
+                rows.push((
+                    str_at(b.column(0).as_ref(), i),
+                    str_at(b.column(1).as_ref(), i),
+                ));
+            }
+        }
+
+        assert_eq!(rows.len(), 2, "both files' rows must be present");
+        assert_eq!(rows[0].0, "pre-unit-run");
+        assert_eq!(rows[0].1, "", "pre-unit file's unit defaults to ''");
+        assert_eq!(rows[1].0, "unit-run");
+        assert_eq!(rows[1].1, "treasury", "the non-empty unit round-trips");
 
         std::fs::remove_dir_all(&dir).ok();
     }

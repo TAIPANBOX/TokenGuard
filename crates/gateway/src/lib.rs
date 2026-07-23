@@ -11,6 +11,7 @@ pub mod estimate;
 pub mod events;
 pub mod firewall;
 pub mod focusexport;
+pub mod identitymap;
 pub mod ledger_backend;
 pub mod mcpbroker;
 pub mod mcpcli;
@@ -31,6 +32,7 @@ pub mod sink;
 pub mod sqlq;
 pub mod state;
 pub mod tui;
+pub mod unitledger;
 pub mod wardryx;
 pub mod wasmpolicy;
 

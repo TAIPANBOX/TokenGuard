@@ -68,6 +68,11 @@ pub enum EventType {
     /// New: the MCP broker's live rug-pull check found a
     /// `tokenfuse_core::mcp::Drift::Changed` entry against the pinned lock.
     McpDrift,
+    /// New (docs/20, identity map): a strict-mode 403 because the presented
+    /// client credential may not speak as the claimed `x-fuse-agent-id`.
+    /// Raised at the gateway's identity gate. Severity `high`, the same
+    /// auth-family band as `dlp_block`/`taint_block`.
+    IdentityMismatch,
 }
 
 impl EventType {
@@ -84,6 +89,7 @@ impl EventType {
             EventType::DlpBlock => "dlp_block",
             EventType::TaintBlock => "taint_block",
             EventType::McpDrift => "mcp_drift",
+            EventType::IdentityMismatch => "identity_mismatch",
         }
     }
 
@@ -91,7 +97,7 @@ impl EventType {
     /// site can misclassify an event. Mapping (from the phase spec):
     /// `budget_exhausted` / `mcp_drift` / `breaker_tripped` = `critical`;
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
-    /// `taint_block` = `high`.
+    /// `taint_block` / `identity_mismatch` (docs/20) = `high`.
     ///
     /// Note this is deliberately independent of `cloud::store::Incident`'s
     /// own `severity` field (used for `/v1/incidents` today, e.g.
@@ -107,7 +113,8 @@ impl EventType {
             | EventType::SpendSpike
             | EventType::FanoutExplosion
             | EventType::DlpBlock
-            | EventType::TaintBlock => Severity::High,
+            | EventType::TaintBlock
+            | EventType::IdentityMismatch => Severity::High,
         }
     }
 }
@@ -356,6 +363,7 @@ mod tests {
             EventType::FanoutExplosion,
             EventType::DlpBlock,
             EventType::TaintBlock,
+            EventType::IdentityMismatch,
         ] {
             assert_eq!(t.severity(), Severity::High, "{t:?}");
         }
@@ -372,6 +380,7 @@ mod tests {
             (EventType::DlpBlock, "dlp_block"),
             (EventType::TaintBlock, "taint_block"),
             (EventType::McpDrift, "mcp_drift"),
+            (EventType::IdentityMismatch, "identity_mismatch"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);

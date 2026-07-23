@@ -9,11 +9,13 @@
 //!   headers with the exact settled figures.
 
 use crate::estimate::estimate_cost;
+use crate::identitymap::StrictMode;
 use crate::provider::{ProviderError, ProviderResponse};
 use crate::router::RouterMode;
 use crate::settle::SettleGuard;
 use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
+use crate::unitledger::UnitReservation;
 use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -139,6 +141,7 @@ fn emit_breaker_event(
     agent_id: &str,
     on_behalf_of: &[String],
     verdict: &BreakerVerdict,
+    unit: &str,
 ) {
     let outcome = st.events.emit(
         EventType::BreakerTripped,
@@ -152,6 +155,9 @@ fn emit_breaker_event(
             "spent_usd": verdict.spent_usd,
             "policy_id": verdict.policy_id,
             "detail": verdict.detail,
+            // The resolved business unit (docs/20); null when the identity
+            // map is off or nothing matched.
+            "unit": (!unit.is_empty()).then_some(unit),
         }),
         None,
     );
@@ -225,6 +231,71 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // `st.events.emit` below and in `buffered_managed`).
     let outcome_tag = outcome_header(&headers).unwrap_or_default();
 
+    // Identity map (docs/20): which business unit this call belongs to, and,
+    // in strict mode, whether the presented credential may speak as the
+    // claimed agent id at all. `unit` is resolved server-side (never
+    // caller-written) and rides into every CallRecord below; the mismatch
+    // check gates before anything is routed, priced, or forwarded.
+    let (unit, identity_mismatch) = {
+        let resolution = st.identity.resolve(&key_id, &agent_id);
+        (
+            resolution.unit.unwrap_or_default().to_string(),
+            resolution.mismatch,
+        )
+    };
+    let mut identity_header: Option<String> = None;
+    if let Some(mismatch) = identity_mismatch {
+        match st.identity_strict {
+            StrictMode::Off => {}
+            StrictMode::Warn => {
+                identity_header = Some(format!("would-block={}", mismatch.reason));
+            }
+            StrictMode::Enforce => {
+                let step = st
+                    .ledger
+                    .snapshot(&run_id)
+                    .await
+                    .map(|s| s.steps + 1)
+                    .unwrap_or(1);
+                st.sink.record(CallRecord {
+                    ts_millis: now_millis(),
+                    run_id: run_id.clone(),
+                    model: parsed.model.clone(),
+                    decision: "identity_mismatch".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    // Nothing was spent and no estimate exists yet on this
+                    // path (it is derived further down, past this gate).
+                    cost_microusd: 0,
+                    step,
+                    agent_id: agent_id.clone(),
+                    saved_microusd: 0,
+                    parent_run_id: parent_run_id.clone(),
+                    on_behalf_of: on_behalf_of.clone(),
+                    outcome: outcome_tag.clone(),
+                    key_id: key_id.clone(),
+                    unit: unit.clone(),
+                });
+                let outcome = st.events.emit(
+                    EventType::IdentityMismatch,
+                    now_millis(),
+                    Some(&agent_id),
+                    Some(&run_id),
+                    (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
+                    serde_json::json!({
+                        "key_id": key_id,
+                        "agent_id": agent_id,
+                        "reason": mismatch.reason,
+                        "unit": (!unit.is_empty()).then_some(&unit),
+                    }),
+                    None,
+                );
+                crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+                return identity_block(&run_id, mismatch.reason);
+            }
+        }
+    }
+
     // Model router (FinOps cost optimization): pick the cheapest model that
     // still meets this task's required quality tier, before anything below
     // prices, reserves, or forwards the request. Off is a true no-op:
@@ -297,6 +368,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             on_behalf_of: on_behalf_of.clone(),
             outcome: outcome_tag.clone(),
             key_id: key_id.clone(),
+            unit: unit.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -305,7 +377,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &st.policy_id,
             "run killed by operator",
         );
-        emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+        emit_breaker_event(
+            &st,
+            &run_id,
+            &agent_id,
+            &on_behalf_of_chain,
+            &verdict,
+            &unit,
+        );
         return breaker_error_response(&run_id, &verdict);
     }
 
@@ -339,6 +418,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
+                        unit: unit.clone(),
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -410,6 +490,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
+                        unit: unit.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -485,6 +566,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
+                unit: unit.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -493,7 +575,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 &eval.violated.clone().unwrap_or_default(),
             );
-            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+            emit_breaker_event(
+                &st,
+                &run_id,
+                &agent_id,
+                &on_behalf_of_chain,
+                &verdict,
+                &unit,
+            );
             return breaker_error_response(&run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
@@ -512,6 +601,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
+                unit: unit.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -520,7 +610,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 reason,
             );
-            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+            emit_breaker_event(
+                &st,
+                &run_id,
+                &agent_id,
+                &on_behalf_of_chain,
+                &verdict,
+                &unit,
+            );
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -558,6 +655,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 on_behalf_of: on_behalf_of.clone(),
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
+                unit: unit.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -566,7 +664,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 "blocked by custom wasm policy",
             );
-            emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+            emit_breaker_event(
+                &st,
+                &run_id,
+                &agent_id,
+                &on_behalf_of_chain,
+                &verdict,
+                &unit,
+            );
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -637,6 +742,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
+                        unit: unit.clone(),
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -659,6 +765,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         on_behalf_of: on_behalf_of.clone(),
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
+                        unit: unit.clone(),
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -672,6 +779,58 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // For shadow/warn, surface whichever signal tripped in the response header.
     let would_block = eval.violated.clone().or(loop_reason);
 
+    // Unit budget gate (docs/20): the resolved unit's monthly cap, checked
+    // BEFORE the run-level reserve so a unit-capped call never holds a run
+    // reservation it is about to lose. Enforce blocks (402 with the UNIT's
+    // numbers); shadow/warn record the unit spend without blocking, exactly
+    // the contract run budgets have. `None` when no unit resolved or the
+    // unit has no cap in effect: nothing reserved, nothing to settle.
+    let unit_reservation: Option<UnitReservation> = if unit.is_empty() {
+        None
+    } else {
+        match st.policy.mode {
+            Mode::Enforce => match st.units.try_reserve(&unit, estimate, now_millis()) {
+                Ok(r) => r,
+                Err(exceeded) => {
+                    st.sink.record(CallRecord {
+                        ts_millis: now_millis(),
+                        run_id: run_id.clone(),
+                        model: parsed.model.clone(),
+                        decision: "unit_budget_exceeded".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microusd: estimate.0,
+                        step: snapshot.steps + 1,
+                        agent_id: agent_id.clone(),
+                        saved_microusd: 0,
+                        parent_run_id: parent_run_id.clone(),
+                        on_behalf_of: on_behalf_of.clone(),
+                        outcome: outcome_tag.clone(),
+                        key_id: key_id.clone(),
+                        unit: unit.clone(),
+                    });
+                    let verdict = budget_verdict(
+                        BreakerReason::UnitBudgetExceeded,
+                        exceeded.budget,
+                        exceeded.spent,
+                        &st.policy_id,
+                        &format!("unit '{}' monthly budget exceeded", exceeded.unit),
+                    );
+                    emit_breaker_event(
+                        &st,
+                        &run_id,
+                        &agent_id,
+                        &on_behalf_of_chain,
+                        &verdict,
+                        &unit,
+                    );
+                    return breaker_error_response(&run_id, &verdict);
+                }
+            },
+            Mode::Shadow | Mode::Warn => st.units.reserve_unchecked(&unit, estimate, now_millis()),
+        }
+    };
+
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
     let reservation = match st.policy.mode {
@@ -683,6 +842,12 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 spent,
                 ..
             }) => {
+                // The unit reservation above was taken optimistically;
+                // release it (settle at zero) so a run-level refusal does
+                // not leak reserved unit headroom.
+                if let Some(ur) = &unit_reservation {
+                    st.units.settle(ur, Microusd::ZERO, now_millis());
+                }
                 let reason = if hit_run == run_id {
                     "per-run budget exceeded".to_string()
                 } else {
@@ -703,6 +868,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     on_behalf_of: on_behalf_of.clone(),
                     outcome: outcome_tag.clone(),
                     key_id: key_id.clone(),
+                    unit: unit.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -711,10 +877,20 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &st.policy_id,
                     &reason,
                 );
-                emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+                emit_breaker_event(
+                    &st,
+                    &run_id,
+                    &agent_id,
+                    &on_behalf_of_chain,
+                    &verdict,
+                    &unit,
+                );
                 return breaker_error_response(&run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
+                if let Some(ur) = &unit_reservation {
+                    st.units.settle(ur, Microusd::ZERO, now_millis());
+                }
                 // Unreachable today on both backends: the in-process ledger's
                 // `open_run` (above, before this match) always registers
                 // this exact `run_id` before `reserve` runs, and the raft
@@ -740,6 +916,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     on_behalf_of: on_behalf_of.clone(),
                     outcome: outcome_tag.clone(),
                     key_id: key_id.clone(),
+                    unit: unit.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -750,7 +927,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         "run '{run_id}' has no ledger reservation; denying instead of bypassing the budget check"
                     ),
                 );
-                emit_breaker_event(&st, &run_id, &agent_id, &on_behalf_of_chain, &verdict);
+                emit_breaker_event(
+                    &st,
+                    &run_id,
+                    &agent_id,
+                    &on_behalf_of_chain,
+                    &verdict,
+                    &unit,
+                );
                 return breaker_error_response(&run_id, &verdict);
             }
         },
@@ -774,8 +958,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     let resp = match st.provider.send(headers, body).await {
         Ok(r) => r,
         Err(e) => {
-            // Failed call cost us nothing — release the reservation.
+            // Failed call cost us nothing - release the reservation(s).
             st.ledger.settle(&reservation, Microusd::ZERO);
+            if let Some(ur) = &unit_reservation {
+                st.units.settle(ur, Microusd::ZERO, now_millis());
+            }
             return upstream_error(e);
         }
     };
@@ -793,6 +980,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             on_behalf_of,
             outcome_tag,
             key_id,
+            unit,
+            unit_reservation,
+            identity_header,
             router_header,
             wardryx_header,
         )
@@ -813,6 +1003,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &on_behalf_of_chain,
             &outcome_tag,
             &key_id,
+            &unit,
+            unit_reservation,
+            identity_header,
             router_header,
             router_route,
             wardryx_header,
@@ -867,6 +1060,9 @@ fn stream_managed(
     on_behalf_of: String,
     outcome: String,
     key_id: String,
+    unit: String,
+    unit_reservation: Option<UnitReservation>,
+    identity_header: Option<String>,
     router_header: Option<String>,
     wardryx_header: Option<String>,
 ) -> Response {
@@ -887,6 +1083,9 @@ fn stream_managed(
         on_behalf_of,
         outcome,
         key_id,
+        unit,
+        st.units.clone(),
+        unit_reservation,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -929,6 +1128,9 @@ fn stream_managed(
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
     }
+    if let Some(ih) = identity_header {
+        builder = builder.header("x-fuse-identity", ih);
+    }
     builder
         .body(Body::from_stream(wrapped))
         .expect("valid response")
@@ -953,6 +1155,9 @@ async fn buffered_managed(
     on_behalf_of_chain: &[String],
     outcome_tag: &str,
     key_id: &str,
+    unit: &str,
+    unit_reservation: Option<UnitReservation>,
+    identity_header: Option<String>,
     router_header: Option<String>,
     router_route: Option<(String, String)>,
     wardryx_header: Option<String>,
@@ -967,6 +1172,9 @@ async fn buffered_managed(
         Ok(b) => b,
         Err(e) => {
             st.ledger.settle(&reservation, Microusd::ZERO);
+            if let Some(ur) = &unit_reservation {
+                st.units.settle(ur, Microusd::ZERO, now_millis());
+            }
             return upstream_error(e);
         }
     };
@@ -977,6 +1185,9 @@ async fn buffered_managed(
         .and_then(|u| st.prices.cost(model, u))
         .unwrap_or(reservation.amount);
     st.ledger.settle(&reservation, actual);
+    if let Some(ur) = &unit_reservation {
+        st.units.settle(ur, actual, now_millis());
+    }
     let spent = st
         .ledger
         .snapshot(&reservation.run_id)
@@ -1025,6 +1236,7 @@ async fn buffered_managed(
         on_behalf_of: on_behalf_of.to_string(),
         outcome: outcome_tag.to_string(),
         key_id: key_id.to_string(),
+        unit: unit.to_string(),
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -1056,6 +1268,7 @@ async fn buffered_managed(
                     on_behalf_of: on_behalf_of.to_string(),
                     outcome: outcome_tag.to_string(),
                     key_id: key_id.to_string(),
+                    unit: unit.to_string(),
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
@@ -1126,6 +1339,9 @@ async fn buffered_managed(
     }
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
+    }
+    if let Some(ih) = identity_header {
+        builder = builder.header("x-fuse-identity", ih);
     }
     builder.body(Body::from(bytes)).expect("valid response")
 }
@@ -1209,6 +1425,31 @@ fn firewall_block(run_id: &str, reason: &str) -> Response {
         .header("x-fuse", "blocked")
         .header("x-fuse-run-id", run_id.to_string())
         .header("x-fuse-taint", format!("blocked: {reason}"))
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// Identity mismatch (docs/20): strict mode refused to let the presented
+/// credential speak as the claimed agent id. A 403 auth-family block like
+/// `dlp_block`/`firewall_block`; the body comes from the Breaker facade's
+/// minimal shape (no budget fields), keeping the wire contract in one place.
+fn identity_block(run_id: &str, reason: &str) -> Response {
+    let verdict = BreakerVerdict {
+        tripped: true,
+        reason: Some(BreakerReason::IdentityMismatch),
+        detail: Some(reason.to_string()),
+        budget_usd: None,
+        spent_usd: None,
+        policy_id: None,
+        would_trip_only: false,
+    };
+    let body = verdict.to_error_json(run_id);
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .header("x-fuse-identity", format!("blocked={reason}"))
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }
@@ -2382,6 +2623,9 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
+            None,
+            None,
             None,
             None,
         );
@@ -2748,5 +2992,192 @@ mod tests {
         let builder = set_header_checked(builder, "x-fuse-router", "foo\rbar");
         let resp = builder.body(Body::empty()).expect("valid response");
         assert!(resp.headers().get("x-fuse-router").is_none());
+    }
+
+    // -- identity map: mismatch gate + unit budgets (docs/20) ----------------
+
+    /// The docs/20 example map, scaled down for tests: `treasury` capped at
+    /// $1/month and bound to one key; `lending` uncapped, prefix-only.
+    const TEST_IDENTITY_MAP: &str = r#"{
+        "units": [
+            { "id": "treasury", "budget_usd_month": 1.0 },
+            { "id": "lending" }
+        ],
+        "keys": [
+            { "key_id": "treasury-bots", "unit": "treasury",
+              "agents": ["agent://bank.example/treasury/*"] }
+        ],
+        "prefixes": [
+            { "match": "agent://bank.example/lending/*", "unit": "lending" }
+        ]
+    }"#;
+
+    fn identity_state(mode: Mode, strict: crate::identitymap::StrictMode) -> AppState {
+        static NEXT_MAP: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tokenfuse-idmap-test-{}-{}.json",
+            std::process::id(),
+            NEXT_MAP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, TEST_IDENTITY_MAP).unwrap();
+        let map = crate::identitymap::IdentityMap::from_path(&path).unwrap();
+        let units = Arc::new(crate::unitledger::UnitLedger::new(map.unit_budgets()));
+        state(mode, StubProvider::default())
+            .with_client_keys(Arc::new(
+                crate::clientkeys::ClientKeys::from_spec("sk-t:treasury-bots").unwrap(),
+            ))
+            .with_identity(Arc::new(map), strict, units)
+    }
+
+    #[tokio::test]
+    async fn identity_enforce_blocks_a_foreign_agent_id_with_403() {
+        let sink = RecordingSink::default();
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "id-enforce")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get("x-fuse-identity").unwrap(),
+            "blocked=agent_id_not_allowed"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "identity_mismatch");
+        assert!(json["error"].get("budget_usd").is_none());
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "identity_mismatch");
+        assert_eq!(records[0].cost_microusd, 0);
+        // The mismatch still attributes the BINDING's unit on the trace.
+        assert_eq!(records[0].unit, "treasury");
+    }
+
+    #[tokio::test]
+    async fn identity_warn_allows_and_sets_the_would_block_header() {
+        let sink = RecordingSink::default();
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Warn)
+            .with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "id-warn")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-fuse-identity").unwrap(),
+            "would-block=agent_id_not_allowed"
+        );
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "allow");
+        assert_eq!(records[0].unit, "treasury");
+    }
+
+    #[tokio::test]
+    async fn identity_off_still_attributes_the_unit_via_prefix() {
+        // No client key presented at all: the prefix fallback attributes the
+        // unit, no mismatch is possible, nothing blocks.
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Off)
+            .with_sink(Arc::new(sink.clone()));
+        st.client_keys = Arc::new(crate::clientkeys::ClientKeys::default());
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "id-prefix")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/lending/scorer")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-fuse-identity").is_none());
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "allow");
+        assert_eq!(records[0].unit, "lending");
+    }
+
+    #[tokio::test]
+    async fn unit_budget_exceeded_blocks_at_402_with_the_units_numbers() {
+        // Estimate for max_tokens=100000 at $15/Mtok output is ~$1.5, past
+        // treasury's $1 monthly cap, while the run budget ($100) has room:
+        // the trip must name the UNIT's cap, not the run's.
+        let sink = RecordingSink::default();
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "unit-402")
+            .header("x-fuse-budget-usd", "100.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(100_000)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unit_budget_exceeded");
+        assert_eq!(json["error"]["budget_usd"], 1.0);
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "unit_budget_exceeded");
+        assert_eq!(records[0].unit, "treasury");
+        // Blocked spend stays visible: the avoided estimate rides the row.
+        assert!(records[0].cost_microusd > 0);
+    }
+
+    #[tokio::test]
+    async fn unit_spend_settles_into_the_unit_ledger() {
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "unit-settle")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let spent = units.spent("treasury", now_millis());
+        assert!(
+            spent > Microusd::ZERO,
+            "the unit ledger must absorb the settled cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_budget_refusal_releases_the_unit_reservation() {
+        // The unit reserve is taken first; when the run-level reserve then
+        // refuses, the unit reservation must be released, not leaked.
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "unit-release")
+            // A run budget far below any estimate: the run gate refuses.
+            .header("x-fuse-budget-usd", "0.000001")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "budget_exceeded");
+        assert_eq!(units.spent("treasury", now_millis()), Microusd::ZERO);
+        // Nearly the whole cap must still be reservable: nothing leaked.
+        assert!(units
+            .try_reserve("treasury", Microusd::from_usd(0.99), now_millis())
+            .is_ok());
     }
 }

@@ -105,6 +105,40 @@ async fn mutations_are_audited_and_chain_verifies() {
     assert!(v.get("break_index").is_none());
 }
 
+/// A unit-budget change is audited under a distinguishable action name
+/// (`control.unit_budget_set`, vs. `control.set_budget` for a run) -
+/// docs/20-identity-map.md section 4, mirroring the run-budget entry in
+/// `mutations_are_audited_and_chain_verifies` above.
+#[tokio::test]
+async fn unit_budget_change_is_audited() {
+    let state = test_state();
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/units/treasury/budget",
+        Some("devkey"),
+        Some(r#"{"budget_usd":2.5}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = send(&state, "GET", "/v1/audit", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = v.as_array().expect("audit is an array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["action"], "control.unit_budget_set");
+    assert_eq!(entries[0]["subject"], "treasury");
+    assert_eq!(entries[0]["detail"], "budget_micros=2500000");
+    let actor = entries[0]["actor"].as_str().unwrap();
+    assert!(actor.starts_with("key:"), "actor was {actor}");
+
+    // The chain still verifies end-to-end.
+    let (status, v) = send(&state, "GET", "/v1/audit/verify", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+}
+
 #[tokio::test]
 async fn audit_readable_by_viewer_unauth_rejected() {
     let state = test_state();

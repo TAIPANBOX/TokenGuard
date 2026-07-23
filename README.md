@@ -603,7 +603,27 @@ Notes, because the details matter more than the flag:
 - **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
 - **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
 - **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
-- **Scope, stated plainly:** this is `/v1/messages` only. `/v1/runs` and `/v1/runs/{id}/kill` on the gateway are unauthenticated today and stay that way in this change; if that matters to you, do not expose the gateway's admin surface. This adds identity, it does not yet enforce a budget against it.
+- **Scope, stated plainly:** this is `/v1/messages` only. `/v1/runs` and `/v1/runs/{id}/kill` on the gateway are unauthenticated today and stay that way in this change; if that matters to you, do not expose the gateway's admin surface. This adds identity; the budget enforced against it is the identity map, next.
+
+**Identity map: key ↔ agent ↔ business unit, plus monthly unit budgets** (opt-in, off by default; design notes in [docs/20](docs/20-identity-map.md)):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOKENFUSE_IDENTITY_MAP` | unset ⇒ **off** | Path to a JSON map with three sections: `units` (each optionally carrying `budget_usd_month`), `keys` (which `key_id` belongs to which unit, and which `agent://` ids it may present), `prefixes` (attribution fallback for unkeyed traffic). Set-but-unusable refuses to start, same posture as `TOKENFUSE_CLIENT_KEYS`. |
+| `TOKENFUSE_IDENTITY_STRICT` | `off` | `off \| warn \| enforce`, governing ONLY the key↔agent binding check: `warn` lets the call through with `x-fuse-identity: would-block=<reason>`; `enforce` returns `403` with `"type": "identity_mismatch"`. Unit budgets follow `TOKENFUSE_MODE` like every other budget. |
+
+```json
+{
+  "units":    [{ "id": "treasury", "budget_usd_month": 2000.0 }],
+  "keys":     [{ "key_id": "treasury-bots", "unit": "treasury",
+                 "agents": ["agent://bank.example/treasury/*"] }],
+  "prefixes": [{ "match": "agent://bank.example/treasury/*", "unit": "treasury" }]
+}
+```
+
+This closes the loop the client-credential slice opened: the credential (`key_id`) is bound to the agent ids it may present, agents roll up into a business unit, and the unit gets the first budget **above** the run - a UTC-calendar-month cap enforced with the same reserve-then-settle discipline as run budgets (`402`, `"type": "unit_budget_exceeded"`, with the unit's numbers). Every trace row now carries a server-resolved `unit` column (nullable-evolution, old files keep reading), `focus-export` grows an `x_unit` column so per-unit chargeback is a spreadsheet filter, and the Cloud aggregates per-unit spend (`GET /v1/units`) with central per-unit cap overrides (`POST /v1/units/{id}/budget`, polled by every gateway of the org). Unmapped spend stays visible as the `unassigned` bucket, never silently dropped.
+
+Limits, stated plainly: unit counters are in-process and per-gateway - they reset on restart and are not fleet-consistent across gateways (the replicated raft ledger deliberately does not grow this dimension in this change; the durable cross-fleet view of unit spend is the Cloud aggregation). Budgets remain estimate-then-settle. With client keys off, `strict` has nothing authenticated to check: binding checks stay idle and only prefix attribution applies.
 
 ---
 
@@ -623,6 +643,7 @@ Notes, because the details matter more than the flag:
 | [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
 | [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` — a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
 | [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
+| [20 · Identity map](docs/20-identity-map.md) | Key ↔ agent ↔ business-unit binding, strict mode, and monthly unit budgets: the design + build plan behind the "Identity map" section above |
 
 ---
 

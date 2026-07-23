@@ -132,6 +132,7 @@ mod tests {
             on_behalf_of: String::new(),
             outcome: String::new(),
             key_id: String::new(),
+            unit: String::new(),
         }
     }
 

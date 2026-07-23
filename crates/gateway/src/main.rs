@@ -385,6 +385,73 @@ async fn serve() {
         );
     }
 
+    // The declarative key<->agent<->unit identity map (docs/20). Unset leaves
+    // identity off, exactly as before. Set-but-unusable exits instead of
+    // falling back to "off", mirroring TOKENFUSE_CLIENT_KEYS above: a typo in
+    // an env var must never silently disable what the operator believes is on.
+    let identity_map = match std::env::var("TOKENFUSE_IDENTITY_MAP") {
+        Ok(path) if !path.trim().is_empty() => {
+            match tokenfuse_gateway::identitymap::IdentityMap::from_path(std::path::Path::new(
+                path.trim(),
+            )) {
+                Ok(map) => map,
+                Err(e) => {
+                    eprintln!("tokenfuse: TOKENFUSE_IDENTITY_MAP: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        _ => tokenfuse_gateway::identitymap::IdentityMap::default(),
+    };
+    // Strict mode governs ONLY the key<->agent binding check; unit budgets
+    // follow TOKENFUSE_MODE like every other budget. An unknown value exits
+    // (same posture as an unusable map: refuse, never guess).
+    let identity_strict = {
+        let raw = std::env::var("TOKENFUSE_IDENTITY_STRICT").unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            tokenfuse_gateway::identitymap::StrictMode::Off
+        } else {
+            match trimmed.parse::<tokenfuse_gateway::identitymap::StrictMode>() {
+                Ok(mode) => mode,
+                Err(_) => {
+                    eprintln!(
+                        "tokenfuse: TOKENFUSE_IDENTITY_STRICT must be off|warn|enforce, got `{trimmed}`"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+    let units = Arc::new(tokenfuse_gateway::unitledger::UnitLedger::new(
+        identity_map.unit_budgets(),
+    ));
+    if identity_map.enabled() {
+        println!(
+            "identity map: ON ({} unit(s), {} key binding(s)); strict={:?}",
+            identity_map.unit_count(),
+            identity_map.key_count(),
+            identity_strict,
+        );
+        // A map key_id with no client key can never authenticate, so its
+        // binding can never match live traffic. Warn, do not refuse: the two
+        // env vars are legitimately staged independently.
+        for id in identity_map.key_ids() {
+            if !client_keys.key_ids().any(|k| k == id) {
+                eprintln!(
+                    "tokenfuse: identity map key_id `{id}` has no matching TOKENFUSE_CLIENT_KEYS entry; its binding cannot match live traffic"
+                );
+            }
+        }
+        if identity_strict != tokenfuse_gateway::identitymap::StrictMode::Off
+            && !client_keys.enabled()
+        {
+            eprintln!(
+                "tokenfuse: TOKENFUSE_IDENTITY_STRICT is set but TOKENFUSE_CLIENT_KEYS is not; nothing is authenticated to check, so binding checks stay idle and only prefix attribution applies"
+            );
+        }
+    }
+
     let mut state = AppState::new(
         Arc::new(Ledger::new()),
         Arc::new(prices),
@@ -392,7 +459,8 @@ async fn serve() {
         provider,
         "default",
     )
-    .with_client_keys(Arc::new(client_keys));
+    .with_client_keys(Arc::new(client_keys))
+    .with_identity(Arc::new(identity_map), identity_strict, units.clone());
 
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
     // records would-hits without serving them — safe to drop in).
@@ -511,6 +579,23 @@ async fn serve() {
                     stb.set_cloud_budgets(budgets);
                 },
             );
+            // Pull centrally-managed per-unit monthly caps (docs/20). Only
+            // when the identity map is on: an unconfigured gateway has no
+            // units to apply them to, so it does not poll the endpoint.
+            if state.identity.enabled() {
+                let stu = units.clone();
+                tokenfuse_gateway::cloudsink::spawn_unit_budget_poller(
+                    base.clone(),
+                    key.clone(),
+                    move |map| {
+                        let overrides = map
+                            .into_iter()
+                            .map(|(unit, micros)| (unit, tokenfuse_core::Microusd(micros)))
+                            .collect();
+                        stu.set_overrides(overrides);
+                    },
+                );
+            }
             let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(base, key));
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();

@@ -103,6 +103,34 @@ async fn budget_flow() {
     assert_eq!(budgets["r9"], 2_500_000);
 }
 
+/// Mirrors `budget_flow`, but for `POST /v1/units/{id}/budget` +
+/// `GET /v1/unit-budgets` (docs/20-identity-map.md section 4).
+#[tokio::test]
+async fn unit_budget_flow() {
+    let state = test_state();
+
+    let (status, v) = send(
+        &state,
+        "POST",
+        "/v1/units/treasury/budget",
+        Some("devkey"),
+        Some(r#"{"budget_usd":2.5}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["unit"], "treasury");
+    assert_eq!(v["budget_micros"], 2_500_000);
+
+    let (status, budgets) = send(&state, "GET", "/v1/unit-budgets", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budgets["treasury"], 2_500_000);
+
+    // A viewer may poll the flat map too (same auth level as `/v1/budgets`).
+    let (status, budgets) = send(&state, "GET", "/v1/unit-budgets", Some("viewerkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(budgets["treasury"], 2_500_000);
+}
+
 #[tokio::test]
 async fn viewer_can_read_but_not_mutate() {
     let state = test_state();
@@ -120,6 +148,17 @@ async fn viewer_can_read_but_not_mutate() {
         &state,
         "POST",
         "/v1/runs/r1/budget",
+        Some("viewerkey"),
+        Some(r#"{"budget_usd":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // ...and cannot set a unit budget either.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/units/treasury/budget",
         Some("viewerkey"),
         Some(r#"{"budget_usd":1}"#),
     )

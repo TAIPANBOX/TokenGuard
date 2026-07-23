@@ -20,13 +20,15 @@ use datafusion::parquet::arrow::ArrowWriter;
 /// One settled call, the unit of the trace.
 ///
 /// Schema evolution note (P2 → P3/agent-passport → P4/outcome-tags → key
-/// identity): `agent_id` and `saved_microusd` were appended after the first
-/// files were written (P2); `parent_run_id` and `on_behalf_of` follow the exact
-/// same pattern (P3); `outcome` follows it again (P4); `key_id` follows it once
-/// more. New fields go at the END and the Parquet
-/// schema keeps a stable order (see [`ParquetSink::schema`]); old files simply
-/// lack the trailing columns and read back as defaults (see `sqlq`). Never
-/// reorder or remove a field — that breaks backward-compatible reads.
+/// identity → unit identity): `agent_id` and `saved_microusd` were appended
+/// after the first files were written (P2); `parent_run_id` and
+/// `on_behalf_of` follow the exact same pattern (P3); `outcome` follows it
+/// again (P4); `key_id` follows it once more; `unit`
+/// (docs/20-identity-map.md section 4) follows it again. New fields go at the
+/// END and the Parquet schema keeps a stable order (see
+/// [`ParquetSink::schema`]); old files simply lack the trailing columns and
+/// read back as defaults (see `sqlq`). Never reorder or remove a field - that
+/// breaks backward-compatible reads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
     pub ts_millis: i64,
@@ -84,6 +86,13 @@ pub struct CallRecord {
     /// Still attribution-only HERE: this field records identity, it does not
     /// enforce anything. Enforcement is a later slice.
     pub key_id: String,
+    /// The business unit this call's key/agent maps to, resolved server-side
+    /// from the identity map (docs/20-identity-map.md). `""` when the
+    /// identity map is off or nothing matched.
+    ///
+    /// Attribution/aggregation only, exactly like `key_id` above - not part
+    /// of run-ledger accounting.
+    pub unit: String,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -185,6 +194,9 @@ impl ParquetSink {
             // [`CallRecord::key_id`]; this is the first column on the trace
             // that the caller cannot choose.
             Field::new("key_id", DataType::Utf8, false),
+            // Appended unit-identity column - same rule: LAST. See
+            // [`CallRecord::unit`] (docs/20-identity-map.md section 4).
+            Field::new("unit", DataType::Utf8, false),
         ]))
     }
 
@@ -227,6 +239,9 @@ impl ParquetSink {
             // Key identity: same treatment once more, so every trace written
             // before client keys existed still reads back.
             Field::new("key_id", DataType::Utf8, true),
+            // Unit identity: same treatment once more, so every trace
+            // written before the identity map existed still reads back.
+            Field::new("unit", DataType::Utf8, true),
         ]))
     }
 
@@ -294,6 +309,9 @@ impl ParquetSink {
                 )),
                 Arc::new(StringArray::from(
                     records.iter().map(|r| r.key_id.clone()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records.iter().map(|r| r.unit.clone()).collect::<Vec<_>>(),
                 )),
             ],
         )?;
@@ -363,6 +381,7 @@ mod tests {
             on_behalf_of: String::new(),
             outcome: String::new(),
             key_id: String::new(),
+            unit: String::new(),
         }
     }
 

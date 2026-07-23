@@ -39,6 +39,7 @@ use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
     AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
+    UnitAgg,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -51,14 +52,16 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        incidents, ack_incident, compliance, compliance_evidence, audit, audit_verify,
-        audit_manifest, replay, pair_new, pair, register_apns, register_activity,
+        ingest, runs, agents, units, savings, summary, alerts, series, kill, kills, set_budget,
+        budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
+        compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
+        register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
         RunAgg,
         AgentAgg,
+        UnitAgg,
         SavingsSummary,
         Summary,
         Alert,
@@ -78,6 +81,7 @@ use crate::store::{
         IngestResponse,
         BudgetBody,
         BudgetResponse,
+        UnitBudgetResponse,
         KillResponse,
         AckResponse,
         ErrorResponse,
@@ -342,6 +346,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
         .route("/v1/agents", get(agents))
+        .route("/v1/units", get(units))
         .route("/v1/savings", get(savings))
         .route("/v1/summary", get(summary))
         .route("/v1/alerts", get(alerts))
@@ -351,6 +356,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/kills", get(kills))
         .route("/v1/runs/{run}/budget", post(set_budget))
         .route("/v1/budgets", get(budgets))
+        .route("/v1/units/{id}/budget", post(set_unit_budget))
+        .route("/v1/unit-budgets", get(unit_budgets))
         .route("/v1/incidents", get(incidents))
         .route("/v1/incidents/{id}/ack", post(ack_incident))
         .route("/v1/findings", post(external_findings))
@@ -404,6 +411,14 @@ struct BudgetBody {
 #[derive(Serialize, ToSchema)]
 struct BudgetResponse {
     run: String,
+    budget_micros: i64,
+}
+
+/// Response for `POST /v1/units/{id}/budget` - same shape as [`BudgetResponse`]
+/// with `unit` in place of `run` (docs/20-identity-map.md section 4).
+#[derive(Serialize, ToSchema)]
+struct UnitBudgetResponse {
+    unit: String,
     budget_micros: i64,
 }
 
@@ -603,6 +618,24 @@ async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.agents(&org))).into_response()
+}
+
+/// The caller org's per-unit spend rollup, highest spend first
+/// (docs/20-identity-map.md section 4). A run with no resolved unit rolls up
+/// under the literal `"unassigned"` bucket, never a blank one.
+#[utoipa::path(
+    get, path = "/v1/units",
+    responses(
+        (status = 200, description = "aggregated units, highest spend first; unmapped spend rolls up under \"unassigned\"", body = Vec<UnitAgg>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn units(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.units(&org))).into_response()
 }
 
 /// The caller org's FinOps savings: budget-protection blocked (avoided) spend,
@@ -843,6 +876,70 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
+}
+
+/// Set a central monthly budget for a unit (admin only;
+/// docs/20-identity-map.md section 4). Gateways poll `/v1/unit-budgets`.
+#[utoipa::path(
+    post, path = "/v1/units/{id}/budget",
+    params(("id" = String, Path, description = "unit id")),
+    request_body = BudgetBody,
+    responses(
+        (status = 200, description = "unit budget set", body = UnitBudgetResponse),
+        (status = 400, description = "malformed json", body = ErrorResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
+async fn set_unit_budget(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(unit): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let parsed: BudgetBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(_) => return bad_json(),
+    };
+    let micros = (parsed.budget_usd * 1e6) as i64;
+    // Mutation + audit entry under ONE store write-lock acquisition - see
+    // `Store::set_unit_budget_audited`'s doc.
+    st.store
+        .set_unit_budget_audited(&org, &unit, micros, &actor);
+    (
+        StatusCode::OK,
+        Json(UnitBudgetResponse {
+            unit,
+            budget_micros: micros,
+        }),
+    )
+        .into_response()
+}
+
+/// This org's unit → budget-micros overrides (gateways poll this every 3s;
+/// see `crates/gateway/src/cloudsink.rs::spawn_unit_budget_poller`). A
+/// separate endpoint from `/v1/budgets` on purpose (docs/20-identity-map.md
+/// section 4): that payload is a flat `run_id -> i64` map old gateways parse
+/// verbatim, so it cannot grow a nested key without breaking them.
+#[utoipa::path(
+    get, path = "/v1/unit-budgets",
+    responses(
+        (status = 200, description = "unit → budget micros"),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
+async fn unit_budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.unit_budgets(&org))).into_response()
 }
 
 /// The caller org's open incidents, most-recently-seen first. Readable by any
