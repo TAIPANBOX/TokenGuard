@@ -6,7 +6,7 @@
 //! trace id, so a run shows up as one trace in Grafana/Datadog/Honeycomb.
 //!
 //! Implemented directly against the OTLP/HTTP JSON endpoint (`/v1/traces`) using
-//! the HTTP client we already have — no heavy OTel crate tree, and it's a no-op
+//! the HTTP client we already have - no heavy OTel crate tree, and it's a no-op
 //! unless `TOKENFUSE_OTLP_ENDPOINT` is set.
 
 use std::hash::{Hash, Hasher};
@@ -36,6 +36,39 @@ impl OtelSink {
     }
 }
 
+/// The OTel GenAI `gen_ai.system` value for a model, by well-known name
+/// prefix, or `None` when the provider can't be told from the model name.
+/// Returning `None` (so the attribute is omitted) is deliberate: TokenFuse is
+/// provider-agnostic and records only the model string, so guessing a
+/// `gen_ai.system` for an unrecognized model would be a fabricated attribute,
+/// which "honesty is a feature" forbids. The values are the semantic-convention
+/// registry's own (`anthropic`, `openai`, `gcp.gemini`, `cohere`, `mistral_ai`,
+/// `deepseek`, `groq`).
+fn gen_ai_system(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("claude") {
+        Some("anthropic")
+    } else if m.starts_with("gpt")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+    {
+        Some("openai")
+    } else if m.starts_with("gemini") {
+        Some("gcp.gemini")
+    } else if m.starts_with("command") || m.starts_with("cohere") {
+        Some("cohere")
+    } else if m.starts_with("mistral") || m.starts_with("codestral") {
+        Some("mistral_ai")
+    } else if m.starts_with("deepseek") {
+        Some("deepseek")
+    } else if m.starts_with("groq") {
+        Some("groq")
+    } else {
+        None
+    }
+}
+
 fn hash64(parts: &[&str]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for p in parts {
@@ -49,7 +82,7 @@ fn hash64(parts: &[&str]) -> u64 {
     }
 }
 
-/// Build the OTLP/JSON payload for a single call. Pure — unit-tested.
+/// Build the OTLP/JSON payload for a single call. Pure - unit-tested.
 pub fn otlp_json(rec: &CallRecord, service: &str) -> serde_json::Value {
     // A run maps to one trace; each step is a span within it.
     let trace_id = format!(
@@ -65,6 +98,31 @@ pub fn otlp_json(rec: &CallRecord, service: &str) -> serde_json::Value {
         |k: &str, v: i64| serde_json::json!({ "key": k, "value": { "intValue": v.to_string() } });
     let attr_d = |k: &str, v: f64| serde_json::json!({ "key": k, "value": { "doubleValue": v } });
 
+    // GenAI semantic-convention attributes first, then TokenFuse's own. Built as
+    // a Vec so `gen_ai.system` can be omitted when the provider is unknown (see
+    // `gen_ai_system`), rather than emitting a guessed value.
+    let mut attributes = vec![
+        // `operation.name` is `chat`: the gateway proxies the chat/messages
+        // completion operation, which is a constant here, not a per-call guess.
+        attr_s("gen_ai.operation.name", "chat"),
+        attr_s("gen_ai.request.model", &rec.model),
+        // The model that actually served the call. TokenFuse records the model
+        // used, so response and request model are the same value here; both are
+        // emitted so a semconv-aware backend sees the standard pair.
+        attr_s("gen_ai.response.model", &rec.model),
+        attr_i("gen_ai.usage.input_tokens", rec.input_tokens as i64),
+        attr_i("gen_ai.usage.output_tokens", rec.output_tokens as i64),
+    ];
+    if let Some(system) = gen_ai_system(&rec.model) {
+        attributes.push(attr_s("gen_ai.system", system));
+    }
+    attributes.extend([
+        attr_s("tokenfuse.run_id", &rec.run_id),
+        attr_i("tokenfuse.step", rec.step as i64),
+        attr_s("tokenfuse.decision", &rec.decision),
+        attr_d("tokenfuse.cost_usd", rec.cost_microusd as f64 / 1e6),
+    ]);
+
     serde_json::json!({
         "resourceSpans": [{
             "resource": { "attributes": [ attr_s("service.name", service) ] },
@@ -77,15 +135,7 @@ pub fn otlp_json(rec: &CallRecord, service: &str) -> serde_json::Value {
                     "kind": 3, // CLIENT
                     "startTimeUnixNano": start_nanos,
                     "endTimeUnixNano": start_nanos,
-                    "attributes": [
-                        attr_s("gen_ai.request.model", &rec.model),
-                        attr_i("gen_ai.usage.input_tokens", rec.input_tokens as i64),
-                        attr_i("gen_ai.usage.output_tokens", rec.output_tokens as i64),
-                        attr_s("tokenfuse.run_id", &rec.run_id),
-                        attr_i("tokenfuse.step", rec.step as i64),
-                        attr_s("tokenfuse.decision", &rec.decision),
-                        attr_d("tokenfuse.cost_usd", rec.cost_microusd as f64 / 1e6),
-                    ]
+                    "attributes": attributes
                 }]
             }]
         }]
@@ -162,10 +212,55 @@ mod tests {
         assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
         let attrs = span["attributes"].as_array().unwrap();
         let has = |k: &str| attrs.iter().any(|a| a["key"] == k);
+        let val = |k: &str| {
+            attrs
+                .iter()
+                .find(|a| a["key"] == k)
+                .map(|a| a["value"]["stringValue"].as_str().unwrap().to_string())
+        };
         assert!(has("gen_ai.request.model"));
         assert!(has("gen_ai.usage.input_tokens"));
         assert!(has("tokenfuse.run_id"));
         assert!(has("tokenfuse.cost_usd"));
+        // GenAI semconv additions.
+        assert_eq!(val("gen_ai.operation.name").as_deref(), Some("chat"));
+        assert_eq!(
+            val("gen_ai.response.model").as_deref(),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            val("gen_ai.system").as_deref(),
+            Some("anthropic"),
+            "a claude model maps to gen_ai.system=anthropic"
+        );
+    }
+
+    #[test]
+    fn gen_ai_system_is_omitted_for_an_unknown_model() {
+        // Honesty: an unrecognized model name yields no gen_ai.system rather
+        // than a guessed provider.
+        assert_eq!(gen_ai_system("my-private-finetune-v3"), None);
+        let mut r = rec();
+        r.model = "my-private-finetune-v3".into();
+        let v = otlp_json(&r, "tokenfuse");
+        let attrs = v["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !attrs.iter().any(|a| a["key"] == "gen_ai.system"),
+            "no gen_ai.system for an unrecognized model"
+        );
+        // The operation and request model are still emitted.
+        assert!(attrs.iter().any(|a| a["key"] == "gen_ai.operation.name"));
+    }
+
+    #[test]
+    fn gen_ai_system_maps_known_providers() {
+        assert_eq!(gen_ai_system("gpt-4o"), Some("openai"));
+        assert_eq!(gen_ai_system("o3-mini"), Some("openai"));
+        assert_eq!(gen_ai_system("gemini-2.0-flash"), Some("gcp.gemini"));
+        assert_eq!(gen_ai_system("mistral-large"), Some("mistral_ai"));
+        assert_eq!(gen_ai_system("command-r-plus"), Some("cohere"));
     }
 
     #[test]
