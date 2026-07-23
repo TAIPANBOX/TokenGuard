@@ -2,10 +2,12 @@
 
 use crate::clientkeys::ClientKeys;
 use crate::firewall::FirewallConfig;
+use crate::identitymap::{IdentityMap, StrictMode};
 use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
 use crate::router::Router;
 use crate::sink::{EventSink, NullSink};
+use crate::unitledger::UnitLedger;
 use crate::wardryx::Wardryx;
 use crate::wasmpolicy::WasmEval;
 use std::collections::{HashMap, HashSet};
@@ -65,6 +67,18 @@ pub struct AppState {
     /// unless `TOKENFUSE_CLIENT_KEYS` is set at startup — see
     /// `crate::clientkeys`.
     pub client_keys: Arc<ClientKeys>,
+    /// The declarative key<->agent<->unit identity map (docs/20). Disabled
+    /// (every call resolves to no unit, no checks) unless
+    /// `TOKENFUSE_IDENTITY_MAP` is set at startup - see `crate::identitymap`.
+    pub identity: Arc<IdentityMap>,
+    /// How a key<->agent mismatch is handled (`TOKENFUSE_IDENTITY_STRICT`):
+    /// off = resolution only, warn = response header, enforce = 403. Governs
+    /// ONLY the binding check; unit budgets follow `policy.mode` like every
+    /// other budget.
+    pub identity_strict: StrictMode,
+    /// Per-unit monthly budget counters (docs/20). Uncapped units are not
+    /// accounted; disabled entirely when the identity map is off.
+    pub units: Arc<UnitLedger>,
 }
 
 impl AppState {
@@ -99,6 +113,9 @@ impl AppState {
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventExporter::disabled()),
             client_keys: Arc::new(ClientKeys::default()),
+            identity: Arc::new(IdentityMap::default()),
+            identity_strict: StrictMode::Off,
+            units: Arc::new(UnitLedger::default()),
         }
     }
 
@@ -107,6 +124,21 @@ impl AppState {
     /// what every existing deployment gets on upgrade.
     pub fn with_client_keys(mut self, keys: Arc<ClientKeys>) -> Self {
         self.client_keys = keys;
+        self
+    }
+
+    /// Wire the identity map, its strict mode, and the per-unit monthly
+    /// ledger (docs/20). Chainable. Not set means identity stays off, which
+    /// is what every existing deployment gets on upgrade.
+    pub fn with_identity(
+        mut self,
+        map: Arc<IdentityMap>,
+        strict: StrictMode,
+        units: Arc<UnitLedger>,
+    ) -> Self {
+        self.identity = map;
+        self.identity_strict = strict;
+        self.units = units;
         self
     }
 

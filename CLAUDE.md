@@ -124,8 +124,8 @@ build)`, `cloud apns (feature build)`.
   cache namespace.
 - `core.fileMode` is already set to `false` in this repo's git config, don't
   re-set it or chase phantom mode-only diffs.
-- **Docs are numbered 01-19** (`docs/`); new design docs continue the
-  sequence (next is 20). `docs/09-product-strategy.md` is the one to read
+- **Docs are numbered 01-20** (`docs/`); new design docs continue the
+  sequence (next is 21). `docs/09-product-strategy.md` is the one to read
   before touching product framing or positioning.
 
 ## Model escalation — tell the user, don't just push through

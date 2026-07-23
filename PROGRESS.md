@@ -3,7 +3,8 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-12 (P3 enterprise/compliance track: machine-readable control catalog, `tokenfuse compliance` CLI + SARIF export, Cloud `/v1/compliance`, minimal OIDC bearer auth, #91; tamper-evident audit trail + ES256-signed manifest + dashboard savings tile, #92; FinOps reporting: `tokenfuse focus-export` #97, the agent-event NDJSON exporter + `x-fuse-on-behalf-of` + `parent_run_id` #98, outcome tags + `tokenfuse outcomes` #99; post-launch fixes for the Anthropic auth header, a raft-follower snapshot panic, and 2026 model pricing, #100-#102; the **Wave-2 governance plane** (model router, the Wardryx PEP/PDP policy hook, Cloud incident replay + regulator evidence pack, per-instance Parquet trace segments), landed and hardened across #103, #104, #106, #110, see [docs/19](docs/19-wave2-governance.md). None of this is in a tagged release yet)
+**Last updated:** 2026-07-23 (identity map: key<->agent<->unit binding, strict mode, monthly unit budgets, Cloud unit aggregation + central unit-cap overrides, docs/20);
+earlier 2026-07-12 (P3 enterprise/compliance track: machine-readable control catalog, `tokenfuse compliance` CLI + SARIF export, Cloud `/v1/compliance`, minimal OIDC bearer auth, #91; tamper-evident audit trail + ES256-signed manifest + dashboard savings tile, #92; FinOps reporting: `tokenfuse focus-export` #97, the agent-event NDJSON exporter + `x-fuse-on-behalf-of` + `parent_run_id` #98, outcome tags + `tokenfuse outcomes` #99; post-launch fixes for the Anthropic auth header, a raft-follower snapshot panic, and 2026 model pricing, #100-#102; the **Wave-2 governance plane** (model router, the Wardryx PEP/PDP policy hook, Cloud incident replay + regulator evidence pack, per-instance Parquet trace segments), landed and hardened across #103, #104, #106, #110, see [docs/19](docs/19-wave2-governance.md). None of this is in a tagged release yet)
 
 **Earlier:** 2026-07-03 (mobile companion: B9 — app icon + polish; **Phase B complete**; web dashboard restyled to the fuse identity; README + fresh visuals: real dashboard hero + app screenshot gallery; **standardized the iOS app name to "TokenFuse"** to match the web, and unified the bolt emblem across README/app/web — now an amber→ember tile with a black-keyline bolt, the same mark on the app icon, dashboard header, README and showcase; **watchOS W1–W3 complete** — standalone watch app: live fleet, wrist-signed kill, face complication; W4 auto-provisioning deferred by owner; **the iPhone + Apple Watch app was extracted to its own repo → [github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile)** — `mobile/` and the `ios` CI job removed here; this repo now links out to it)
 
@@ -28,19 +29,26 @@ documented threat model in [docs/13](docs/13-security-hardening.md)). What's lef
 is genuinely optional scale/ops work (a SQL/columnar Cloud store; automated cert
 rotation) and a formal third-party audit — none of it a blocker.
 
-**In progress: budgets above the run** (per key / agent / team / org). Today a
-budget exists only per run, with the ledger already enforcing the run's whole
-ancestor chain. The blocker for anything wider was identity: every dimension on
-a metered call arrived as a header the caller wrote, and a budget keyed on
-something the caller chooses is a budget the caller can move off. Slice 1 fixes
-that and nothing else: an opt-in gateway client credential
-(`TOKENFUSE_CLIENT_KEYS`, header `x-fuse-key`) resolved server-side to a stable
-`key_id`, appended to the Parquet trace under the same nullable-evolution rule
-as `agent_id` / `parent_run_id` / `outcome`. Off unless configured, so existing
-deployments are untouched; set-but-unusable exits rather than silently serving
-unauthenticated traffic. No enforcement yet, deliberately: this establishes the
-identity a later slice can enforce against, and the cloud-side accumulators,
-the `key_id -> team` mapping and threshold alerts are the next increment.
+**Budgets above the run: slice 2, the identity map, is on this branch**
+(docs/20, `feat/identity-map`). Slice 1 (#119) established the server-resolved
+`key_id`; this slice binds it: a declarative JSON map
+(`TOKENFUSE_IDENTITY_MAP`) links `key_id -> business unit -> allowed
+`agent://` ids, `TOKENFUSE_IDENTITY_STRICT=off|warn|enforce` gates the
+key<->agent binding (403 `identity_mismatch` in enforce, a
+`x-fuse-identity: would-block` header in warn), and a unit with
+`budget_usd_month` gets the first budget above the run: a UTC-calendar-month
+cap, reserve-then-settle like run budgets, tripping `402
+unit_budget_exceeded` under `TOKENFUSE_MODE=enforce`. The trace gains a
+server-resolved `unit` column (nullable-evolution), `focus-export` gains
+`x_unit`, breaker events gain `data.unit`, and the Cloud gains `GET
+/v1/units` (per-unit aggregation, unmapped spend visible as `unassigned`),
+`POST /v1/units/{id}/budget` (audited central override) and `GET
+/v1/unit-budgets` (polled by every gateway, replace-all). Honest limits,
+stated in docs/20 and the README: unit counters are per-gateway-process
+(restart resets them; the raft ledger deliberately does not grow this
+dimension), and with client keys off the strict check has nothing
+authenticated to gate. Still next: per-key budgets, threshold alerts per
+unit, dashboard grouping by unit, fleet-consistent unit caps.
 
 ## Status by component
 

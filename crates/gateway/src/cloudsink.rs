@@ -143,6 +143,52 @@ where
     });
 }
 
+/// Poll the control plane's per-UNIT monthly budget overrides and hand them to
+/// `apply` (unit id → µUSD) as a full replacement map, so an operator can
+/// centrally cap a business unit and every gateway of the org enforces it
+/// (docs/20). A separate endpoint from `/v1/budgets` on purpose: that payload
+/// is a flat `run_id -> i64` map old gateways parse verbatim, so it cannot
+/// grow a nested key without breaking them. Best-effort; runs until the
+/// process exits.
+pub fn spawn_unit_budget_poller<F>(base: String, key: String, apply: F)
+where
+    F: Fn(std::collections::HashMap<String, i64>) + Send + Sync + 'static,
+{
+    let url = format!("{}/v1/unit-budgets", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            let resp = match client.get(&url).bearer_auth(&key).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("cloud unit-budget poll failed: {e}");
+                    continue;
+                }
+            };
+            if !resp.status().is_success() {
+                // Includes an older control plane without the endpoint (404):
+                // no data this tick, never a crash.
+                tracing::debug!(
+                    "cloud unit-budget poll: unexpected status {}",
+                    resp.status()
+                );
+                continue;
+            }
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(map) =
+                serde_json::from_slice::<std::collections::HashMap<String, i64>>(&bytes)
+            {
+                apply(map);
+            }
+        }
+    });
+}
+
 /// Poll the control plane's kill list and apply each killed run id locally, so an
 /// operator's "Kill" in the Cloud dashboard propagates to every gateway of the
 /// org (which then hard-stops that run — `402 killed`). Best-effort; runs until

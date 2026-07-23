@@ -12,6 +12,7 @@
 use crate::ledger_backend::LedgerBackend;
 use crate::provider::UsageSlot;
 use crate::sink::{now_millis, CallRecord, EventSink};
+use crate::unitledger::{UnitLedger, UnitReservation};
 use std::sync::Arc;
 use tokenfuse_core::{Microusd, PriceBook, Reservation};
 
@@ -39,6 +40,14 @@ pub struct SettleGuard {
     /// every other field here it does not come from a request header the
     /// caller wrote — see `CallRecord::key_id`.
     key_id: String,
+    /// The server-resolved business unit (docs/20), carried into the settled
+    /// `CallRecord`. `""` when the identity map is off or nothing matched.
+    unit: String,
+    /// The per-unit monthly ledger and this call's unit reservation, settled
+    /// alongside the run reservation with the same actual cost. `None` when
+    /// the unit has no cap in effect (nothing was reserved).
+    units: Arc<UnitLedger>,
+    unit_reservation: Option<UnitReservation>,
 }
 
 impl SettleGuard {
@@ -56,6 +65,9 @@ impl SettleGuard {
         on_behalf_of: String,
         outcome: String,
         key_id: String,
+        unit: String,
+        units: Arc<UnitLedger>,
+        unit_reservation: Option<UnitReservation>,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -70,6 +82,9 @@ impl SettleGuard {
             on_behalf_of,
             outcome,
             key_id,
+            unit,
+            units,
+            unit_reservation,
         }
     }
 
@@ -83,6 +98,9 @@ impl SettleGuard {
             .and_then(|u| self.prices.cost(&self.model, u))
             .unwrap_or(self.fallback);
         self.ledger.settle(&reservation, actual);
+        if let Some(ur) = self.unit_reservation.take() {
+            self.units.settle(&ur, actual, now_millis());
+        }
 
         let usage = parsed.unwrap_or_default();
         self.sink.record(CallRecord {
@@ -101,6 +119,7 @@ impl SettleGuard {
             on_behalf_of: self.on_behalf_of.clone(),
             outcome: self.outcome.clone(),
             key_id: self.key_id.clone(),
+            unit: self.unit.clone(),
         });
     }
 
@@ -156,6 +175,9 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
         );
         guard.complete();
 
@@ -183,11 +205,53 @@ mod tests {
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
+                Arc::new(UnitLedger::default()),
+                None,
             );
             // dropped here without complete()
         }
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(snap.reserved, Microusd::ZERO); // reservation released, not leaked
         assert_eq!(snap.spent, fallback); // conservative fallback charge
+    }
+
+    #[test]
+    fn a_unit_reservation_settles_alongside_the_run_reservation() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        let units = Arc::new(UnitLedger::new(std::collections::HashMap::from([(
+            "treasury".to_string(),
+            Microusd::from_usd(10.0),
+        )])));
+        let now = now_millis();
+        let ur = units
+            .try_reserve("treasury", Microusd::from_usd(1.0), now)
+            .unwrap()
+            .expect("capped unit reserves");
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            prices,
+            Arc::new(crate::sink::NullSink),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "treasury".into(),
+            units.clone(),
+            Some(ur),
+        );
+        guard.complete();
+        // The unit ledger absorbed the same actual cost as the run ledger.
+        assert_eq!(units.spent("treasury", now), Microusd::from_usd(3.0));
     }
 }

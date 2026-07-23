@@ -138,6 +138,13 @@ impl ClientKeys {
     pub fn resolve(&self, secret: &str) -> Option<&str> {
         self.by_secret.get(secret).map(String::as_str)
     }
+
+    /// Every configured `key_id` (startup cross-checks against the identity
+    /// map, docs/20). Unordered; duplicates possible when two secrets share a
+    /// `key_id`, which is legal.
+    pub fn key_ids(&self) -> impl Iterator<Item = &str> {
+        self.by_secret.values().map(String::as_str)
+    }
 }
 
 #[cfg(test)]

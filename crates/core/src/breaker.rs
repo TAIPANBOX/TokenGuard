@@ -1,5 +1,6 @@
-//! Breaker: a facade that unifies TokenFuse's seven existing block reasons
-//! (budget, policy, loop, kill, WASM policy, taint, DLP) behind one type.
+//! Breaker: a facade that unifies TokenFuse's block reasons (budget, policy,
+//! loop, kill, WASM policy, taint, DLP, plus the identity-map pair: unit
+//! budget and identity mismatch, docs/20) behind one type.
 //!
 //! Adoption is partial. The 402 budget-family block sites in
 //! `crates/gateway/src/proxy.rs` (budget, policy, loop, kill, WASM policy) now
@@ -12,8 +13,11 @@
 
 use serde::Serialize;
 
-/// The seven reasons the Breaker can trip a run, one per existing wire
-/// `"type"` string emitted by the gateway.
+/// The reasons the Breaker can trip a run, one per wire `"type"` string
+/// emitted by the gateway. The original seven plus the identity-map pair
+/// (docs/20): `UnitBudgetExceeded` (a 402 budget-family trip against a
+/// business unit's monthly cap) and `IdentityMismatch` (a 403 auth-family
+/// block: the presented credential may not speak as the claimed agent id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerReason {
     BudgetExceeded,
@@ -23,6 +27,8 @@ pub enum BreakerReason {
     WasmPolicy,
     TaintBlocked,
     DlpBlocked,
+    UnitBudgetExceeded,
+    IdentityMismatch,
 }
 
 impl BreakerReason {
@@ -38,6 +44,8 @@ impl BreakerReason {
             BreakerReason::WasmPolicy => "wasm_policy",
             BreakerReason::TaintBlocked => "taint_blocked",
             BreakerReason::DlpBlocked => "dlp_blocked",
+            BreakerReason::UnitBudgetExceeded => "unit_budget_exceeded",
+            BreakerReason::IdentityMismatch => "identity_mismatch",
         }
     }
 
@@ -47,12 +55,15 @@ impl BreakerReason {
     /// `402 PAYMENT_REQUIRED`.
     pub fn http_status(self) -> u16 {
         match self {
-            BreakerReason::TaintBlocked | BreakerReason::DlpBlocked => 403,
+            BreakerReason::TaintBlocked
+            | BreakerReason::DlpBlocked
+            | BreakerReason::IdentityMismatch => 403,
             BreakerReason::BudgetExceeded
             | BreakerReason::PolicyViolation
             | BreakerReason::LoopDetected
             | BreakerReason::Killed
-            | BreakerReason::WasmPolicy => 402,
+            | BreakerReason::WasmPolicy
+            | BreakerReason::UnitBudgetExceeded => 402,
         }
     }
 }
@@ -174,6 +185,60 @@ mod tests {
         // Matches proxy.rs dlp_block/firewall_block: StatusCode::FORBIDDEN.
         assert_eq!(BreakerReason::TaintBlocked.http_status(), 403);
         assert_eq!(BreakerReason::DlpBlocked.http_status(), 403);
+    }
+
+    #[test]
+    fn wire_str_and_status_for_the_identity_map_pair() {
+        // docs/20: the unit cap is a 402 budget-family trip; the key<->agent
+        // mismatch is a 403 auth-family block like DLP/taint.
+        assert_eq!(
+            BreakerReason::UnitBudgetExceeded.as_wire_str(),
+            "unit_budget_exceeded"
+        );
+        assert_eq!(BreakerReason::UnitBudgetExceeded.http_status(), 402);
+        assert_eq!(
+            BreakerReason::IdentityMismatch.as_wire_str(),
+            "identity_mismatch"
+        );
+        assert_eq!(BreakerReason::IdentityMismatch.http_status(), 403);
+    }
+
+    #[test]
+    fn unit_budget_json_uses_the_budget_family_shape() {
+        // Same body contract as budget_exceeded, with the UNIT's numbers in
+        // budget_usd/spent_usd (docs/20 section 4).
+        let verdict = BreakerVerdict {
+            tripped: true,
+            reason: Some(BreakerReason::UnitBudgetExceeded),
+            detail: Some("unit 'treasury' monthly budget exceeded".to_string()),
+            budget_usd: Some(2000.0),
+            spent_usd: Some(2001.5),
+            policy_id: Some("default".to_string()),
+            would_trip_only: false,
+        };
+        let got = verdict.to_error_json("run-7");
+        assert_eq!(got["error"]["type"], "unit_budget_exceeded");
+        assert_eq!(got["error"]["budget_usd"], 2000.0);
+        assert_eq!(got["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn identity_mismatch_json_uses_the_minimal_403_shape() {
+        // Like dlp_blocked/taint_blocked: no budget fields at all.
+        let verdict = BreakerVerdict {
+            tripped: true,
+            reason: Some(BreakerReason::IdentityMismatch),
+            detail: Some("agent_id_not_allowed".to_string()),
+            budget_usd: None,
+            spent_usd: None,
+            policy_id: None,
+            would_trip_only: false,
+        };
+        let got = verdict.to_error_json("run-8");
+        assert_eq!(got["error"]["type"], "identity_mismatch");
+        assert_eq!(got["error"]["retryable"], false);
+        assert!(got["error"].get("budget_usd").is_none());
+        assert!(got["error"].get("policy_id").is_none());
     }
 
     #[test]

@@ -39,6 +39,13 @@ fn spec_covers_every_endpoint() {
         "/v1/kills",
         "/v1/runs/{run}/budget",
         "/v1/budgets",
+        // docs/20-identity-map.md section 4: additive unit aggregation +
+        // central unit-budget endpoints (mirroring the run-budget/agent-agg
+        // endpoints above; see crates/cloud/src/http.rs's `units` /
+        // `set_unit_budget` / `unit_budgets`).
+        "/v1/units",
+        "/v1/units/{id}/budget",
+        "/v1/unit-budgets",
         "/v1/incidents",
         "/v1/incidents/{id}/ack",
         "/v1/compliance",
@@ -59,6 +66,7 @@ fn spec_covers_every_endpoint() {
         "Summary",
         "Alert",
         "CallRecord",
+        "UnitAgg",
         "Incident",
         "ComplianceReportSchema",
         "ControlEvidenceSchema",

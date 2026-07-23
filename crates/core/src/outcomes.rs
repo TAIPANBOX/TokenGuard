@@ -58,10 +58,11 @@ pub struct Call {
     pub step: u32,
 }
 
-/// The seven Breaker block reasons — read off [`BreakerReason`] so this
+/// The Breaker block reasons - read off [`BreakerReason`] so this
 /// mirrors `gateway::focusexport::is_blocked_decision` from the single
 /// canonical source rather than hand-copying wire strings a second time.
-const BLOCKED_DECISIONS: [BreakerReason; 7] = [
+/// Includes the identity-map pair (docs/20).
+const BLOCKED_DECISIONS: [BreakerReason; 9] = [
     BreakerReason::BudgetExceeded,
     BreakerReason::PolicyViolation,
     BreakerReason::LoopDetected,
@@ -69,9 +70,11 @@ const BLOCKED_DECISIONS: [BreakerReason; 7] = [
     BreakerReason::WasmPolicy,
     BreakerReason::TaintBlocked,
     BreakerReason::DlpBlocked,
+    BreakerReason::UnitBudgetExceeded,
+    BreakerReason::IdentityMismatch,
 ];
 
-/// Whether a decision string is one of the seven Breaker block reasons (vs.
+/// Whether a decision string is one of the Breaker block reasons (vs.
 /// an allow or a cache hit). A blocked row's `cost_microusd` holds the
 /// avoided estimate, never a real settled charge (see `proxy.rs`), so
 /// [`compute_outcomes`] excludes these rows from the cost total but still

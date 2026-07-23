@@ -29,10 +29,12 @@ async fn ingest_authorized_aggregates_into_store() {
     let store = Arc::new(Store::new());
     let router = app(state_with(Arc::clone(&store)));
 
-    // Exactly the shape crates/gateway/src/cloudsink.rs POSTs.
+    // Exactly the shape crates/gateway/src/cloudsink.rs POSTs (`unit` is the
+    // docs/20-identity-map.md section 4 addition - additive, so it rides
+    // along on the same batch as every other field).
     let payload = r#"{"records":[
-        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","input_tokens":10,"output_tokens":5,"cost_microusd":1000,"step":1},
-        {"ts_millis":200,"run_id":"r1","model":"claude","decision":"cache_hit","input_tokens":0,"output_tokens":0,"cost_microusd":0,"step":2}
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","input_tokens":10,"output_tokens":5,"cost_microusd":1000,"step":1,"unit":"treasury"},
+        {"ts_millis":200,"run_id":"r1","model":"claude","decision":"cache_hit","input_tokens":0,"output_tokens":0,"cost_microusd":0,"step":2,"unit":"treasury"}
     ]}"#;
 
     let resp = router
@@ -57,6 +59,39 @@ async fn ingest_authorized_aggregates_into_store() {
     assert_eq!(runs[0].calls, 2);
     assert_eq!(runs[0].cache_hits, 1);
     assert_eq!(runs[0].steps, 2);
+    assert_eq!(runs[0].unit, "treasury");
+}
+
+/// A gateway that predates docs/20-identity-map.md simply omits `unit` -
+/// additive means the batch still ingests, and the run's `unit` stays empty
+/// (folded into the "unassigned" bucket by `Store::units`, never a hard error).
+#[tokio::test]
+async fn ingest_without_unit_is_additive() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let runs = store.runs("acme");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].unit, "");
+    let units = store.units("acme");
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].unit, "unassigned");
 }
 
 #[tokio::test]

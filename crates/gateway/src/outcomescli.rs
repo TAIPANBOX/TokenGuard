@@ -203,6 +203,7 @@ mod tests {
             on_behalf_of: String::new(),
             outcome: outcome.into(),
             key_id: String::new(),
+            unit: String::new(),
         }
     }
 

@@ -129,6 +129,14 @@ pub struct CallRecord {
     /// field yet.
     #[serde(default)]
     pub outcome: String,
+    /// The business unit this call's key/agent maps to, resolved server-side
+    /// by the gateway's identity map (docs/20-identity-map.md section 4).
+    /// `""` when the identity map is off or nothing matched. Matches
+    /// `crates/gateway/src/sink.rs::CallRecord::unit` on the wire. Additive:
+    /// `#[serde(default)]` so a pre-identity-map gateway that omits the field
+    /// still deserializes.
+    #[serde(default)]
+    pub unit: String,
 }
 
 /// The aggregated state of one run within an organization.
@@ -141,6 +149,16 @@ pub struct RunAgg {
     /// [`Store::agents`]. `serde(default)` so pre-P2 snapshots still load.
     #[serde(default)]
     pub agent_id: String,
+    /// Which business unit this run's key/agent maps to
+    /// (docs/20-identity-map.md section 4). `""` when the identity map is off
+    /// or nothing matched - folded into the literal `"unassigned"` bucket by
+    /// [`Store::units`] (deliberately NOT kept as its own `""` bucket the way
+    /// `agent_id`'s unattributed runs are: docs/20 section 3 requires
+    /// unmapped spend to stay a VISIBLE bucket, never silently dropped, and a
+    /// literal id reads better than a blank one). `serde(default)` so
+    /// pre-identity-map snapshots still load.
+    #[serde(default)]
+    pub unit: String,
     pub spent_microusd: i64,
     pub calls: u64,
     pub cache_hits: u64,
@@ -170,6 +188,26 @@ pub struct AgentAgg {
     pub spent_microusd: i64,
     pub calls: u64,
     /// Distinct runs attributed to this agent.
+    pub runs: u64,
+    #[serde(rename = "last_seen_millis")]
+    pub last_seen: i64,
+}
+
+/// Per-unit spend rollup (docs/20-identity-map.md section 4), folded from an
+/// org's [`RunAgg`]s by `unit` - the same fold-by-attribution shape as
+/// [`AgentAgg`]/`agent_id`, with one deliberate difference: an empty `unit`
+/// is folded into the literal bucket `"unassigned"` (see [`Store::units`]),
+/// never kept as its own `""` key. docs/20 section 3 requires unmapped spend
+/// to stay a VISIBLE bucket, never silently dropped.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct UnitAgg {
+    /// The unit this bucket rolls up; the literal `"unassigned"` for runs
+    /// with no resolved unit (see the struct doc - never `""`).
+    pub unit: String,
+    /// Real spend (blocked/avoided-spend rows already excluded upstream).
+    pub spent_microusd: i64,
+    pub calls: u64,
+    /// Distinct runs attributed to this unit.
     pub runs: u64,
     #[serde(rename = "last_seen_millis")]
     pub last_seen: i64,
@@ -542,6 +580,11 @@ struct Inner {
     killed: HashMap<String, HashMap<String, bool>>,
     /// org → run → central budget (microdollars)
     budgets: HashMap<String, HashMap<String, i64>>,
+    /// org → unit → central monthly budget override (microdollars),
+    /// docs/20-identity-map.md section 4. Mirrors `budgets` (run-scoped);
+    /// gateways poll `GET /v1/unit-budgets` and apply these over the
+    /// identity map's own `budget_usd_month`.
+    unit_budgets: HashMap<String, HashMap<String, i64>>,
     /// org → bounded log of recent samples for the burn-rate series
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
@@ -607,6 +650,7 @@ struct SnapshotRef<'a> {
     orgs: &'a HashMap<String, HashMap<String, RunAgg>>,
     killed: &'a HashMap<String, HashMap<String, bool>>,
     budgets: &'a HashMap<String, HashMap<String, i64>>,
+    unit_budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
     decision_counts: &'a HashMap<String, HashMap<String, u64>>,
@@ -623,6 +667,11 @@ struct SnapshotOwned {
     killed: HashMap<String, HashMap<String, bool>>,
     #[serde(default)]
     budgets: HashMap<String, HashMap<String, i64>>,
+    /// Missing on pre-identity-map snapshots (docs/20-identity-map.md) -
+    /// `default` loads empty, so `unit_budgets()` reports no overrides until
+    /// an operator sets one.
+    #[serde(default)]
+    unit_budgets: HashMap<String, HashMap<String, i64>>,
     #[serde(default)]
     devices: HashMap<String, Device>,
     /// Missing on pre-P2 snapshots — `default` yields an empty map, so
@@ -900,6 +949,13 @@ impl Store {
                     }
                     if !r.agent_id.is_empty() {
                         agg.agent_id = r.agent_id.clone();
+                    }
+                    // docs/20-identity-map.md section 4: thread the resolved
+                    // unit onto the run aggregate exactly like `agent_id`
+                    // above. An empty `r.unit` never clears an already-set
+                    // one - same "last non-empty wins" rule `agent_id` uses.
+                    if !r.unit.is_empty() {
+                        agg.unit = r.unit.clone();
                     }
                     if r.step > agg.steps {
                         agg.steps = r.step;
@@ -1283,6 +1339,44 @@ impl Store {
         out
     }
 
+    /// An org's per-unit spend rollup, highest spend first
+    /// (docs/20-identity-map.md section 4). Folds the org's [`RunAgg`]s by
+    /// `unit`, mirroring [`Store::agents`]'s fold-by-`agent_id` shape - with
+    /// one deliberate difference at the bucketing key. Spend already excludes
+    /// blocked rows (that gate is applied when folding calls into
+    /// `RunAgg::spent_microusd`).
+    pub fn units(&self, org: &str) -> Vec<UnitAgg> {
+        let inner = self.inner.read().unwrap();
+        let mut by_unit: HashMap<String, UnitAgg> = HashMap::new();
+        if let Some(runs) = inner.orgs.get(org) {
+            for agg in runs.values() {
+                // docs/20-identity-map.md section 3: a run with no resolved
+                // unit rolls up under the literal "unassigned" bucket, not a
+                // blank one - unmapped spend must stay VISIBLE, never
+                // silently dropped from this aggregation.
+                let key: &str = if agg.unit.is_empty() {
+                    "unassigned"
+                } else {
+                    &agg.unit
+                };
+                let u = by_unit.entry(key.to_string()).or_insert_with(|| UnitAgg {
+                    unit: key.to_string(),
+                    ..Default::default()
+                });
+                // C4 defense-in-depth: same overflow guard `agents()` uses.
+                u.spent_microusd = u.spent_microusd.saturating_add(agg.spent_microusd);
+                u.calls += agg.calls;
+                u.runs += 1;
+                if agg.last_seen > u.last_seen {
+                    u.last_seen = agg.last_seen;
+                }
+            }
+        }
+        let mut out: Vec<UnitAgg> = by_unit.into_values().collect();
+        out.sort_by_key(|u| std::cmp::Reverse(u.spent_microusd));
+        out
+    }
+
     /// An org's live FinOps savings totals (blocked/avoided spend + cache
     /// savings + router savings). Accumulated incrementally in
     /// [`Store::ingest`] and persisted.
@@ -1626,6 +1720,52 @@ impl Store {
         inner.budgets.get(org).cloned().unwrap_or_default()
     }
 
+    /// Set a centrally-managed monthly budget (microdollars) override for a
+    /// unit (docs/20-identity-map.md section 4); gateways poll
+    /// `/v1/unit-budgets` and apply it over the identity map's own
+    /// `budget_usd_month`. Mirrors [`Store::set_budget`] (run-scoped).
+    pub fn set_unit_budget(&self, org: &str, unit: &str, micros: i64) {
+        let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
+        inner
+            .unit_budgets
+            .entry(org.to_string())
+            .or_default()
+            .insert(unit.to_string(), micros);
+    }
+
+    /// [`Store::set_unit_budget`] plus its `control.unit_budget_set` audit
+    /// entry, folded into ONE write-lock acquisition (see
+    /// [`append_audit_locked`]'s doc) - mirrors [`Store::set_budget_audited`].
+    /// A distinguishable action name (`control.unit_budget_set`, vs.
+    /// `control.set_budget` for a run) keeps the two mutation kinds tell-apart-
+    /// able on the audit trail.
+    pub fn set_unit_budget_audited(&self, org: &str, unit: &str, micros: i64, actor: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
+        inner
+            .unit_budgets
+            .entry(org.to_string())
+            .or_default()
+            .insert(unit.to_string(), micros);
+        append_audit_locked(
+            &mut inner,
+            org,
+            actor,
+            "control.unit_budget_set",
+            unit,
+            &format!("budget_micros={micros}"),
+        );
+    }
+
+    /// An org's unit → budget-micros overrides (gateways poll
+    /// `/v1/unit-budgets`; see
+    /// `crates/gateway/src/cloudsink.rs::spawn_unit_budget_poller`).
+    pub fn unit_budgets(&self, org: &str) -> HashMap<String, i64> {
+        let inner = self.inner.read().unwrap();
+        inner.unit_budgets.get(org).cloned().unwrap_or_default()
+    }
+
     /// Runs whose spend has reached `pct` (0..1) of a set budget. Only runs with
     /// a central budget override (> 0) are considered.
     pub fn alerts(&self, org: &str, pct: f64) -> Vec<Alert> {
@@ -1666,6 +1806,7 @@ impl Store {
                 orgs: &inner.orgs,
                 killed: &inner.killed,
                 budgets: &inner.budgets,
+                unit_budgets: &inner.unit_budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
                 decision_counts: &inner.decision_counts,
@@ -1695,6 +1836,7 @@ impl Store {
         inner.orgs = snap.orgs;
         inner.killed = snap.killed;
         inner.budgets = snap.budgets;
+        inner.unit_budgets = snap.unit_budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
         inner.decision_counts = snap.decision_counts;
@@ -2391,6 +2533,86 @@ mod tests {
         assert_eq!(agents[2].agent_id, "");
         assert_eq!(agents[2].spent_microusd, 250);
         assert_eq!(agents[2].runs, 1);
+    }
+
+    /// Mirrors `agents_roll_up_by_agent_id`, but for `unit`
+    /// (docs/20-identity-map.md section 4) - with the one deliberate
+    /// difference the doc calls out: an empty unit rolls up under the
+    /// literal `"unassigned"` bucket, not its own blank one.
+    #[test]
+    fn units_roll_up_by_unit_and_unassigned_bucket() {
+        let s = Store::new();
+        let r = |run: &str, unit: &str, decision: &str, cost: i64, ts: i64| CallRecord {
+            run_id: run.into(),
+            unit: unit.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("r1", "treasury", "allow", 1000, 10),
+                r("r2", "treasury", "allow", 2000, 20),
+                // A budget-protection block for ops - its avoided cost must
+                // NOT count toward the unit's real spend.
+                r("r3", "ops", "allow", 500, 30),
+                r("r3", "ops", "budget_exceeded", 999_999, 40),
+                // Unmapped run (empty unit) rolls up under "unassigned" -
+                // docs/20 section 3: never a silently-dropped/blank bucket.
+                r("r4", "", "allow", 250, 50),
+            ],
+        );
+
+        let units = s.units("acme");
+        assert_eq!(units.len(), 3);
+        // Sorted by spend desc: treasury (3000) > ops (500) > unassigned (250).
+        assert_eq!(units[0].unit, "treasury");
+        assert_eq!(units[0].spent_microusd, 3000);
+        assert_eq!(units[0].calls, 2);
+        assert_eq!(units[0].runs, 2);
+        assert_eq!(units[0].last_seen, 20);
+
+        assert_eq!(units[1].unit, "ops");
+        // Blocked/avoided spend excluded - only the $0.0005 allow counts.
+        assert_eq!(units[1].spent_microusd, 500);
+        assert_eq!(units[1].calls, 2);
+        assert_eq!(units[1].runs, 1);
+
+        assert_eq!(units[2].unit, "unassigned");
+        assert_eq!(units[2].spent_microusd, 250);
+        assert_eq!(units[2].runs, 1);
+    }
+
+    /// Central unit-budget overrides round-trip through the store, mirroring
+    /// the run-budget precedent (see `alerts_fire_only_over_threshold_with_a_budget`'s
+    /// sibling coverage of `set_budget`/`budgets`).
+    #[test]
+    fn unit_budget_roundtrips_through_store() {
+        let s = Store::new();
+        assert!(s.unit_budgets("acme").is_empty());
+        s.set_unit_budget("acme", "treasury", 2_000_000_000);
+        let budgets = s.unit_budgets("acme");
+        assert_eq!(budgets.get("treasury"), Some(&2_000_000_000));
+        // Orgs stay isolated, exactly like run budgets.
+        assert!(s.unit_budgets("globex").is_empty());
+    }
+
+    /// `set_unit_budget_audited` appends a `control.unit_budget_set` entry -
+    /// distinguishable from `control.set_budget` (run-scoped) - under the
+    /// same one-write-lock discipline `set_budget_audited` uses.
+    #[test]
+    fn unit_budget_set_is_audited_with_a_distinguishable_action() {
+        let s = Store::new();
+        s.set_unit_budget_audited("acme", "treasury", 2_000_000_000, "key:abc123");
+        let chain = s.audit("acme");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].action, "control.unit_budget_set");
+        assert_eq!(chain[0].subject, "treasury");
+        assert_eq!(chain[0].detail, "budget_micros=2000000000");
+        assert_eq!(chain[0].actor, "key:abc123");
+        assert!(audit::verify_chain(&chain).is_ok());
     }
 
     #[test]

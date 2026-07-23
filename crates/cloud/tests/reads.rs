@@ -225,6 +225,77 @@ async fn agents_roll_up_and_sort_by_spend() {
     assert_eq!(agents[2]["spent_microusd"], 250);
 }
 
+/// Mirrors `agents_roll_up_and_sort_by_spend`, but for `/v1/units`
+/// (docs/20-identity-map.md section 4) - with the one deliberate difference
+/// the doc calls out: an empty unit rolls up under the literal
+/// `"unassigned"` bucket, not its own blank one.
+#[tokio::test]
+async fn units_roll_up_and_sort_by_spend() {
+    let (state, store) = test_state();
+    store.ingest(
+        "acme",
+        &[
+            CallRecord {
+                run_id: "r1".into(),
+                unit: "treasury".into(),
+                decision: "allow".into(),
+                cost_microusd: 1000,
+                ts_millis: 10,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r2".into(),
+                unit: "treasury".into(),
+                decision: "allow".into(),
+                cost_microusd: 2000,
+                ts_millis: 20,
+                ..Default::default()
+            },
+            // A budget-protection block: counted, but avoided cost is not spend.
+            CallRecord {
+                run_id: "r3".into(),
+                unit: "ops".into(),
+                decision: "allow".into(),
+                cost_microusd: 500,
+                ts_millis: 30,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r3".into(),
+                unit: "ops".into(),
+                decision: "budget_exceeded".into(),
+                cost_microusd: 900_000,
+                ts_millis: 40,
+                ..Default::default()
+            },
+            // Unmapped run rolls up under the literal "unassigned" bucket.
+            CallRecord {
+                run_id: "r4".into(),
+                decision: "allow".into(),
+                cost_microusd: 250,
+                ts_millis: 50,
+                ..Default::default()
+            },
+        ],
+    );
+
+    // A viewer may read units.
+    let (status, v) = get(&state, "/v1/units", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let units = v.as_array().expect("units is an array");
+    assert_eq!(units.len(), 3);
+    // Sorted by spend desc.
+    assert_eq!(units[0]["unit"], "treasury");
+    assert_eq!(units[0]["spent_microusd"], 3000);
+    assert_eq!(units[0]["calls"], 2);
+    assert_eq!(units[0]["runs"], 2);
+    assert_eq!(units[1]["unit"], "ops");
+    // Blocked row excluded from spend.
+    assert_eq!(units[1]["spent_microusd"], 500);
+    assert_eq!(units[2]["unit"], "unassigned");
+    assert_eq!(units[2]["spent_microusd"], 250);
+}
+
 #[tokio::test]
 async fn savings_sum_blocked_cache_and_breaks() {
     let (state, _store) = test_state();
@@ -393,7 +464,7 @@ async fn reads_require_a_valid_key() {
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
 
     // The new read endpoints are gated too.
-    for path in ["/v1/agents", "/v1/savings"] {
+    for path in ["/v1/agents", "/v1/savings", "/v1/units", "/v1/unit-budgets"] {
         let (no_key, _) = get(&state, path, None).await;
         assert_eq!(no_key, StatusCode::UNAUTHORIZED, "{path} unauth");
         let (wrong_key, _) = get(&state, path, Some("nope")).await;
