@@ -2789,7 +2789,7 @@ mod tests {
     }
 
     /// C3: `cache_saved_microusd` and `router_saved_microusd` (the source of
-    /// `/v1/savings`'s customer-facing "Saved this month" headline) must each
+    /// `/v1/savings`'s customer-facing all-time "Saved" headline) must each
     /// only be credited by the one real decision that can legitimately carry
     /// it: `cache_hit` for cache, `allow` for router. `/v1/ingest` is ungated
     /// (any org principal, including a read-only viewer key, may POST a

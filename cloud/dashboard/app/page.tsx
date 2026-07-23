@@ -342,7 +342,7 @@ export default function Page() {
                   </div>
                   <div className="agl">
                     <span>
-                      spent today <b>{usd(summary.spent_microusd)}</b>
+                      spent <b>{usd(summary.spent_microusd)}</b>
                     </span>
                     <span>
                       caps <b>{usd(caps)}</b> · {Math.round(fleetFrac * 100)}%
@@ -352,15 +352,25 @@ export default function Page() {
               )}
             </div>
             <div className="tiles">
+              {/* `activeRuns` is a live count of retained, non-killed runs -
+                  genuinely "now". Everything read off `summary.*`, though, is
+                  `Store::summary`'s org-wide running total: exact over the
+                  FULL ingest history, persisted across restarts, with no
+                  day-boundary reset - so those labels must say "all time",
+                  never "today". Don't rebuild "today" by summing /v1/series
+                  over a 24h window client-side either: the series is an
+                  in-memory sample log (SERIES_CAP-bounded, gone on plane
+                  restart), so that sum silently undercounts. A real daily
+                  figure needs a day-windowed rollup on the plane first. */}
               <div className="card tile">
                 <div className="k">Active runs</div>
                 <div className="n">{activeRuns}</div>
-                <div className="s">{summary.calls} calls</div>
+                <div className="s">{summary.calls} calls · all time</div>
               </div>
               <div className="card tile">
-                <div className="k">Spent today</div>
+                <div className="k">Spent</div>
                 <div className="n">{usd(summary.spent_microusd)}</div>
-                <div className="s">reserve → settle</div>
+                <div className="s">all time · reserve → settle</div>
               </div>
               <div className="card tile alert">
                 <div className="k">Alerts</div>
@@ -374,7 +384,10 @@ export default function Page() {
               </div>
               {savings && (
                 <div className="card tile" style={{ gridColumn: "1 / -1" }}>
-                  <div className="k">Saved this month</div>
+                  {/* SavingsAcc is the same all-time shape: a persisted,
+                      monotonic accumulator with no month reset - hence
+                      "all time", not the "this month" it used to claim. */}
+                  <div className="k">Saved</div>
                   <div
                     className="n"
                     style={savings.total_saved_microusd ? { color: "var(--mint)" } : undefined}
@@ -382,7 +395,7 @@ export default function Page() {
                     {usd(savings.total_saved_microusd)}
                   </div>
                   <div className="s">
-                    blocked {usd(savings.blocked_spend_microusd)} · cache {usd(savings.cache_saved_microusd)}
+                    all time · blocked {usd(savings.blocked_spend_microusd)} · cache {usd(savings.cache_saved_microusd)}
                     {savings.budget_breaks > 0 && ` · ${savings.budget_breaks} budget breaks`}
                   </div>
                 </div>
@@ -596,7 +609,7 @@ export default function Page() {
               <div className="card">
                 <div className="sechead">
                   <div className="t">Spend by run</div>
-                  <div className="r">today</div>
+                  <div className="r">run lifetime</div>
                 </div>
                 <div className="barchart">
                   {runs.slice(0, 6).map((r) => {
