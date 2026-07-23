@@ -48,7 +48,7 @@ artifacts - passports, descriptors - are JSON already):
   ],
   "keys": [
     { "key_id": "treasury-bots", "unit": "treasury",
-      "agents": ["agent://bank.example/treasury/*"] }
+      "agents": ["agent://bank.example/treasury/*"], "created": "2026-07-01" }
   ],
   "prefixes": [
     { "match": "agent://bank.example/treasury/*", "unit": "treasury" }
@@ -62,6 +62,11 @@ artifacts - passports, descriptors - are JSON already):
   patterns bound which `x-fuse-agent-id` values that credential may present.
   An empty/missing `agents` list means "any agent id", binding the key to the
   unit for attribution without constraining the id.
+- `keys[].created` (optional, added by docs/22-key-lifecycle.md) is a
+  free-form string, convention `YYYY-MM-DD`. Informational only: nothing
+  parses it as a date or enforces anything from it; a blank/whitespace
+  value normalizes to absent. Read by `GET /v1/keys` so an operator can
+  compare how old a binding is against how recently it was actually used.
 - `prefixes` is the fallback for traffic with no (or no mapped) key: pure
   attribution, never a mismatch.
 - Patterns are a literal string or a single trailing `*` (prefix match).

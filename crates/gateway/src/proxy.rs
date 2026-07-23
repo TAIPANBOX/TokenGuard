@@ -10,6 +10,7 @@
 
 use crate::estimate::estimate_cost;
 use crate::identitymap::StrictMode;
+use crate::keystats::KeyStats;
 use crate::provider::{ProviderError, ProviderResponse};
 use crate::router::RouterMode;
 use crate::settle::SettleGuard;
@@ -180,8 +181,13 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // credential, so an operator who turned this on to control who may use the
     // gateway would be surprised to find "omit the run id" is a way around it.
     let Some(key_id) = resolve_client_key(&st, &headers) else {
-        return unauthorized();
+        return unauthorized(&st.keystats);
     };
+    // Key lifecycle health (docs/22): one increment per request that
+    // resolved a credential, regardless of what happens downstream
+    // (success, a 402 Breaker trip, a 403 identity block) - see
+    // `KeyStats::record_call`.
+    st.keystats.record_call(&key_id);
 
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
@@ -248,9 +254,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         match st.identity_strict {
             StrictMode::Off => {}
             StrictMode::Warn => {
+                // Key lifecycle health (docs/22): warn mode still DETECTS
+                // the mismatch, so it still counts, even though the call is
+                // allowed through.
+                st.keystats.record_identity_mismatch(&key_id);
                 identity_header = Some(format!("would-block={}", mismatch.reason));
             }
             StrictMode::Enforce => {
+                st.keystats.record_identity_mismatch(&key_id);
                 let step = st
                     .ledger
                     .snapshot(&run_id)
@@ -1412,7 +1423,15 @@ fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
 /// `401` for a metered call with no usable client credential. Never echoes the
 /// presented secret back, not even truncated: an error body is exactly the
 /// place a credential ends up in someone's log aggregator.
-fn unauthorized() -> Response {
+///
+/// Also stamps the aggregate unauthorized counter (`stats`,
+/// docs/22-key-lifecycle.md) - the only side effect this function gains for
+/// that feature. The response bytes and headers below are unchanged: the
+/// counter is aggregate-only and never keyed by the presented secret, so it
+/// cannot narrow the "missing vs unknown credential" distinction this
+/// response deliberately elides.
+fn unauthorized(stats: &KeyStats) -> Response {
+    stats.record_unauthorized();
     let body = serde_json::json!({
         "error": {
             "type": "unauthorized",
@@ -2191,6 +2210,55 @@ mod tests {
         );
     }
 
+    /// Key lifecycle health (docs/22): `unauthorized()` gains exactly ONE
+    /// side effect (the keystats aggregate counter), and the 401 wire
+    /// contract must stay byte-for-byte identical to before that existed.
+    /// Copies `a_missing_or_unknown_credential_is_refused_identically`'s
+    /// response-shape assertions verbatim, then checks the new counter.
+    #[tokio::test]
+    async fn unauthorized_increments_keystats_without_changing_the_response() {
+        let st = with_keys(state(Mode::Enforce, StubProvider::default()), KEYS);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "auth-stats")
+            .header("x-fuse-budget-usd", "5.0")
+            .header(crate::clientkeys::CLIENT_KEY_HEADER, "sk-live-wrong")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get("x-fuse").unwrap(), "unauthorized");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": {
+                    "type": "unauthorized",
+                    "reason": format!(
+                        "this gateway requires a client credential in the `{}` header",
+                        crate::clientkeys::CLIENT_KEY_HEADER
+                    ),
+                    "retryable": false,
+                }
+            }),
+            "the 401 body must stay byte-for-byte identical now that it has a side effect"
+        );
+
+        let snap = keystats.snapshot();
+        assert_eq!(snap.unauthorized.attempts, 1);
+        assert!(snap.unauthorized.last_millis.is_some());
+        assert!(
+            snap.per_key.is_empty(),
+            "a refused credential must never create a per-key entry"
+        );
+    }
+
     #[tokio::test]
     async fn an_unmanaged_call_cannot_walk_around_the_credential() {
         // No run id would take the drop-in pass-through, which still reaches
@@ -2254,6 +2322,62 @@ mod tests {
         assert_eq!(
             recs[0].agent_id, "someone-elses-agent",
             "agent_id stays client-supplied attribution, unchanged and still not a budget key"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_call_increments_keystats_calls_and_last_seen() {
+        let st = with_keys(state(Mode::Enforce, StubProvider::default()), KEYS);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "authed-stats")
+            .header("x-fuse-budget-usd", "5.0")
+            .header(crate::clientkeys::CLIENT_KEY_HEADER, "sk-live-abc")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+
+        let snap = keystats.snapshot();
+        let k = snap
+            .per_key
+            .get("billing-agent")
+            .expect("the resolved key_id must be tracked");
+        assert_eq!(k.calls, 1);
+        assert!(k.last_seen_millis.is_some());
+        assert_eq!(k.identity_mismatches, 0);
+    }
+
+    #[tokio::test]
+    async fn keystats_calls_increments_even_when_the_call_is_402_blocked() {
+        // "all downstream outcomes included" (docs/22): a resolved
+        // credential still counts even when the request itself gets
+        // Breaker-blocked further down the pipeline.
+        let st = with_keys(
+            state(
+                Mode::Enforce,
+                StubProvider {
+                    input_tokens: 1_000,
+                    output_tokens: 100_000,
+                    sse: false,
+                    body_override: None,
+                },
+            ),
+            KEYS,
+        );
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "authed-402-stats")
+            .header("x-fuse-budget-usd", "0.000001")
+            .header(crate::clientkeys::CLIENT_KEY_HEADER, "sk-live-abc")
+            .body(Body::from(body(100_000)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let snap = keystats.snapshot();
+        assert_eq!(
+            snap.per_key.get("billing-agent").unwrap().calls,
+            1,
+            "a 402-blocked call still resolved a real credential, so it still counts"
         );
     }
 
@@ -3145,6 +3269,74 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, "allow");
         assert_eq!(records[0].unit, "lending");
+    }
+
+    // -- identity map: keystats wiring (docs/22-key-lifecycle.md) ------------
+
+    #[tokio::test]
+    async fn identity_mismatch_in_warn_mode_still_increments_keystats() {
+        // "warn also counts" is a documented, deliberate choice (docs/22):
+        // the mismatch genuinely happened even though the call is allowed
+        // through.
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Warn);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "id-warn-stats")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+
+        let snap = keystats.snapshot();
+        let k = snap.per_key.get("treasury-bots").unwrap();
+        assert_eq!(k.identity_mismatches, 1);
+        assert_eq!(k.calls, 1, "the call itself is still counted once too");
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_in_enforce_mode_increments_keystats() {
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "id-enforce-stats")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::FORBIDDEN);
+
+        let snap = keystats.snapshot();
+        let k = snap.per_key.get("treasury-bots").unwrap();
+        assert_eq!(k.identity_mismatches, 1);
+        assert_eq!(k.calls, 1);
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_in_off_mode_is_not_counted() {
+        // Off mode never consults the mismatch operationally, so docs/22
+        // scopes keystats counting to warn/enforce only - this locks that
+        // scoping decision in.
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Off);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "id-off-stats")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+
+        let snap = keystats.snapshot();
+        let k = snap.per_key.get("treasury-bots").unwrap();
+        assert_eq!(k.calls, 1);
+        assert_eq!(
+            k.identity_mismatches, 0,
+            "off mode does not count a mismatch, only warn/enforce do"
+        );
     }
 
     #[tokio::test]

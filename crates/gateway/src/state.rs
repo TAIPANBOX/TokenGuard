@@ -3,6 +3,7 @@
 use crate::clientkeys::ClientKeys;
 use crate::firewall::FirewallConfig;
 use crate::identitymap::{IdentityMap, StrictMode};
+use crate::keystats::KeyStats;
 use crate::ledger_backend::{LedgerBackend, LocalLedger};
 use crate::provider::Provider;
 use crate::router::Router;
@@ -79,6 +80,13 @@ pub struct AppState {
     /// Per-unit monthly budget counters (docs/20). Uncapped units are not
     /// accounted; disabled entirely when the identity map is off.
     pub units: Arc<UnitLedger>,
+    /// Since-startup, in-process counters for client-key activity
+    /// (docs/22-key-lifecycle.md): per-key calls/mismatches and an
+    /// aggregate unauthorized-attempt count. Always present - it is a plain
+    /// in-memory tally with no persistence and no env toggle, harmless
+    /// whether or not client keys/identity are configured. See
+    /// `crate::keystats`/`crate::keysreport`.
+    pub keystats: Arc<KeyStats>,
 }
 
 impl AppState {
@@ -116,6 +124,7 @@ impl AppState {
             identity: Arc::new(IdentityMap::default()),
             identity_strict: StrictMode::Off,
             units: Arc::new(UnitLedger::default()),
+            keystats: Arc::new(KeyStats::default()),
         }
     }
 

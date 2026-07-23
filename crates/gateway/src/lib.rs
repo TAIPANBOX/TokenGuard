@@ -12,6 +12,8 @@ pub mod events;
 pub mod firewall;
 pub mod focusexport;
 pub mod identitymap;
+pub mod keysreport;
+pub mod keystats;
 pub mod ledger_backend;
 pub mod mcpbroker;
 pub mod mcpcli;
@@ -57,6 +59,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/messages", post(proxy::messages))
         .route("/v1/runs", get(obs::list_runs))
         .route("/v1/runs/{id}/kill", post(obs::kill_run))
+        .route("/v1/keys", get(keysreport::list_keys))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }

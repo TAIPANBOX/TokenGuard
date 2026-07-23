@@ -50,9 +50,12 @@
 //!
 //! - `units[]`: `{id, name?, owner?, budget_usd_month?}`. A unit without
 //!   `budget_usd_month` is attribution-only.
-//! - `keys[]`: `{key_id, unit, agents?: [pattern]}`. Binds a
+//! - `keys[]`: `{key_id, unit, agents?: [pattern], created?}`. Binds a
 //!   `TOKENFUSE_CLIENT_KEYS` `key_id` to a unit; an empty or missing
 //!   `agents` list means "any agent id", attribution without constraint.
+//!   `created` (`docs/22-key-lifecycle.md`) is a free-form, informational
+//!   date string (convention `YYYY-MM-DD`) - not parsed, not validated
+//!   beyond the empty-string check, read only by `GET /v1/keys`.
 //! - `prefixes[]`: `{match: pattern, unit}`. The fallback for calls with no
 //!   (or no mapped) key: pure attribution, never a mismatch.
 //!
@@ -100,6 +103,20 @@ impl std::str::FromStr for StrictMode {
     }
 }
 
+impl StrictMode {
+    /// The lowercase wire string this mode reads as on `GET /v1/keys`
+    /// (`docs/22-key-lifecycle.md`) - the reverse direction of `FromStr`,
+    /// over the exact same three-value vocabulary.
+    #[must_use]
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            StrictMode::Off => "off",
+            StrictMode::Warn => "warn",
+            StrictMode::Enforce => "enforce",
+        }
+    }
+}
+
 /// The parsed, validated identity map. Build with [`IdentityMap::from_path`];
 /// [`IdentityMap::default`] is the disabled/empty map every gateway starts
 /// with when `TOKENFUSE_IDENTITY_MAP` is unset.
@@ -116,6 +133,11 @@ pub struct IdentityMap {
 struct KeyBinding {
     unit: String,
     agents: Vec<Pattern>,
+    /// Verbatim `created` from the map (`docs/22-key-lifecycle.md`), except
+    /// a blank/whitespace-only string normalizes to `None` - see
+    /// `IdentityMap::build`. `None` on every map written before this field
+    /// existed. Read-only: nothing in this module parses or enforces it.
+    created: Option<String>,
 }
 
 /// A `prefixes[]` entry, resolved.
@@ -152,6 +174,18 @@ impl Pattern {
         match self {
             Pattern::Literal(s) => s == agent_id,
             Pattern::Prefix(prefix) => agent_id.starts_with(prefix.as_str()),
+        }
+    }
+
+    /// Reconstructs the original pattern string this was parsed from (a
+    /// `Prefix` gets its trailing `*` restored). Used only by
+    /// [`IdentityMap::key_binding`] so `GET /v1/keys`
+    /// (`docs/22-key-lifecycle.md`) can echo the configured `agents`
+    /// patterns back verbatim; matching itself never calls this.
+    fn as_pattern_str(&self) -> String {
+        match self {
+            Pattern::Literal(s) => s.clone(),
+            Pattern::Prefix(prefix) => format!("{prefix}*"),
         }
     }
 }
@@ -257,6 +291,12 @@ struct WireKey {
     unit: String,
     #[serde(default)]
     agents: Vec<String>,
+    /// Informational only (`docs/22-key-lifecycle.md`): a free-form date
+    /// string, convention `YYYY-MM-DD`. `#[serde(default)]` so an old map
+    /// (written before this field existed) still parses; absent here maps
+    /// to `None` on [`KeyBinding`], identical to an old map's result.
+    #[serde(default)]
+    created: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,6 +304,18 @@ struct WirePrefix {
     #[serde(rename = "match")]
     pattern: String,
     unit: String,
+}
+
+/// A `keys[]` binding, read back out for `GET /v1/keys`
+/// (`docs/22-key-lifecycle.md`). See [`IdentityMap::key_binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBindingInfo {
+    pub unit: String,
+    /// The configured `agents` patterns, as the original strings (e.g.
+    /// `"agent://bank.example/treasury/*"`); empty means "any agent id".
+    pub agents: Vec<String>,
+    /// Verbatim from the map, or `None` when absent or blank.
+    pub created: Option<String>,
 }
 
 impl IdentityMap {
@@ -353,11 +405,20 @@ impl IdentityMap {
             for pat in &k.agents {
                 agents.push(Pattern::parse(pat).map_err(LoadError::Invalid)?);
             }
+            // Blank/whitespace-only normalizes to "absent", the same
+            // "blank reads as not-configured" convention this module already
+            // uses elsewhere; a genuinely present value is kept verbatim
+            // (docs/22-key-lifecycle.md), not trimmed.
+            let created = match k.created {
+                Some(s) if !s.trim().is_empty() => Some(s),
+                _ => None,
+            };
             keys.insert(
                 k.key_id,
                 KeyBinding {
                     unit: k.unit,
                     agents,
+                    created,
                 },
             );
         }
@@ -477,6 +538,21 @@ impl IdentityMap {
     #[must_use]
     pub fn key_ids(&self) -> Vec<&str> {
         self.keys.keys().map(String::as_str).collect()
+    }
+
+    /// The full `keys[]` binding for `key_id`, if the map has one - the
+    /// read-only surface `GET /v1/keys` (`docs/22-key-lifecycle.md`) uses to
+    /// render `unit`/`agents`/`created`. `agents` patterns are reconstructed
+    /// to their original strings; `[]` means "any agent id" (an empty or
+    /// missing `agents` list). `None` when `key_id` has no binding at all -
+    /// distinct from a binding whose own fields happen to be empty.
+    #[must_use]
+    pub fn key_binding(&self, key_id: &str) -> Option<KeyBindingInfo> {
+        self.keys.get(key_id).map(|b| KeyBindingInfo {
+            unit: b.unit.clone(),
+            agents: b.agents.iter().map(Pattern::as_pattern_str).collect(),
+            created: b.created.clone(),
+        })
     }
 
     /// How many units are configured (startup log).
@@ -782,7 +858,9 @@ mod tests {
     // Resolution matrix
     // -----------------------------------------------------------------
 
-    /// The exact example from `docs/20-identity-map.md` section 2.
+    /// The exact example from `docs/20-identity-map.md` section 2
+    /// (`created` added by `docs/22-key-lifecycle.md`; kept in sync with the
+    /// doc's own JSON block).
     const DESIGN_DOC_EXAMPLE: &str = r#"{
       "units": [
         { "id": "treasury", "name": "Treasury", "owner": "user://bank.example/olena",
@@ -790,7 +868,7 @@ mod tests {
       ],
       "keys": [
         { "key_id": "treasury-bots", "unit": "treasury",
-          "agents": ["agent://bank.example/treasury/*"] }
+          "agents": ["agent://bank.example/treasury/*"], "created": "2026-07-01" }
       ],
       "prefixes": [
         { "match": "agent://bank.example/treasury/*", "unit": "treasury" }
@@ -807,6 +885,14 @@ mod tests {
         assert_eq!(
             map.unit_budget("treasury"),
             Some(Microusd::from_usd(2000.0))
+        );
+        assert_eq!(
+            map.key_binding("treasury-bots"),
+            Some(KeyBindingInfo {
+                unit: "treasury".to_string(),
+                agents: vec!["agent://bank.example/treasury/*".to_string()],
+                created: Some("2026-07-01".to_string()),
+            })
         );
     }
 
@@ -1036,5 +1122,124 @@ mod tests {
         assert!(map.enabled());
         assert_eq!(map.unit_count(), 1);
         assert_eq!(map.key_count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // `created` and `key_binding` (docs/22-key-lifecycle.md)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn created_is_carried_into_the_binding_verbatim() {
+        let raw = r#"{
+            "units": [{"id": "u"}],
+            "keys": [{"key_id": "k1", "unit": "u", "created": "2026-07-01"}]
+        }"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(
+            map.key_binding("k1").unwrap().created,
+            Some("2026-07-01".to_string())
+        );
+    }
+
+    #[test]
+    fn created_absent_is_none() {
+        // An old map, written before this field existed.
+        let raw = r#"{"units": [{"id": "u"}], "keys": [{"key_id": "k1", "unit": "u"}]}"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(map.key_binding("k1").unwrap().created, None);
+    }
+
+    #[test]
+    fn created_empty_or_whitespace_normalizes_to_none() {
+        for created in ["", "   ", "\n", "\t "] {
+            let raw = format!(
+                r#"{{"units": [{{"id": "u"}}], "keys": [{{"key_id": "k1", "unit": "u", "created": {created:?}}}]}}"#
+            );
+            let map = IdentityMap::parse(&raw).unwrap();
+            assert_eq!(
+                map.key_binding("k1").unwrap().created,
+                None,
+                "created {created:?} must normalize to None"
+            );
+        }
+    }
+
+    #[test]
+    fn created_is_kept_verbatim_even_with_incidental_surrounding_whitespace() {
+        // Only a WHOLLY blank string normalizes to None; a value that is
+        // merely padded is still non-blank and is kept exactly as given -
+        // "verbatim from the map" in the GET /v1/keys contract.
+        let raw = r#"{"units": [{"id": "u"}], "keys": [{"key_id": "k1", "unit": "u", "created": " 2026-07-01 "}]}"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(
+            map.key_binding("k1").unwrap().created,
+            Some(" 2026-07-01 ".to_string())
+        );
+    }
+
+    #[test]
+    fn a_map_with_created_and_other_unknown_fields_still_parses() {
+        // Unknown fields are tolerated everywhere (no `deny_unknown_fields`,
+        // the stack-wide additive convention) - this must keep holding with
+        // `created` present alongside a hypothetical future field, proving
+        // the addition did not narrow that tolerance.
+        let raw = r#"{
+            "units": [{"id": "u"}],
+            "keys": [{"key_id": "k1", "unit": "u", "created": "2026-07-01",
+                       "some_future_field": {"nested": true}}]
+        }"#;
+        let map = IdentityMap::parse(raw).expect("unknown fields must not refuse the load");
+        assert_eq!(
+            map.key_binding("k1").unwrap().created,
+            Some("2026-07-01".to_string())
+        );
+    }
+
+    #[test]
+    fn key_binding_reconstructs_agent_patterns_verbatim() {
+        let raw = r#"{
+            "units": [{"id": "u"}],
+            "keys": [{"key_id": "k1", "unit": "u",
+                       "agents": ["literal-agent", "prefix-*", "*"]}]
+        }"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(
+            map.key_binding("k1").unwrap().agents,
+            vec![
+                "literal-agent".to_string(),
+                "prefix-*".to_string(),
+                "*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn key_binding_agents_is_empty_when_the_list_is_missing() {
+        let raw = r#"{"units": [{"id": "u"}], "keys": [{"key_id": "k1", "unit": "u"}]}"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert!(map.key_binding("k1").unwrap().agents.is_empty());
+    }
+
+    #[test]
+    fn key_binding_is_none_for_an_unbound_or_unknown_key() {
+        let map = IdentityMap::default();
+        assert_eq!(map.key_binding("anything"), None);
+        let bound = IdentityMap::parse(
+            r#"{"units": [{"id": "u"}], "keys": [{"key_id": "k1", "unit": "u"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(bound.key_binding("not-k1"), None);
+    }
+
+    #[test]
+    fn strict_mode_as_wire_str_round_trips_through_from_str() {
+        for (mode, s) in [
+            (StrictMode::Off, "off"),
+            (StrictMode::Warn, "warn"),
+            (StrictMode::Enforce, "enforce"),
+        ] {
+            assert_eq!(mode.as_wire_str(), s);
+            assert_eq!(s.parse::<StrictMode>(), Ok(mode));
+        }
     }
 }
